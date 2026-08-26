@@ -40,6 +40,14 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
     private const string AllocationPropertyId =
         "String {9b3c1f2e-6d4a-4c1b-8f77-2a5d1e0c7b41} Name WorkItemPlannerAllocationId";
 
+    /// <summary>
+    /// Everything needed to rebuild the block from the event alone, so a machine that has
+    /// never seen the plan file can still show it, move it and delete it. The id above says
+    /// which block an event belongs to; this says what that block actually was.
+    /// </summary>
+    private const string PayloadPropertyId =
+        "String {9b3c1f2e-6d4a-4c1b-8f77-2a5d1e0c7b41} Name SlateAllocationPayload";
+
     private static readonly HttpClient Http = new(new SocketsHttpHandler
     {
         AutomaticDecompression = DecompressionMethods.All,
@@ -186,7 +194,8 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
                   $"&endDateTime={Instant(localEnd)}" +
                   "&$select=id,subject,start,end,showAs,isAllDay,lastModifiedDateTime" +
                   "&$orderby=start/dateTime&$top=250" +
-                  $"&$expand=singleValueExtendedProperties($filter=id eq '{Uri.EscapeDataString(AllocationPropertyId)}')";
+                  $"&$expand=singleValueExtendedProperties($filter=id eq '{Uri.EscapeDataString(AllocationPropertyId)}'" +
+                  $" or id eq '{Uri.EscapeDataString(PayloadPropertyId)}')";
 
         var events = new List<ExistingEvent>();
 
@@ -203,6 +212,7 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
                     continue;
 
                 var allocationId = ReadAllocationId(e);
+                var payload = ReadNamedProperty(e, PayloadPropertyId);
 
                 events.Add(new ExistingEvent(
                     e.GetProperty("id").GetString()!,
@@ -211,8 +221,9 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
                     end,
                     e.TryGetProperty("showAs", out var sa) ? sa.GetString() ?? "busy" : "busy",
                     e.TryGetProperty("isAllDay", out var ad) && ad.GetBoolean(),
-                    allocationId is not null,
+                    allocationId is not null || payload is not null,
                     allocationId,
+                    payload,
                     e.TryGetProperty("lastModifiedDateTime", out var lm) &&
                     DateTimeOffset.TryParse(lm.GetString(), CultureInfo.InvariantCulture,
                         DateTimeStyles.RoundtripKind, out var modified) ? modified : null));
@@ -244,7 +255,11 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
         value.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
 
     /// <summary>The allocation this event was created from, or null if the app did not create it.</summary>
-    private static Guid? ReadAllocationId(JsonElement e)
+    private static Guid? ReadAllocationId(JsonElement e) =>
+        Guid.TryParse(ReadNamedProperty(e, AllocationPropertyId), out var id) ? id : null;
+
+    /// <summary>One named extended property off an event, matched by id.</summary>
+    private static string? ReadNamedProperty(JsonElement e, string propertyId)
     {
         if (!e.TryGetProperty("singleValueExtendedProperties", out var props) ||
             props.ValueKind != JsonValueKind.Array)
@@ -252,9 +267,10 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
 
         foreach (var property in props.EnumerateArray())
         {
-            if (property.TryGetProperty("value", out var value) &&
-                Guid.TryParse(value.GetString(), out var id))
-                return id;
+            if (property.TryGetProperty("id", out var id) &&
+                string.Equals(id.GetString(), propertyId, StringComparison.OrdinalIgnoreCase) &&
+                property.TryGetProperty("value", out var value))
+                return value.GetString();
         }
 
         return null;
@@ -326,7 +342,7 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
     private object BuildEventBody(Allocation allocation, bool includeIdentity)
     {
         var cal = settings.Current.Calendar;
-        var subject = RenderSubject(cal.SubjectTemplate, allocation);
+        var subject = RenderSubject(cal.SubjectTemplate, allocation, cal.Marker);
 
         var body = new Dictionary<string, object?>
         {
@@ -343,18 +359,20 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
         if (!string.IsNullOrWhiteSpace(cal.Category))
             body["categories"] = new[] { cal.Category };
 
-        if (includeIdentity)
-        {
-            body["singleValueExtendedProperties"] = new[]
+        // The payload rides along on every write, not just creation: a block edited here
+        // has to leave the calendar telling the same story to whichever machine reads it next.
+        body["singleValueExtendedProperties"] = includeIdentity
+            ? new[]
             {
                 new { id = AllocationPropertyId, value = allocation.Id.ToString() },
-            };
-        }
+                new { id = PayloadPropertyId, value = AllocationPayload.Write(allocation) },
+            }
+            : [new { id = PayloadPropertyId, value = AllocationPayload.Write(allocation) }];
 
         return body;
     }
 
-    public static string RenderSubject(string template, Allocation allocation)
+    public static string RenderSubject(string template, Allocation allocation, string marker = "")
     {
         var rendered = (string.IsNullOrWhiteSpace(template) ? "#{id} {title}" : template)
             .Replace("{id}", allocation.WorkItemId.ToString())
@@ -364,7 +382,16 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
             .Replace("{project}", allocation.Project)
             .Trim();
 
-        // Outlook truncates very long subjects awkwardly; keep them sane.
+        // Outlook truncates very long subjects awkwardly; keep them sane. The marker is
+        // trimmed for rather than trimmed off - it is the part another machine looks for.
+        var tag = marker.Trim();
+        if (tag.Length > 0 && !rendered.Contains(tag, StringComparison.OrdinalIgnoreCase))
+        {
+            var room = 250 - tag.Length - 1;
+            if (rendered.Length > room) rendered = rendered[..Math.Max(0, room - 3)] + "...";
+            rendered = $"{rendered} {tag}".Trim();
+        }
+
         return rendered.Length > 250 ? rendered[..247] + "..." : rendered;
     }
 

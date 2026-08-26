@@ -35,35 +35,46 @@ yet](docs/screenshots/05-help.png)
 
 To regenerate the application icon after changing the mark, run `build/makeicon.ps1`.
 
-On first launch the app opens on **Settings**, because it needs two things from you.
+On first launch the app opens on **Settings**, because it needs a couple of things from you.
 
-![The Settings page: organization URL, sign-in method, personal access token and project, with a
-Test connection button](docs/screenshots/04-settings.png)
+![The Settings page: organization URL, sign-in method, personal access token and project
+](docs/screenshots/04-settings.png)
+
+> The Settings screenshot predates the single **Connect** card and the removal of the Save button.
 
 ---
 
 ## Setup, once
 
-### 1. Azure DevOps
+Settings save as you go — there is no Save button to remember.
 
-Fill in your **organization URL** (for example `https://dev.azure.com/contoso`) and pick a sign-in
-method:
+### 1. Connect
 
-- **Personal access token** — the quick path. In Azure DevOps go to
-  *User settings → Personal access tokens → New Token* and give it the
-  **Work Items (Read & Write)** scope — write is what lets you record time.
-  Paste it in. It is stored encrypted with Windows DPAPI under your user account, so nobody else
-  on the machine can read it.
-- **Microsoft sign-in** — reuses the Entra sign-in below. Needs the app registration to also carry
-  the `Azure DevOps → user_impersonation` delegated permission.
+One **Sign in with Microsoft** at the top of Settings connects both halves: it authenticates,
+checks Azure DevOps answers, and loads your projects and calendars in the same step. Signing in
+and separately remembering to test the other side was the bit people left half done.
 
-Optionally choose a **project**; leaving it blank queries across everything you can see. Hit
-**Test connection** to confirm.
+You still need an app registration for the client ID (the card walks you through it), and a
+personal access token remains available under *Use a personal access token instead* for anyone who
+cannot have one — a token reaches Azure DevOps only, so Outlook still wants the Microsoft sign-in.
+
+### 2. Azure DevOps details
+
+Your **organization URL** (for example `https://dev.azure.com/contoso`) goes in the Connect card,
+and Microsoft sign-in covers Azure DevOps as well as Outlook — the app registration needs the
+`Azure DevOps → user_impersonation` delegated permission for that.
+
+If you would rather use a **personal access token**, it is under *Use a personal access token
+instead*: in Azure DevOps go to *User settings → Personal access tokens → New Token* with the
+**Work Items (Read & Write)** scope — write is what lets you record time. It is stored encrypted
+with Windows DPAPI under your user account, so nobody else on the machine can read it.
+
+Optionally choose a **project**; leaving it blank queries across everything you can see.
 
 Then choose which work items appear: *assigned to me* (with finished states filtered out), a
 **saved query** from your Queries hub, or your own **WIQL**.
 
-### 2. Outlook, via an Entra ID app registration
+### 3. Outlook, via an Entra ID app registration
 
 The app writes to your calendar through Microsoft Graph, which needs a client ID you own. It takes
 about two minutes:
@@ -115,7 +126,7 @@ The **Plan** tab is a week grid with your work items down the left.
 | Action | How |
 | --- | --- |
 | Book time | Drag a work item from the sidebar onto a slot |
-| Auto-book | Press <kbd>Enter</kbd> on a card, or **Schedule** on the Work items tab — it finds the first gap that fits |
+| Book automatically | Press <kbd>Enter</kbd> on a card, or **Schedule…** — next free slot, or pick a time yourself |
 | Move a block | Drag it |
 | Copy a block | <kbd>Ctrl</kbd> + drag it |
 | Resize | Drag the bottom edge |
@@ -243,6 +254,34 @@ Remaining Work seeded from the length of the block. The calendar block then poin
 task, so time can be recorded against it.
 
 The block stays put either way. Turn the offer off in Settings, or from the notice itself.
+
+## Your hours
+
+Three separate things, because they are genuinely different:
+
+- **The working day** — when you actually work. A day's load is measured against these hours.
+- **Show the full 24 hours** — draws the whole clock rather than only the working day, for on-call
+  or shift weeks. It does not change what counts as a full day.
+- **Book time from / until** — where **Schedule…** and <kbd>Enter</kbd> are allowed to place work.
+  Keep the first hour for catching up by booking from 10:00 while the day still starts at 09:00;
+  you can always drag a block there yourself.
+
+## Scheduling a block
+
+**Schedule…** offers two ways in: the **next free slot** — the first gap that fits inside the hours
+above, skipping anything already in your calendar — or **pick a time**, for when the work has to go
+somewhere particular. Either way you can set how long it runs, starting from whatever is left on
+the work item's estimate.
+
+## Working across two machines
+
+Your plan file stays on the machine that wrote it. Your calendar does not, so the calendar is where
+a block's identity lives: every event Slate writes carries a **marker** in its subject (`-Slate-` by
+default, configurable in Settings) and enough of the block stamped onto the event itself.
+
+Open Slate on another machine signed in to the same calendar and it picks those blocks up — they
+appear on the grid and can be moved, resized, re-synced or deleted there like any other. Keep the
+marker the same on both machines.
 
 ## Changing the status
 

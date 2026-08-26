@@ -352,8 +352,13 @@
                     }
 
                     @* ------------------------------------------------ metadata, last *@
-                    <div class="modal-section metadata">
-                        <h3>Metadata</h3>
+                    @* Folded away by default: it is reference material, and open it pushed
+                       everything worth reading off the top of a short window. *@
+                    <details class="modal-section metadata">
+                        <summary class="section-toggle">
+                            <span class="chevron">›</span>
+                            <h3>Metadata</h3>
+                        </summary>
                         <div class="field-grid">
                             <Cell Label="State" Value="@detail.State" />
                             <Cell Label="Reason" Value="@detail.Reason" />
@@ -368,24 +373,16 @@
                                 <Cell Label="@field.DisplayName" Value="@field.Value" />
                             }
                         </div>
-                    </div>
+                    </details>
                 }
             </div>
 
-            <div class="modal-foot wrap">
-                @if (State.CanEditWorkItems && State.DetailListEntry is { } listed)
-                {
-                    <div class="prio-group">
-                        <span class="prio-group-label" title="The work item's own state - the team sees it">
-                            Status
-                        </span>
-                        <StatePicker WorkItemId="listed.Id" Project="@listed.Project"
-                                     WorkItemType="@listed.WorkItemType" Current="@listed.State" />
-                    </div>
-                }
-
+            @* A row each, rather than everything competing for one line: the two priorities
+               read as a pair when they sit above one another, and the actions get the width
+               they need instead of being squeezed in beside them. *@
+            <div class="modal-foot stacked">
                 @* Two priorities: yours, which stays here, and the one on the work item itself. *@
-                <div class="prio-group">
+                <div class="foot-row">
                     <span class="prio-group-label" title="Never written back to Azure DevOps">Your triage</span>
                     <div class="prio-choices">
                         @foreach (var level in PriorityLevels)
@@ -401,7 +398,7 @@
 
                 @if (State.CanSetAdoPriority)
                 {
-                <div class="prio-group">
+                <div class="foot-row">
                     <span class="prio-group-label" title="This is the work item's own field - the team sees it">
                         Azure DevOps
                     </span>
@@ -419,14 +416,22 @@
                 </div>
                 }
 
-                <span style="flex: 1"></span>
-                <button class="btn" @onclick="OpenInAdo">Open in Azure DevOps ↗</button>
-                @if (Fallback is { } item)
-                {
-                    <button class="btn" title="Book the next free slot for this item"
-                            @onclick="() => Schedule(item)">Schedule next free slot</button>
-                }
-                <button class="btn btn-primary" @onclick="Close">Close</button>
+                <div class="foot-row actions">
+                    @if (State.CanEditWorkItems && State.DetailListEntry is { } listed)
+                    {
+                        <span class="prio-group-label" title="The work item's own state - the team sees it">Status</span>
+                        <StatePicker WorkItemId="listed.Id" Project="@listed.Project"
+                                     WorkItemType="@listed.WorkItemType" Current="@listed.State" />
+                    }
+                    <span style="flex: 1"></span>
+                    <button class="btn" @onclick="OpenInAdo">Open in Azure DevOps ↗</button>
+                    @if (Fallback is { } item)
+                    {
+                        <button class="btn" title="Book time for this work item"
+                                @onclick="() => Schedule(item)">Schedule…</button>
+                    }
+                    <button class="btn btn-primary" @onclick="Close">Close</button>
+                </div>
             </div>
         </div>
     </div>

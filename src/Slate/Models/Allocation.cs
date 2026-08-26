@@ -91,6 +91,7 @@ public sealed record ExistingEvent(
     bool IsAllDay,
     bool IsFromThisApp,
     Guid? AllocationId,
+    string? Payload,
     DateTimeOffset? LastModified)
 {
     /// <summary>True when this event should block planning on top of it.</summary>

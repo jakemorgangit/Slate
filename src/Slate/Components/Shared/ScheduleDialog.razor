@@ -1,0 +1,213 @@
+@using System.Globalization
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject PlannerService Planner
+@inject SettingsStore Settings
+@inject ToastService Toasts
+
+@*
+    Booking a work item in. "Next free slot" is the quick answer and stays the default, but
+    a day is not always a queue - sometimes the meeting is at two and the work goes before it.
+*@
+
+@if (State.SchedulingFor is { } item)
+{
+    <div class="modal-scrim" @onclick="Cancel">
+        <div class="modal narrow" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span style="color: var(--accent); margin-top: 3px">＋</span>
+                <div class="grow">
+                    <h2>Schedule</h2>
+                    <div class="sub">
+                        <span class="mono">#@item.Id</span>
+                        <span class="truncate">@item.Title</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close" @onclick="Cancel">✕</button>
+            </div>
+
+            <div class="modal-body">
+                <div class="field">
+                    <label>When</label>
+                    <div class="row">
+                        <button class="chip @(_pickTime ? "" : "on")"
+                                title="Find the first gap that fits, inside the hours work can be booked into"
+                                @onclick="() => _pickTime = false">Next free slot</button>
+                        <button class="chip @(_pickTime ? "on" : "")"
+                                title="Put it exactly where you want it"
+                                @onclick="ChooseTime">Pick a time</button>
+                    </div>
+                </div>
+
+                @if (_pickTime)
+                {
+                    <div class="grid-2">
+                        <div class="field">
+                            <label for="sched-date">Date</label>
+                            <input id="sched-date" class="input" type="date" value="@_date"
+                                   @onchange="e => _date = e.Value?.ToString() ?? _date" />
+                        </div>
+                        <div class="field">
+                            <label for="sched-time">Start</label>
+                            <input id="sched-time" class="input" type="time" step="300" value="@_time"
+                                   @onchange="e => _time = e.Value?.ToString() ?? _time" />
+                        </div>
+                    </div>
+                }
+                else
+                {
+                    <div class="banner info">
+                        <span>i</span>
+                        <div class="grow">
+                            The first gap that fits between
+                            <strong>@($"{P.BookFromHour:00}:00")</strong> and
+                            <strong>@($"{P.BookUntilHour:00}:00")</strong> on a working day,
+                            skipping anything already in your calendar.
+                        </div>
+                    </div>
+                }
+
+                <div class="field">
+                    <label for="sched-mins">How long</label>
+                    <div class="row wrap">
+                        @foreach (var preset in Presets)
+                        {
+                            <button class="chip @(_minutes == preset ? "on" : "")"
+                                    @onclick="() => _minutes = preset">@Ui.Duration(preset)</button>
+                        }
+                    </div>
+                    <input id="sched-mins" class="input" type="number" min="5" max="1440" step="5"
+                           value="@_minutes"
+                           @onchange="e => _minutes = int.TryParse(e.Value?.ToString(), out var m) ? Math.Clamp(m, 5, 1440) : _minutes" />
+                    <span class="hint">Starts from whatever is left on the work item's estimate.</span>
+                </div>
+            </div>
+
+            <div class="modal-foot">
+                <span class="muted" style="font-size: 11.5px">Nothing is sent to Outlook until it syncs.</span>
+                <span style="flex: 1"></span>
+                <button class="btn" @onclick="Cancel">Cancel</button>
+                <button class="btn btn-primary" disabled="@(_minutes <= 0)" @onclick="Confirm">
+                    @(_pickTime ? "Book it" : "Find a slot")
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private static readonly int[] Presets = [30, 60, 90, 120, 240];
+
+    private bool _pickTime;
+    private int _minutes = 60;
+    private string _date = "";
+    private string _time = "";
+    private int _openedFor = -1;
+
+    private PlanningSettings P => Settings.Current.Planning;
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    protected override void OnParametersSet() => Prime();
+
+    /// <summary>Seeds the form the first time a given work item opens the dialog.</summary>
+    private void Prime()
+    {
+        if (State.SchedulingFor is not { } item || _openedFor == item.Id) return;
+
+        _openedFor = item.Id;
+        _pickTime = false;
+        _minutes = Math.Max(5, Planner.SuggestedDuration(item));
+
+        var suggested = NextSlotBoundary();
+        _date = suggested.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        _time = suggested.ToString("HH:mm", CultureInfo.InvariantCulture);
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        Prime();
+        StateHasChanged();
+    });
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    /// <summary>
+    /// A sensible starting point for the pickers: the next slot boundary from now, pulled
+    /// into the booking window so the form does not open on an hour it would refuse.
+    /// </summary>
+    private DateTime NextSlotBoundary()
+    {
+        var slot = Math.Clamp(P.SlotMinutes, 5, 120);
+        var now = DateTime.Now;
+        var rounded = now.AddMinutes(slot - 1);
+        rounded = rounded.Date.AddMinutes(Math.Floor(rounded.TimeOfDay.TotalMinutes / slot) * slot);
+
+        if (rounded.Hour < P.BookFromHour) return rounded.Date.AddHours(P.BookFromHour);
+        if (rounded.Hour >= P.BookUntilHour) return rounded.Date.AddDays(1).AddHours(P.BookFromHour);
+        return rounded;
+    }
+
+    private void ChooseTime()
+    {
+        _pickTime = true;
+
+        // Seed from now rather than whatever was last typed, so the fields are never stale.
+        if (_date.Length == 0 || _time.Length == 0)
+        {
+            var suggested = NextSlotBoundary();
+            _date = suggested.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            _time = suggested.ToString("HH:mm", CultureInfo.InvariantCulture);
+        }
+    }
+
+    private void Cancel()
+    {
+        _openedFor = -1;
+        State.CancelSchedule();
+    }
+
+    private void Confirm()
+    {
+        if (State.SchedulingFor is not { } item) return;
+
+        if (!_pickTime)
+        {
+            if (State.ScheduleIntoNextFree(item)) _openedFor = -1;
+            return;
+        }
+
+        if (!TryReadChosenStart(out var start))
+        {
+            // Never fail quietly: a dialog that shrugs when the button is pressed is worse
+            // than one that says the date is no good.
+            Toasts.Warning("That date and time did not read", "Pick both, then try again.");
+            return;
+        }
+
+        if (State.ScheduleAt(item, start, _minutes)) _openedFor = -1;
+    }
+
+    /// <summary>
+    /// Reads the two pickers into one instant. The browser hands back an ISO date and a
+    /// 24-hour time, but a time input may or may not include seconds depending on its step,
+    /// so both shapes are accepted rather than assuming one.
+    /// </summary>
+    private bool TryReadChosenStart(out DateTime start)
+    {
+        start = default;
+        if (string.IsNullOrWhiteSpace(_date) || string.IsNullOrWhiteSpace(_time)) return false;
+
+        string[] formats =
+        [
+            "yyyy-MM-dd HH:mm", "yyyy-MM-dd H:mm",
+            "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd H:mm:ss",
+        ];
+
+        return DateTime.TryParseExact($"{_date.Trim()} {_time.Trim()}", formats,
+            CultureInfo.InvariantCulture, DateTimeStyles.None, out start);
+    }
+}

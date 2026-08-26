@@ -354,7 +354,22 @@ public sealed class AppState(
             if (cts.IsCancellationRequested) return;
 
             ExistingEvents = events;
-            if (Settings.Planning.TwoWaySync) ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
+
+            // Before reconciling: a block planned on another machine is not "missing from
+            // the plan", it is one this copy has not met yet. Picking it up first means the
+            // reconciler sees a complete week and leaves it alone.
+            if (Settings.Planning.TwoWaySync)
+            {
+                var adopted = planner.AdoptOrphanEvents(events);
+                if (adopted > 0)
+                {
+                    toasts.Info(
+                        adopted == 1 ? "Picked up 1 block from your calendar" : $"Picked up {adopted} blocks from your calendar",
+                        "Planned on another machine. You can move or delete them here as usual.");
+                }
+
+                ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
+            }
         }
         catch (OperationCanceledException)
         {
@@ -545,10 +560,11 @@ public sealed class AppState(
         var duration = planner.SuggestedDuration(item);
         var p = Settings.Planning;
 
+        // The booking window, not the grid: someone who keeps the first hour of the day for
+        // catching up wants the grid to show it and automatic scheduling to leave it alone.
         var slot = Math.Clamp(p.SlotMinutes, 5, 120);
-        var startHour = Math.Clamp(p.DayStartHour, 0, 23);
-        var dayStart = TimeSpan.FromHours(startHour);
-        var dayEnd = TimeSpan.FromHours(Math.Clamp(p.DayEndHour, startHour + 1, 24));
+        var dayStart = TimeSpan.FromHours(p.BookFromHour);
+        var dayEnd = TimeSpan.FromHours(p.BookUntilHour);
         var windowMinutes = (dayEnd - dayStart).TotalMinutes;
 
         if (duration > windowMinutes) return null;
@@ -575,6 +591,79 @@ public sealed class AppState(
         }
 
         return null;
+    }
+
+    // ---------------------------------------------------------------- scheduling
+
+    /// <summary>The work item the schedule dialog is open for.</summary>
+    public WorkItem? SchedulingFor { get; private set; }
+
+    public void BeginSchedule(WorkItem item)
+    {
+        SchedulingFor = item;
+        Changed?.Invoke();
+    }
+
+    public void CancelSchedule()
+    {
+        if (SchedulingFor is null) return;
+        SchedulingFor = null;
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Books the next free gap. Reports for itself rather than leaving each caller to say the
+    /// same thing three different ways.
+    /// </summary>
+    public bool ScheduleIntoNextFree(WorkItem item)
+    {
+        var allocation = ScheduleNextFree(item);
+
+        if (allocation is null)
+        {
+            toasts.Warning("No free slot in the next two weeks",
+                "Widen the hours work can be booked into in Settings, or pick a time yourself.");
+            return false;
+        }
+
+        AfterScheduled(item, allocation, "Scheduled");
+        return true;
+    }
+
+    /// <summary>
+    /// Books a chosen time. The time was asked for explicitly, so an overlap with another
+    /// block is allowed - but something already in the calendar is still refused when the
+    /// setting says never to plan over one, which is the whole point of that setting.
+    /// </summary>
+    public bool ScheduleAt(WorkItem item, DateTime start, int minutes)
+    {
+        if (minutes <= 0) return false;
+
+        var end = start.AddMinutes(minutes);
+
+        if (Settings.Planning.PreventOverlap && IsBusy(start, end))
+        {
+            toasts.Warning("Something is already in the calendar then",
+                "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
+            return false;
+        }
+
+        AfterScheduled(item, planner.Add(item, start, minutes), "Booked");
+        return true;
+    }
+
+    private void AfterScheduled(WorkItem item, Allocation allocation, string verb)
+    {
+        SchedulingFor = null;
+        SelectAllocation(allocation.Id);
+        if (allocation.Start.Date != WeekStart.Date) WeekStart = allocation.Start;
+        OfferTaskIfUntrackable(allocation);
+
+        toasts.Success($"{verb} #{item.Id}",
+            $"{Ui.RelativeDay(allocation.Start)} at {allocation.Start:HH:mm} for " +
+            $"{Ui.Duration(allocation.DurationMinutes)}.");
+
+        Changed?.Invoke();
     }
 
     // ---------------------------------------------------------------- sign-in

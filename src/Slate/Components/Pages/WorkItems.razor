@@ -219,6 +219,7 @@
 <WorkItemModal OnSchedule="Schedule" />
 <SpawnTaskDialog />
 <PriorityDialog />
+<ScheduleDialog />
 <NewWorkItemDialog OnCreated="Created" OnSchedule="Schedule" />
 
 @code {
@@ -270,22 +271,5 @@
         StateHasChanged();
     }
 
-    private void Schedule(WorkItem item)
-    {
-        var allocation = State.ScheduleNextFree(item);
-
-        if (allocation is null)
-        {
-            Toasts.Warning("No free slot in the next two weeks",
-                "Widen your working hours in Settings, or place it by hand on the Plan tab.");
-            return;
-        }
-
-        State.WeekStart = allocation.Start;
-        State.SelectAllocation(allocation.Id);
-        State.OfferTaskIfUntrackable(allocation);
-
-        Toasts.Success($"Scheduled #{item.Id}",
-            $"{Ui.RelativeDay(allocation.Start)} at {allocation.Start:HH:mm} for {Ui.Duration(allocation.DurationMinutes)}. Open Plan to adjust it.");
-    }
+    private void Schedule(WorkItem item) => State.BeginSchedule(item);
 }

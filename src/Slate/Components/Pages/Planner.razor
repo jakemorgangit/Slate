@@ -496,6 +496,7 @@
 
 <WorkItemModal OnSchedule="ScheduleNextFree" />
 <RecordTimeDialog />
+<ScheduleDialog />
 <SpawnTaskDialog />
 <PriorityDialog />
 <NewWorkItemDialog OnSchedule="ScheduleNextFree" />
@@ -522,14 +523,16 @@
     private PlanningSettings P => Settings.Current.Planning;
     private int SlotMinutes => Math.Clamp(P.SlotMinutes, 5, 120);
     private int SlotPx => Settings.Current.Ui.CompactDensity ? 22 : 30;
-    private int DayStartHour => Math.Clamp(P.DayStartHour, 0, 23);
+    // What the grid draws: the working day, or the whole 24 hours when that is turned on.
+    private int DayStartHour => P.GridStartHour;
     private TimeSpan DayStart => TimeSpan.FromHours(DayStartHour);
-
-    // Clamped against DayStartHour rather than the raw setting: Math.Clamp throws outright
-    // when min exceeds max, and an imported config can carry any hour it likes.
-    private TimeSpan DayEnd => TimeSpan.FromHours(Math.Clamp(P.DayEndHour, DayStartHour + 1, 24));
+    private TimeSpan DayEnd => TimeSpan.FromHours(P.GridEndHour);
     private int SlotCount => (int)((DayEnd - DayStart).TotalMinutes / SlotMinutes);
-    private int CapacityMinutes => (int)(DayEnd - DayStart).TotalMinutes;
+
+    // A day's load is measured against the hours actually worked, not against however much
+    // of the clock happens to be on screen - showing the full 24 hours does not make a
+    // nine-to-five day any emptier.
+    private int CapacityMinutes => (P.WorkEndHour - P.WorkStartHour) * 60;
 
     private string WeekLabel
     {
@@ -729,25 +732,8 @@
         InvokeAsync(StateHasChanged);
     }
 
-    /// <summary>Books the item into the next free gap, or says why it could not.</summary>
-    private void ScheduleNextFree(WorkItem item)
-    {
-        var allocation = State.ScheduleNextFree(item);
-
-        if (allocation is null)
-        {
-            Toasts.Warning("No free slot in the next two weeks",
-                "Widen your working hours in Settings, or place it by hand.");
-            return;
-        }
-
-        State.SelectAllocation(allocation.Id);
-        if (allocation.Start.Date != State.WeekStart.Date) State.WeekStart = allocation.Start;
-        State.OfferTaskIfUntrackable(allocation);
-
-        Toasts.Success($"Scheduled #{item.Id}",
-            $"{Ui.RelativeDay(allocation.Start)} at {allocation.Start:HH:mm} for {Ui.Duration(allocation.DurationMinutes)}.");
-    }
+    /// <summary>Opens the schedule dialog: next free gap, or a time of your choosing.</summary>
+    private void ScheduleNextFree(WorkItem item) => State.BeginSchedule(item);
 
     private void WarnIfConflict(Allocation allocation)
     {

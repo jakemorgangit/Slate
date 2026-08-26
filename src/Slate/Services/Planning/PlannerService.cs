@@ -352,6 +352,51 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     }
 
     /// <summary>
+    /// Takes on any of this app's events the plan does not know about, rebuilding the block
+    /// from what the event carries.
+    ///
+    /// This is what makes a week planned on one machine workable on another: the plan file
+    /// stays where it was written, but the calendar travels, so an event that says which
+    /// block it is and what that block was is enough to pick it up and carry on - moving it,
+    /// resizing it or deleting it - from anywhere.
+    ///
+    /// Only events still carrying our stamp are considered, and only when nothing in the
+    /// plan already claims them. Returns how many were taken on.
+    /// </summary>
+    public int AdoptOrphanEvents(IReadOnlyList<ExistingEvent> events)
+    {
+        var known = store.All.Select(a => a.Id).ToHashSet();
+        var claimed = store.All
+            .Where(a => a.OutlookEventId is not null)
+            .Select(a => a.OutlookEventId!)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var adopted = 0;
+
+        foreach (var e in events)
+        {
+            if (e.Payload is null || e.IsAllDay) continue;
+            if (e.AllocationId is Guid id && known.Contains(id)) continue;
+            if (claimed.Contains(e.Id)) continue;
+
+            var minutes = (int)Math.Round((e.End - e.Start).TotalMinutes);
+            var rebuilt = Graph.AllocationPayload.Read(e.Payload, e.Id, e.Start, minutes);
+            if (rebuilt is null || known.Contains(rebuilt.Id)) continue;
+
+            // An event deleted here but not yet sent would otherwise walk straight back in.
+            if (store.PendingDeletes.Contains(e.Id, StringComparer.Ordinal)) continue;
+
+            store.All.Add(rebuilt);
+            known.Add(rebuilt.Id);
+            claimed.Add(e.Id);
+            adopted++;
+        }
+
+        if (adopted > 0) Persist();
+        return adopted;
+    }
+
+    /// <summary>
     /// Pulls changes made in Outlook back into the plan for the window that was just fetched.
     /// Blocks with unsent local edits are left alone - the local edit wins until it is sent.
     /// </summary>
@@ -518,14 +563,23 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     // ---------------------------------------------------------------- helpers
 
-    /// <summary>Rounds a time to the configured grid granularity.</summary>
+    /// <summary>
+    /// Rounds a time to the configured grid granularity, and hands it back as plain wall
+    /// clock.
+    ///
+    /// The kind matters as much as the rounding: a Local time serialises with this machine's
+    /// offset, and a plan read back somewhere else - or after the clocks change - would slide
+    /// by that offset. Nine in the morning means nine in the morning wherever the plan is
+    /// opened, so the offset has no business being written down.
+    /// </summary>
     public DateTime Snap(DateTime value)
     {
         var slot = SlotMinutes;
         var minutes = (int)Math.Round(value.TimeOfDay.TotalMinutes / slot) * slot;
 
         // Rounding up from the last slot of the day would otherwise roll into tomorrow.
-        return value.Date.AddMinutes(Math.Min(minutes, (24 * 60) - slot));
+        var snapped = value.Date.AddMinutes(Math.Min(minutes, (24 * 60) - slot));
+        return DateTime.SpecifyKind(snapped, DateTimeKind.Unspecified);
     }
 
     /// <summary>The grid granularity, guarded so a bad setting can never divide by zero.</summary>

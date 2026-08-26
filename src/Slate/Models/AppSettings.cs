@@ -57,6 +57,7 @@ public sealed class AppSettings
         Ado.ExcludedStates ??= [];
 
         if (string.IsNullOrWhiteSpace(Calendar.SubjectTemplate)) Calendar.SubjectTemplate = "#{id} {title}";
+        if (string.IsNullOrWhiteSpace(Calendar.Marker)) Calendar.Marker = "-Slate-";
         Calendar.ReminderMinutes = Math.Clamp(Calendar.ReminderMinutes, 0, 40320);
         Calendar.ShowAs = Array.Find(ShowAsValues,
             v => string.Equals(v, Calendar.ShowAs, StringComparison.OrdinalIgnoreCase)) ?? "busy";
@@ -71,6 +72,14 @@ public sealed class AppSettings
         // bounds cross, which a raw DayStartHour of 24 would do.
         Planning.DayStartHour = Math.Clamp(Planning.DayStartHour, 0, 22);
         Planning.DayEndHour = Math.Clamp(Planning.DayEndHour, Planning.DayStartHour + 1, 24);
+
+        // Kept null rather than pinned to today's working day: null means "follow it", so
+        // moving the working day later carries the booking window with it instead of
+        // silently leaving it behind at an hour nobody chose.
+        if (Planning.AllocateFromHour is { } from)
+            Planning.AllocateFromHour = Math.Clamp(from, 0, 23);
+        if (Planning.AllocateUntilHour is { } until)
+            Planning.AllocateUntilHour = Math.Clamp(until, 1, 24);
         Planning.SlotMinutes = Math.Clamp(Planning.SlotMinutes, 5, 120);
         Planning.DefaultDurationMinutes =
             Math.Clamp(Planning.DefaultDurationMinutes, Planning.SlotMinutes, 24 * 60);
@@ -127,6 +136,13 @@ public sealed class CalendarSettings
     /// <summary>Supports {id}, {title}, {type}, {state}.</summary>
     public string SubjectTemplate { get; set; } = "#{id} {title}";
 
+    /// <summary>
+    /// Appended to every subject this app writes, and what tells a second machine which
+    /// events are its to manage. The plan file does not travel between machines; the
+    /// calendar does, so the calendar is where the truth about a block has to live.
+    /// </summary>
+    public string Marker { get; set; } = "-Slate-";
+
     public int ReminderMinutes { get; set; } = 5;
     public bool ReminderEnabled { get; set; } = true;
 
@@ -143,8 +159,57 @@ public sealed class CalendarSettings
 
 public sealed class PlanningSettings
 {
+    /// <summary>Start of the working day. With the full day off, this is also where the grid starts.</summary>
     public int DayStartHour { get; set; } = 8;
+
+    /// <summary>End of the working day, exclusive.</summary>
     public int DayEndHour { get; set; } = 19;
+
+    /// <summary>
+    /// Draw the whole 24 hours rather than only the working day, for anyone whose week does
+    /// not stop at five - on call, on shift, or simply booking around the evening.
+    /// </summary>
+    public bool ShowFullDay { get; set; }
+
+    /// <summary>
+    /// First hour automatic scheduling may place work in. Null follows the working day, which
+    /// is what most people want; setting it later leaves the start of the morning clear for
+    /// whatever the day actually opens with.
+    /// </summary>
+    public int? AllocateFromHour { get; set; }
+
+    /// <summary>Last hour automatic scheduling may run to, exclusive. Null follows the working day.</summary>
+    public int? AllocateUntilHour { get; set; }
+
+    // The four below are what the rest of the app should ask for: they hold the relationships
+    // between these settings in one place, so nothing has to remember that the grid and the
+    // working day stopped being the same thing.
+
+    /// <summary>Start of the working day, clamped to something usable.</summary>
+    [JsonIgnore]
+    public int WorkStartHour => Math.Clamp(DayStartHour, 0, 23);
+
+    /// <summary>End of the working day, always at least an hour after it starts.</summary>
+    [JsonIgnore]
+    public int WorkEndHour => Math.Clamp(DayEndHour, WorkStartHour + 1, 24);
+
+    /// <summary>First hour the grid draws.</summary>
+    [JsonIgnore]
+    public int GridStartHour => ShowFullDay ? 0 : WorkStartHour;
+
+    /// <summary>Last hour the grid draws, exclusive.</summary>
+    [JsonIgnore]
+    public int GridEndHour => ShowFullDay ? 24 : WorkEndHour;
+
+    /// <summary>First hour automatic scheduling will book into.</summary>
+    [JsonIgnore]
+    public int BookFromHour =>
+        Math.Clamp(AllocateFromHour ?? WorkStartHour, GridStartHour, GridEndHour - 1);
+
+    /// <summary>Last hour automatic scheduling will book into, exclusive.</summary>
+    [JsonIgnore]
+    public int BookUntilHour =>
+        Math.Clamp(AllocateUntilHour ?? WorkEndHour, BookFromHour + 1, GridEndHour);
 
     /// <summary>Grid granularity in minutes: 15, 30 or 60.</summary>
     public int SlotMinutes { get; set; } = 30;

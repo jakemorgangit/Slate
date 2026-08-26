@@ -18,7 +18,10 @@
         <div class="page-head">
             <div>
                 <h1>Settings</h1>
-                <p>Everything is stored on this machine only. Secrets are encrypted with your Windows account.</p>
+                <p>
+                    Saved as you go. Everything is stored on this machine only, and secrets are
+                    encrypted with your Windows account.
+                </p>
             </div>
             <div class="spacer"></div>
             <button class="btn" title="Version, author and build date"
@@ -29,66 +32,159 @@
                 <button class="btn" title="Load settings from a JSON file"
                         @onclick="ImportConfig">Import config…</button>
             </div>
-            @if (_dirty)
-            {
-                <span class="badge badge-warn">Unsaved changes</span>
-                <button class="btn" @onclick="Discard">Discard</button>
-            }
-            <button class="btn btn-primary" disabled="@(!_dirty)" @onclick="SaveAsync">Save</button>
         </div>
 
-        @* ---------------------------------------------------------- Azure DevOps *@
+        @* ---------------------------------------------------------- connect *@
+        @*
+            One card, one sign-in. Azure DevOps and Outlook are reached with the same
+            Microsoft account, so making them two separate rituals - sign in here, test the
+            connection over there - only ever meant being half connected without knowing it.
+        *@
         <div class="card">
             <div class="card-head">
                 <div class="grow">
                     <h2>
-                        <span class="dot" style="background: @(_draft.IsAdoConfigured ? "var(--ok)" : "var(--warn)")"></span>
-                        Azure DevOps
+                        <span class="dot" style="background: @ConnectionColour"></span>
+                        Connect
                     </h2>
-                    <div class="sub">Where your work items come from.</div>
+                    <div class="sub">One Microsoft sign-in for both Azure DevOps and Outlook.</div>
                 </div>
-            </div>
-            <div class="card-body">
-                <div class="field">
-                    <label for="org">Organization URL</label>
-                    <input id="org" class="input" placeholder="https://dev.azure.com/your-org"
-                           value="@_draft.Ado.OrganizationUrl" @onchange="e => Set(() => _draft.Ado.OrganizationUrl = Text(e).TrimEnd('/'))" />
-                    <span class="hint">Copy it from your browser's address bar when you are on any Azure DevOps page.</span>
-                </div>
+                <div class="connect-actions">
 
-                <div class="field">
-                    <label>Sign-in method</label>
-                    <div class="row">
-                        <button class="chip @(_draft.Ado.AuthMode == AdoAuthMode.Pat ? "on" : "")"
-                                @onclick="() => Set(() => _draft.Ado.AuthMode = AdoAuthMode.Pat)">Personal access token</button>
-                        <button class="chip @(_draft.Ado.AuthMode == AdoAuthMode.Entra ? "on" : "")"
-                                @onclick="() => Set(() => _draft.Ado.AuthMode = AdoAuthMode.Entra)">Microsoft sign-in</button>
-                    </div>
-                </div>
-
-                @if (_draft.Ado.AuthMode == AdoAuthMode.Pat)
+                @if (State.SignIn.IsSignedIn)
                 {
-                    <div class="field">
-                        <label for="pat">Personal access token</label>
-                        <input id="pat" class="input" type="password" autocomplete="off"
-                               placeholder="@(string.IsNullOrEmpty(_draft.Ado.PersonalAccessToken) ? "Paste your PAT" : "••••••••••••••••")"
-                               @onchange="e => Set(() => _draft.Ado.PersonalAccessToken = Text(e))" />
-                        <span class="hint">
-                            In Azure DevOps: <strong>User settings → Personal access tokens → New Token</strong>,
-                            with the <strong>Work Items (Read &amp; Write)</strong> scope - write is needed to record time. Stored encrypted with Windows DPAPI.
-                        </span>
-                    </div>
+                    <span class="badge badge-ok">Signed in as @State.SignIn.Username</span>
+                    <span class="badge @(_adoOk ? "badge-ok" : "badge-muted")">
+                        Azure DevOps @(_adoOk ? "connected" : "not checked")
+                    </span>
+                    <span class="topbar-spacer"></span>
+                    <button class="btn btn-sm" disabled="@_busyConnect" @onclick="ConnectAsync">
+                        @if (_busyConnect) { <span class="spinner"></span> }
+                        <span>Re-check</span>
+                    </button>
+                    <button class="btn btn-sm" @onclick="SignOutAsync">Sign out</button>
                 }
                 else
+                {
+                    <button class="btn btn-primary" disabled="@(_busyConnect || !CanConnect)" @onclick="ConnectAsync">
+                        @if (_busyConnect) { <span class="spinner on-accent"></span> }
+                        <span>Sign in with Microsoft</span>
+                    </button>
+                    @if (!_draft.Entra.IsConfigured)
+                    {
+                        <span class="muted">Enter a valid client ID first.</span>
+                    }
+                    else if (string.IsNullOrWhiteSpace(_draft.Ado.OrganizationUrl))
+                    {
+                        <span class="muted">Enter your organization URL first.</span>
+                    }
+                }
+                </div>
+                <button class="btn btn-sm btn-ghost" @onclick="() => _showSetup = !_showSetup">
+                    @(_showSetup ? "Hide setup steps" : "How do I get a client ID?")
+                </button>
+            </div>
+
+            <div class="card-body">
+                @if (_showSetup)
                 {
                     <div class="banner info">
                         <span>i</span>
                         <div class="grow">
-                            Uses the same Microsoft sign-in as the calendar below. Your app registration also needs the
-                            <strong>Azure DevOps → user_impersonation</strong> delegated permission.
+                            <ol class="steps">
+                                <li>Open the <strong>Azure portal</strong> → <strong>Microsoft Entra ID</strong> →
+                                    <strong>App registrations</strong> → <strong>New registration</strong>.</li>
+                                <li>Name it anything (for example <code>Slate</code>) and pick the account
+                                    types that match your organisation.</li>
+                                <li>Under <strong>Redirect URI</strong> choose <strong>Public client/native
+                                    (mobile &amp; desktop)</strong> and enter <code>http://localhost</code>.</li>
+                                <li>Register, then copy the <strong>Application (client) ID</strong> and
+                                    <strong>Directory (tenant) ID</strong> into the boxes below.</li>
+                                <li><strong>API permissions</strong> → <strong>Add a permission</strong> →
+                                    <strong>Microsoft Graph</strong> → <strong>Delegated</strong> → add
+                                    <code>User.Read</code> and <code>Calendars.ReadWrite</code>.</li>
+                                <li>Only if you chose Microsoft sign-in for Azure DevOps above:
+                                    <strong>Add a permission</strong> → <strong>APIs my organization uses</strong> →
+                                    <strong>Azure DevOps</strong> → <code>user_impersonation</code>.</li>
+                                <li><strong>Authentication</strong> → set <strong>Allow public client flows</strong> to
+                                    <strong>Yes</strong>.</li>
+                            </ol>
+                            <button class="btn btn-sm" style="margin-top: 10px"
+                                    @onclick="@(() => SystemShell.OpenUrl("https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"))">
+                                Open app registrations ↗
+                            </button>
                         </div>
                     </div>
                 }
+
+                <div class="field">
+                    <label for="org">Azure DevOps organization URL</label>
+                    <input id="org" class="input" placeholder="https://dev.azure.com/your-org"
+                           value="@_draft.Ado.OrganizationUrl"
+                           @onchange="e => Set(() => _draft.Ado.OrganizationUrl = Text(e).TrimEnd('/'))" />
+                    <span class="hint">Copy it from your browser's address bar when you are on any Azure DevOps page.</span>
+                </div>
+
+                <details class="tucked" open="@(!_draft.Entra.IsConfigured)">
+                    <summary class="section-toggle">
+                        <span class="chevron">&#8250;</span>
+                        <h3>Microsoft app registration</h3>
+                    </summary>
+                    <div class="grid-2" style="margin-top: 8px">
+                        <div class="field">
+                            <label for="client">Application (client) ID</label>
+                            <input id="client" class="input mono" placeholder="00000000-0000-0000-0000-000000000000"
+                                   value="@_draft.Entra.ClientId" @onchange="e => Set(() => _draft.Entra.ClientId = Text(e))" />
+                        </div>
+                        <div class="field">
+                            <label for="tenant">Directory (tenant) ID</label>
+                            <input id="tenant" class="input mono" placeholder="common"
+                                   value="@_draft.Entra.TenantId" @onchange="e => Set(() => _draft.Entra.TenantId = Text(e))" />
+                            <span class="hint">Or <code>common</code> / <code>organizations</code> / <code>consumers</code>.</span>
+                        </div>
+                    </div>
+                </details>
+
+                @if (_connectResult is { } summary)
+                {
+                    <div class="banner @(_connectOk ? "info" : "error")">
+                        <span>@(_connectOk ? "i" : "!")</span>
+                        <div class="grow">@summary</div>
+                    </div>
+                }
+
+                @* The token route stays for anyone who cannot have an app registration. *@
+                <details class="tucked">
+                    <summary class="section-toggle">
+                        <span class="chevron">&#8250;</span>
+                        <h3>Use a personal access token instead</h3>
+                    </summary>
+                    <div style="margin-top: 8px">
+                        <div class="field">
+                            <label>Sign-in method</label>
+                            <div class="row">
+                                <button class="chip @(_draft.Ado.AuthMode == AdoAuthMode.Entra ? "on" : "")"
+                                        @onclick="() => Set(() => _draft.Ado.AuthMode = AdoAuthMode.Entra)">Microsoft sign-in</button>
+                                <button class="chip @(_draft.Ado.AuthMode == AdoAuthMode.Pat ? "on" : "")"
+                                        @onclick="() => Set(() => _draft.Ado.AuthMode = AdoAuthMode.Pat)">Personal access token</button>
+                            </div>
+                        </div>
+                        @if (_draft.Ado.AuthMode == AdoAuthMode.Pat)
+                        {
+                            <div class="field" style="margin-top: 8px">
+                                <label for="pat">Personal access token</label>
+                                <input id="pat" class="input" type="password" autocomplete="off"
+                                       placeholder="@(string.IsNullOrEmpty(_draft.Ado.PersonalAccessToken) ? "Paste your PAT" : "••••••••")"
+                                       @onchange="e => Set(() => _draft.Ado.PersonalAccessToken = Text(e))" />
+                                <span class="hint">
+                                    In Azure DevOps: <strong>User settings &#8594; Personal access tokens &#8594; New Token</strong>,
+                                    with the <strong>Work Items (Read &amp; Write)</strong> scope. A token reaches Azure
+                                    DevOps only - Outlook still needs the Microsoft sign-in above.
+                                </span>
+                            </div>
+                        }
+                    </div>
+                </details>
 
                 <div class="field">
                     <label for="project">Project</label>
@@ -116,18 +212,30 @@
                     </div>
                     <span class="hint">Leave empty to query across every project you can see.</span>
                 </div>
+
+                <div class="field">
+                    <label for="calendar">Target calendar</label>
+                    <div class="row">
+                        <select id="calendar" class="select" value="@_draft.Calendar.CalendarId"
+                                @onchange="OnCalendarChanged">
+                            <option value="">Default calendar</option>
+                            @foreach (var calendar in _calendars)
+                            {
+                                <option value="@calendar.Id">@calendar.Name</option>
+                            }
+                        </select>
+                        <button class="btn" disabled="@(_busyCalendars || !State.SignIn.IsSignedIn)" @onclick="LoadCalendarsAsync">
+                            @if (_busyCalendars) { <span class="spinner"></span> }
+                            <span>Load calendars</span>
+                        </button>
+                    </div>
+                    @if (!State.SignIn.IsSignedIn)
+                    {
+                        <span class="hint">Sign in first to list your calendars.</span>
+                    }
+                </div>
             </div>
 
-            <div class="card-foot">
-                <button class="btn" disabled="@_busyTest" @onclick="TestAdoAsync">
-                    @if (_busyTest) { <span class="spinner"></span> }
-                    <span>Test connection</span>
-                </button>
-                @if (_adoResult is { } result)
-                {
-                    <span class="badge @(_adoOk ? "badge-ok" : "badge-danger")">@result</span>
-                }
-            </div>
         </div>
 
         @* ---------------------------------------------------------- query *@
@@ -207,110 +315,6 @@
             </div>
         </div>
 
-        @* ---------------------------------------------------------- Microsoft account *@
-        <div class="card">
-            <div class="card-head">
-                <div class="grow">
-                    <h2>
-                        <span class="dot" style="background: @(State.SignIn.IsSignedIn ? "var(--ok)" : "var(--warn)")"></span>
-                        Microsoft account &amp; Outlook
-                    </h2>
-                    <div class="sub">Used to write events into your calendar.</div>
-                </div>
-                <button class="btn btn-sm btn-ghost" @onclick="() => _showSetup = !_showSetup">
-                    @(_showSetup ? "Hide setup steps" : "How do I get a client ID?")
-                </button>
-            </div>
-
-            <div class="card-body">
-                @if (_showSetup)
-                {
-                    <div class="banner info">
-                        <span>i</span>
-                        <div class="grow">
-                            <ol class="steps">
-                                <li>Open the <strong>Azure portal</strong> → <strong>Microsoft Entra ID</strong> →
-                                    <strong>App registrations</strong> → <strong>New registration</strong>.</li>
-                                <li>Name it anything (for example <code>Slate</code>) and pick the account
-                                    types that match your organisation.</li>
-                                <li>Under <strong>Redirect URI</strong> choose <strong>Public client/native
-                                    (mobile &amp; desktop)</strong> and enter <code>http://localhost</code>.</li>
-                                <li>Register, then copy the <strong>Application (client) ID</strong> and
-                                    <strong>Directory (tenant) ID</strong> into the boxes below.</li>
-                                <li><strong>API permissions</strong> → <strong>Add a permission</strong> →
-                                    <strong>Microsoft Graph</strong> → <strong>Delegated</strong> → add
-                                    <code>User.Read</code> and <code>Calendars.ReadWrite</code>.</li>
-                                <li>Only if you chose Microsoft sign-in for Azure DevOps above:
-                                    <strong>Add a permission</strong> → <strong>APIs my organization uses</strong> →
-                                    <strong>Azure DevOps</strong> → <code>user_impersonation</code>.</li>
-                                <li><strong>Authentication</strong> → set <strong>Allow public client flows</strong> to
-                                    <strong>Yes</strong>.</li>
-                            </ol>
-                            <button class="btn btn-sm" style="margin-top: 10px"
-                                    @onclick="@(() => SystemShell.OpenUrl("https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"))">
-                                Open app registrations ↗
-                            </button>
-                        </div>
-                    </div>
-                }
-
-                <div class="grid-2">
-                    <div class="field">
-                        <label for="client">Application (client) ID</label>
-                        <input id="client" class="input mono" placeholder="00000000-0000-0000-0000-000000000000"
-                               value="@_draft.Entra.ClientId" @onchange="e => Set(() => _draft.Entra.ClientId = Text(e))" />
-                    </div>
-                    <div class="field">
-                        <label for="tenant">Directory (tenant) ID</label>
-                        <input id="tenant" class="input mono" placeholder="common"
-                               value="@_draft.Entra.TenantId" @onchange="e => Set(() => _draft.Entra.TenantId = Text(e))" />
-                        <span class="hint">Or <code>common</code> / <code>organizations</code> / <code>consumers</code>.</span>
-                    </div>
-                </div>
-
-                <div class="field">
-                    <label for="calendar">Target calendar</label>
-                    <div class="row">
-                        <select id="calendar" class="select" value="@_draft.Calendar.CalendarId"
-                                @onchange="OnCalendarChanged">
-                            <option value="">Default calendar</option>
-                            @foreach (var calendar in _calendars)
-                            {
-                                <option value="@calendar.Id">@calendar.Name</option>
-                            }
-                        </select>
-                        <button class="btn" disabled="@(_busyCalendars || !State.SignIn.IsSignedIn)" @onclick="LoadCalendarsAsync">
-                            @if (_busyCalendars) { <span class="spinner"></span> }
-                            <span>Load calendars</span>
-                        </button>
-                    </div>
-                    @if (!State.SignIn.IsSignedIn)
-                    {
-                        <span class="hint">Sign in first to list your calendars.</span>
-                    }
-                </div>
-            </div>
-
-            <div class="card-foot">
-                @if (State.SignIn.IsSignedIn)
-                {
-                    <span class="badge badge-ok">Signed in as @State.SignIn.Username</span>
-                    <button class="btn btn-sm" @onclick="SignOutAsync">Sign out</button>
-                }
-                else
-                {
-                    <button class="btn btn-primary" disabled="@(_busySignIn || !_draft.Entra.IsConfigured)" @onclick="SignInAsync">
-                        @if (_busySignIn) { <span class="spinner on-accent"></span> }
-                        <span>Sign in with Microsoft</span>
-                    </button>
-                    @if (!_draft.Entra.IsConfigured)
-                    {
-                        <span class="muted">Enter a valid client ID first.</span>
-                    }
-                }
-            </div>
-        </div>
-
         @* ---------------------------------------------------------- event defaults *@
         @if (State.ShowOutlook)
         {
@@ -329,6 +333,19 @@
                     <span class="hint">
                         Placeholders: <code>{id}</code> <code>{title}</code> <code>{type}</code>
                         <code>{state}</code> <code>{project}</code>
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label for="marker">Marker</label>
+                    <input id="marker" class="input mono" placeholder="-Slate-"
+                           value="@_draft.Calendar.Marker"
+                           @onchange="e => Set(() => _draft.Calendar.Marker = Text(e))" />
+                    <span class="hint">
+                        Added to the end of every subject this app writes, and how another machine
+                        knows which events are its to manage. Your plan file does not travel between
+                        machines but your calendar does, so a week planned on one turns up on the
+                        other and can be moved or deleted there. Keep it the same everywhere.
                     </span>
                 </div>
 
@@ -400,7 +417,7 @@
             <div class="card-body">
                 <div class="grid-3">
                     <div class="field">
-                        <label for="start">Day starts at</label>
+                        <label for="start">Working day starts</label>
                         <select id="start" class="select" value="@_draft.Planning.DayStartHour"
                                 @onchange="e => Set(() => _draft.Planning.DayStartHour = Int(e, 8, 0, 22))">
                             @for (var h = 0; h <= 22; h++)
@@ -410,7 +427,7 @@
                         </select>
                     </div>
                     <div class="field">
-                        <label for="end">Day ends at</label>
+                        <label for="end">Working day ends</label>
                         <select id="end" class="select" value="@_draft.Planning.DayEndHour"
                                 @onchange="e => Set(() => _draft.Planning.DayEndHour = Int(e, 18, 1, 24))">
                             @for (var h = 1; h <= 24; h++)
@@ -429,6 +446,47 @@
                         </select>
                     </div>
                 </div>
+
+                <label class="switch">
+                    <input type="checkbox" checked="@_draft.Planning.ShowFullDay"
+                           @onchange="e => Set(() => _draft.Planning.ShowFullDay = Bool(e))" />
+                    <span class="track"></span>
+                    <span class="label">Show the full 24 hours, not just the working day</span>
+                </label>
+                <span class="hint">
+                    For on-call or shift weeks. A day's load is still measured against the working
+                    hours above, so showing more of the clock does not make a day look emptier.
+                </span>
+
+                <div class="grid-2">
+                    <div class="field">
+                        <label for="book-from">Book time from</label>
+                        <select id="book-from" class="select" value="@BookFromValue"
+                                @onchange="e => Set(() => _draft.Planning.AllocateFromHour = NullableHour(e))">
+                            <option value="">When the working day starts</option>
+                            @for (var h = _draft.Planning.GridStartHour; h < _draft.Planning.GridEndHour; h++)
+                            {
+                                <option value="@h">@($"{h:00}:00")</option>
+                            }
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="book-until">Book time until</label>
+                        <select id="book-until" class="select" value="@BookUntilValue"
+                                @onchange="e => Set(() => _draft.Planning.AllocateUntilHour = NullableHour(e))">
+                            <option value="">When the working day ends</option>
+                            @for (var h = _draft.Planning.GridStartHour + 1; h <= _draft.Planning.GridEndHour; h++)
+                            {
+                                <option value="@h">@($"{h:00}:00")</option>
+                            }
+                        </select>
+                    </div>
+                </div>
+                <span class="hint">
+                    Where <strong>Schedule…</strong> and <kbd>Enter</kbd> are allowed to put work. Keep
+                    the first hour of the day for catching up by booking from 10:00 while the day still
+                    starts at 09:00 - you can always drag a block there yourself.
+                </span>
 
                 <div class="grid-2">
                     <div class="field">
@@ -611,12 +669,11 @@
     private bool _showAbout;
 
     private AppSettings _draft = new();
-    private bool _dirty;
     private bool _showSetup;
 
-    private bool _busyTest, _busyProjects, _busyQueries, _busyCalendars, _busySignIn;
-    private string? _adoResult;
-    private bool _adoOk;
+    private bool _busyProjects, _busyQueries, _busyCalendars, _busyConnect;
+    private bool _adoOk, _connectOk;
+    private string? _connectResult;
 
     private List<AdoProject> _projects = [];
     private List<AdoQuery> _queries = [];
@@ -648,15 +705,33 @@
 
     // ---------------------------------------------------------------- draft plumbing
 
+    /// <summary>
+    /// Applies a change and writes it there and then. Settings are small and every control
+    /// here is a discrete choice, so a Save button only stood between somebody and the thing
+    /// they had just asked for - and made every other action on the page have to remember to
+    /// commit first.
+    ///
+    /// The draft is rebuilt from what was stored rather than kept: Save normalises as it
+    /// goes, so re-reading is what puts a clamped value back in front of the person who
+    /// typed it.
+    /// </summary>
     private void Set(Action mutate)
     {
         mutate();
-        _dirty = true;
+        Store.Save(_draft);
+        _draft = Store.CreateDraft();
     }
 
     private static string Text(ChangeEventArgs e) => e.Value?.ToString()?.Trim() ?? "";
 
     private static bool Bool(ChangeEventArgs e) => e.Value is true or "true" or "on";
+
+    /// <summary>Empty means "follow the working day", which is what null stands for.</summary>
+    private static int? NullableHour(ChangeEventArgs e) =>
+        int.TryParse(e.Value?.ToString(), out var parsed) ? Math.Clamp(parsed, 0, 24) : null;
+
+    private string BookFromValue => _draft.Planning.AllocateFromHour?.ToString() ?? "";
+    private string BookUntilValue => _draft.Planning.AllocateUntilHour?.ToString() ?? "";
 
     private static int Int(ChangeEventArgs e, int fallback, int min, int max) =>
         int.TryParse(e.Value?.ToString(), out var parsed) ? Math.Clamp(parsed, min, max) : fallback;
@@ -694,8 +769,6 @@
     /// </summary>
     private void ExportConfig()
     {
-        CommitIfDirty();
-
         var path = SystemShell.AskWhereToSave(ConfigTransfer.SuggestedFileName);
         if (path is null) return;
 
@@ -723,36 +796,11 @@
         }
 
         _draft = Store.CreateDraft();
-        _dirty = false;
         _projects = [];
         _queries = [];
 
         Toasts.Success("Configuration imported", string.Join(", ", result.Applied) + ". Your access token was kept.");
         _ = State.LoadWorkItemsAsync();
-    }
-
-    private void Discard()
-    {
-        _draft = Store.CreateDraft();
-        _dirty = false;
-    }
-
-    private Task SaveAsync()
-    {
-        Store.Save(_draft);
-        _draft = Store.CreateDraft();
-        _dirty = false;
-        Toasts.Success("Settings saved");
-        return Task.CompletedTask;
-    }
-
-    /// <summary>Actions that hit the network need the draft persisted first.</summary>
-    private void CommitIfDirty()
-    {
-        if (!_dirty) return;
-        Store.Save(_draft);
-        _draft = Store.CreateDraft();
-        _dirty = false;
     }
 
     private static string AccentSwatch(string accent) => accent switch
@@ -766,32 +814,8 @@
 
     // ---------------------------------------------------------------- actions
 
-    private async Task TestAdoAsync()
-    {
-        CommitIfDirty();
-        _busyTest = true;
-        _adoResult = null;
-
-        try
-        {
-            var who = await Ado.TestConnectionAsync();
-            _adoOk = true;
-            _adoResult = $"Connected as {who}";
-        }
-        catch (Exception ex) when (ex is AzureDevOpsException or InteractiveSignInRequiredException or InvalidOperationException)
-        {
-            _adoOk = false;
-            _adoResult = ex.Message;
-        }
-        finally
-        {
-            _busyTest = false;
-        }
-    }
-
     private async Task LoadProjectsAsync()
     {
-        CommitIfDirty();
         _busyProjects = true;
 
         try
@@ -811,7 +835,6 @@
 
     private async Task LoadQueriesAsync()
     {
-        CommitIfDirty();
         _busyQueries = true;
 
         try
@@ -831,7 +854,6 @@
 
     private async Task LoadCalendarsAsync()
     {
-        CommitIfDirty();
         _busyCalendars = true;
 
         try
@@ -851,33 +873,83 @@
 
     private async Task PreviewAsync()
     {
-        CommitIfDirty();
         await State.LoadWorkItemsAsync(showToast: true);
     }
 
-    private async Task SignInAsync()
+    private bool CanConnect =>
+        _draft.Entra.IsConfigured && !string.IsNullOrWhiteSpace(_draft.Ado.OrganizationUrl);
+
+    private string ConnectionColour =>
+        State.SignIn.IsSignedIn && _adoOk ? "var(--ok)"
+        : State.SignIn.IsSignedIn ? "var(--warn)"
+        : "var(--warn)";
+
+    /// <summary>
+    /// The whole connection in one go: sign in, prove Azure DevOps answers, then fetch the
+    /// things that were previously behind their own buttons. Signing in and separately
+    /// remembering to test the other half was the step people were leaving half done.
+    ///
+    /// Azure DevOps is left on whatever sign-in method is configured. Switching a token user
+    /// to Entra behind their back would break a working setup on the way past.
+    /// </summary>
+    private async Task ConnectAsync()
     {
-        CommitIfDirty();
-        _busySignIn = true;
+        _busyConnect = true;
+        _connectResult = null;
+        StateHasChanged();
 
         try
         {
             await Auth.SignInAsync();
             await State.RefreshSignInAsync();
 
-            var profile = await Graph.GetProfileAsync();
-            Toasts.Success("Signed in", $"Connected to Outlook as {profile.Mail}.");
+            var outlook = "Outlook is connected.";
+            try
+            {
+                var profile = await Graph.GetProfileAsync();
+                outlook = $"Outlook is connected as {profile.Mail}.";
+                await LoadCalendarsAsync();
+            }
+            catch (GraphException ex)
+            {
+                outlook = $"Signed in, but Outlook did not answer: {ex.Message}";
+            }
 
-            await LoadCalendarsAsync();
+            var ado = "Azure DevOps is not configured yet.";
+            if (_draft.IsAdoConfigured)
+            {
+                try
+                {
+                    var who = await Ado.TestConnectionAsync();
+                    _adoOk = true;
+                    ado = $"Azure DevOps answered as {who}.";
+                    _projects = await Ado.GetProjectsAsync();
+                }
+                catch (Exception ex) when (ex is AzureDevOpsException or InteractiveSignInRequiredException)
+                {
+                    _adoOk = false;
+                    ado = $"Azure DevOps refused the connection: {ex.Message}";
+                }
+            }
+
+            _connectOk = _adoOk;
+            _connectResult = $"{ado} {outlook}";
+
             await State.LoadEventsAsync();
+            if (_adoOk) await State.LoadWorkItemsAsync();
+
+            if (_connectOk) Toasts.Success("Connected", _connectResult);
+            else Toasts.Warning("Partly connected", _connectResult);
         }
-        catch (Exception ex) when (ex is Microsoft.Identity.Client.MsalException or GraphException or InvalidOperationException)
+        catch (Exception ex) when (ex is Microsoft.Identity.Client.MsalException or InvalidOperationException)
         {
+            _connectOk = false;
+            _connectResult = ex.Message;
             Toasts.Error("Sign-in failed", ex.Message);
         }
         finally
         {
-            _busySignIn = false;
+            _busyConnect = false;
         }
     }
 
