@@ -4,41 +4,39 @@
 @inject AppState State
 
 @*
-    The states a work item can move to, as its process template defines them. Rendered
-    wherever a work item can be acted on, so the same set of choices turns up in the same
-    order whether it is reached from a menu, the table or the work item window.
+    The work item's status: the state it is in as a single pill, and a dropdown to move it
+    somewhere else. A pill per state read nicely with four of them and became a wall of
+    colour on a process template that defines a dozen, so only the current one is coloured.
 *@
 
-@if (_states.Count > 0)
-{
-    <div class="state-choices @(Compact ? "compact" : "")">
-        @foreach (var option in _states)
-        {
-            var current = string.Equals(option.Name, Current, StringComparison.OrdinalIgnoreCase);
-            <button class="chip state-pill @(current ? "on" : "")"
-                    style="@Ui.StatePillStyle(option, current)"
-                    disabled="@(Busy || current)"
-                    title="@(current ? $"Already {option.Name}" : $"Move this work item to {option.Name}")"
-                    @onclick="() => PickAsync(option)"
-                    @onclick:stopPropagation="true">
-                @if (Busy && string.Equals(option.Name, _pending, StringComparison.OrdinalIgnoreCase))
-                {
-                    <span class="spinner"></span>
-                }
-                else
-                {
-                    <span class="dot" style="background: @Ui.StateColour(option)"></span>
-                }
-                <span>@option.Name</span>
-            </button>
-        }
-    </div>
-}
-else if (!string.IsNullOrWhiteSpace(Current))
-{
-    @* Either the states have not arrived yet, or this project would not give them up. *@
-    <span class="muted" style="font-size: 11.5px">@Current</span>
-}
+<div class="state-control">
+    @if (Option is { } current)
+    {
+        <span class="chip state-pill on" style="@Ui.StatePillStyle(current, true)" title="@StatusTitle">
+            <span class="dot" style="background: @Ui.StateColour(current)"></span>
+            <span>@current.Name</span>
+        </span>
+    }
+    else if (!string.IsNullOrWhiteSpace(Current))
+    {
+        <span class="chip state-pill on" title="@StatusTitle">@Current</span>
+    }
+
+    @if (Moves.Count > 0)
+    {
+        @* Keyed on the current state: once it moves, the list of destinations changes under
+           the dropdown, and without a fresh element the browser keeps whatever index was
+           selected and shows a state nobody picked. *@
+        <select @key="Current" class="select state-select" disabled="@Busy" @onchange="OnSelectedAsync"
+                @onclick:stopPropagation="true" title="Move this work item to another state">
+            <option value="">@(Busy ? "Saving…" : "Change to…")</option>
+            @foreach (var option in Moves)
+            {
+                <option value="@option.Name">@option.Name</option>
+            }
+        </select>
+    }
+</div>
 
 @code {
     [Parameter, EditorRequired] public int WorkItemId { get; set; }
@@ -46,16 +44,22 @@ else if (!string.IsNullOrWhiteSpace(Current))
     [Parameter, EditorRequired] public string WorkItemType { get; set; } = "";
     [Parameter, EditorRequired] public string Current { get; set; } = "";
 
-    /// <summary>Tighter spacing, where there is less room than a page has.</summary>
-    [Parameter] public bool Compact { get; set; }
-
     /// <summary>Raised after the state has actually been written.</summary>
     [Parameter] public EventCallback<string> OnChanged { get; set; }
 
     private IReadOnlyList<WorkItemStateOption> _states = [];
-    private string? _pending;
 
     private bool Busy => State.SavingStateFor == WorkItemId;
+
+    /// <summary>The state the item is in, when the process template owns up to it.</summary>
+    private WorkItemStateOption? Option =>
+        _states.FirstOrDefault(s => string.Equals(s.Name, Current, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Everywhere it could go instead - so, everything but where it already is.</summary>
+    private IReadOnlyList<WorkItemStateOption> Moves =>
+        [.. _states.Where(s => !string.Equals(s.Name, Current, StringComparison.OrdinalIgnoreCase))];
+
+    private string StatusTitle => $"This work item is {Current}";
 
     protected override void OnInitialized() => State.Changed += OnStateChanged;
 
@@ -74,19 +78,12 @@ else if (!string.IsNullOrWhiteSpace(Current))
 
     public void Dispose() => State.Changed -= OnStateChanged;
 
-    private async Task PickAsync(WorkItemStateOption option)
+    private async Task OnSelectedAsync(ChangeEventArgs e)
     {
-        if (Busy || string.Equals(option.Name, Current, StringComparison.OrdinalIgnoreCase)) return;
+        var picked = e.Value?.ToString();
+        if (string.IsNullOrWhiteSpace(picked) || Busy) return;
 
-        _pending = option.Name;
-        try
-        {
-            if (await State.SetStateAsync(WorkItemId, option.Name))
-                await OnChanged.InvokeAsync(option.Name);
-        }
-        finally
-        {
-            _pending = null;
-        }
+        if (await State.SetStateAsync(WorkItemId, picked))
+            await OnChanged.InvokeAsync(picked);
     }
 }

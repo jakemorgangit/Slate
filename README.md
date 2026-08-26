@@ -246,9 +246,12 @@ The block stays put either way. Turn the offer off in Settings, or from the noti
 
 ## Changing the status
 
-Open a work item and the states its type can take sit along the bottom of the window, in the order
-its process template defines them — New, Active, Resolved, Closed and whatever else your process
-adds. The one it is in is filled; pick another and it is written to Azure DevOps straight away.
+Open a work item and its status sits along the bottom of the window: a coloured pill for the state
+it is in, and a **Change to…** dropdown listing everywhere else it could go, in the order its
+process template defines them. Pick one and it is written to Azure DevOps straight away.
+
+A pill per state read well enough with four of them and became a wall of colour on a process that
+defines a dozen, so only the current one is coloured.
 
 Deliberately only there and in the record-time dialog. The state is what the rest of the team reads
 as "where is this up to", so it is not something to change in passing from a list or a right-click

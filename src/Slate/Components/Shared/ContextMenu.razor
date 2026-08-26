@@ -1,11 +1,13 @@
-@* A right-click menu positioned at the pointer, kept inside the window. *@
+@* A right-click menu positioned at the pointer, kept whole and inside the window. *@
+
+@inject IJSRuntime Js
 
 @if (Visible)
 {
     <div class="modal-scrim" style="background: transparent; backdrop-filter: none; padding: 0"
          @onclick="Close" @oncontextmenu="Close" @oncontextmenu:preventDefault="true">
 
-        <div class="menu" style="@PositionStyle" @onclick:stopPropagation="true">
+        <div class="menu" @ref="_menu" style="@InitialPosition" @onclick:stopPropagation="true">
             @if (!string.IsNullOrWhiteSpace(Heading))
             {
                 <div class="heading" title="@Heading">@Heading</div>
@@ -24,13 +26,36 @@
     [Parameter] public EventCallback OnClose { get; set; }
     [Parameter] public RenderFragment? ChildContent { get; set; }
 
+    private ElementReference _menu;
+
     /// <summary>
-    /// Anchors the menu at the pointer. Flipping is done in CSS terms rather than by
-    /// measuring, so a menu near the right or bottom edge opens back towards the middle.
+    /// Where to draw it before it has been measured. Deliberately rough - it only has to
+    /// avoid a visible jump; <c>planner.placeMenu</c> settles it against the real size.
     /// </summary>
-    private string PositionStyle =>
-        $"left: min({X.ToString("0", System.Globalization.CultureInfo.InvariantCulture)}px, calc(100vw - 232px)); " +
-        $"top: min({Y.ToString("0", System.Globalization.CultureInfo.InvariantCulture)}px, calc(100vh - 260px));";
+    private string InitialPosition =>
+        $"left: min({Round(X)}px, calc(100vw - 232px)); top: min({Round(Y)}px, calc(100vh - 120px));";
+
+    private static string Round(double value) =>
+        value.ToString("0", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Positions against the menu as actually laid out. Its height and width depend on the
+    /// work item behind it, so this cannot be worked out ahead of time - and a menu that
+    /// runs off the window is one whose bottom entries cannot be reached at all.
+    /// </summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!Visible) return;
+
+        try
+        {
+            await Js.InvokeVoidAsync("planner.placeMenu", _menu, X, Y);
+        }
+        catch (JSException)
+        {
+            // The menu closed between render and call. Its position no longer matters.
+        }
+    }
 
     private Task Close() => OnClose.InvokeAsync();
 }

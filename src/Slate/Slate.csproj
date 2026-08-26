@@ -13,7 +13,7 @@
     <ApplicationIcon>appicon.ico</ApplicationIcon>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Product>Slate</Product>
     <Company>Blackcat Data Solutions Limited</Company>
     <Authors>Jake Morgan</Authors>

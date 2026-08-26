@@ -55,22 +55,26 @@
                 @if (StateOptions.Count > 0)
                 {
                     <div class="field">
-                        <label>Status <span class="muted">(optional)</span></label>
-                        <div class="state-choices">
-                            <button class="chip @(_newState is null ? "on" : "")"
-                                    title="Book the time without touching the work item's state"
-                                    @onclick="() => _newState = null">Leave as @Current?.State</button>
-                            @foreach (var option in StateOptions.Where(o => !string.Equals(o.Name, Current?.State, StringComparison.OrdinalIgnoreCase)))
+                        <label for="time-state">Status <span class="muted">(optional)</span></label>
+                        <div class="state-control">
+                            @if (CurrentOption is { } now)
                             {
-                                var picked = string.Equals(option.Name, _newState, StringComparison.OrdinalIgnoreCase);
-                                <button class="chip state-pill @(picked ? "on" : "")"
-                                        style="@Ui.StatePillStyle(option, picked)"
-                                        title="@($"Move this work item to {option.Name} when the time is recorded")"
-                                        @onclick="() => _newState = option.Name">
-                                    <span class="dot" style="background: @Ui.StateColour(option)"></span>
-                                    <span>@option.Name</span>
-                                </button>
+                                <span class="chip state-pill on" style="@Ui.StatePillStyle(now, true)"
+                                      title="@($"This work item is {now.Name}")">
+                                    <span class="dot" style="background: @Ui.StateColour(now)"></span>
+                                    <span>@now.Name</span>
+                                </span>
                             }
+                            <select id="time-state" class="select state-select" @onchange="OnStateChosen">
+                                <option value="" selected="@(_newState is null)">Leave unchanged</option>
+                                @foreach (var option in StateOptions.Where(o => !string.Equals(o.Name, Current?.State, StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    <option value="@option.Name"
+                                            selected="@string.Equals(option.Name, _newState, StringComparison.OrdinalIgnoreCase)">
+                                        Move to @option.Name
+                                    </option>
+                                }
+                            </select>
                         </div>
                         <span class="hint">Applied after the hours go on, and only if they do.</span>
                     </div>
@@ -151,6 +155,17 @@
         !State.CanEditWorkItems || Current is not { } item
             ? []
             : State.KnownStates(item.Project, item.WorkItemType);
+
+    /// <summary>The state the work item is in now, for the pill beside the dropdown.</summary>
+    private WorkItemStateOption? CurrentOption =>
+        StateOptions.FirstOrDefault(s =>
+            string.Equals(s.Name, Current?.State, StringComparison.OrdinalIgnoreCase));
+
+    private void OnStateChosen(ChangeEventArgs e)
+    {
+        var picked = e.Value?.ToString();
+        _newState = string.IsNullOrWhiteSpace(picked) ? null : picked;
+    }
 
     /// <summary>
     /// Shared with the discussion box in the work item window, so a note reads the way the

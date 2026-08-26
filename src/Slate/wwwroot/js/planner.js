@@ -364,6 +364,34 @@ window.planner = (() => {
         if (scroller) scroller.scrollTop = Math.max(0, offsetPixels - 60);
     }
 
+    // ---------------------------------------------------------------- menus
+
+    /**
+     * Places a context menu at the pointer and keeps the whole of it on screen.
+     *
+     * Measured rather than guessed: the menu's height depends on what the work item has -
+     * how many linked items, whether time has been recorded - and its width on how long
+     * those titles are, so no fixed offset can hold for every menu at every window size or
+     * zoom level. Anything still too tall for the window scrolls inside itself rather than
+     * running off the bottom where it cannot be reached.
+     */
+    function placeMenu(element, x, y) {
+        if (!element) return;
+
+        const margin = 8;
+        const vw = document.documentElement.clientWidth;
+        const vh = document.documentElement.clientHeight;
+
+        element.style.maxHeight = Math.max(120, vh - margin * 2) + 'px';
+
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(margin, Math.min(x, vw - margin - rect.width));
+        const top = Math.max(margin, Math.min(y, vh - margin - rect.height));
+
+        element.style.left = left + 'px';
+        element.style.top = top + 'px';
+    }
+
     // ---------------------------------------------------------------- shell safety net
 
     // The shell fills the window and html/body are overflow:hidden, so the document itself
@@ -386,6 +414,7 @@ window.planner = (() => {
         cancelResize,
         registerShortcuts,
         unregisterShortcuts,
+        placeMenu,
         focusSelector,
         caretIndex,
         setCaret,

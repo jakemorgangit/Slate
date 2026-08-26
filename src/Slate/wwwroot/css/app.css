@@ -376,13 +376,11 @@ input, select, textarea, button { font: inherit; color: inherit; }
 .switch input:checked + .track::after { transform: translateX(15px); background: #fff; }
 .switch .label { font-size: 12.5px; color: var(--text); }
 
-/* Work item state choices, wherever a work item can be acted on. */
-.state-choices { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.state-choices.compact { gap: 4px; }
-.state-pill { font-weight: 560; }
-.state-pill:disabled { cursor: default; opacity: 1; }
+/* The work item's status: where it is now, and a dropdown to move it. */
+.state-control { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.state-pill { font-weight: 560; cursor: default; }
 .state-pill .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
-.state-choices.compact .state-pill { font-size: 11px; padding: 2px 7px; }
+.state-select { width: auto; min-width: 132px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
 
 .chip {
     display: inline-flex;
@@ -1281,6 +1279,13 @@ table.data tbody tr:last-child td { border-bottom: none; }
     position: fixed;
     z-index: 900;
     min-width: 208px;
+    /* Capped so one long work item title cannot stretch the menu off the side of the
+       window, and scrollable so a tall one keeps its last entries reachable. The height
+       is set for real by planner.placeMenu once it knows the window. */
+    max-width: min(360px, calc(100vw - 16px));
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 5px;
     background: var(--surface);
     border: 1px solid var(--border-strong);
@@ -1302,6 +1307,14 @@ table.data tbody tr:last-child td { border-bottom: none; }
     text-align: left;
     cursor: pointer;
 }
+/* Long titles wrap onto another line rather than widening the menu or being clipped. */
+.menu button > * { min-width: 0; }
+.menu button .truncate {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+}
 .menu button:hover:not(:disabled) { background: var(--surface-3); }
 .menu button:disabled { opacity: 0.4; cursor: not-allowed; }
 .menu button .glyph { width: 15px; flex: none; text-align: center; opacity: 0.85; }
@@ -1312,9 +1325,7 @@ table.data tbody tr:last-child td { border-bottom: none; }
     padding: 5px 9px 6px;
     font-size: 11px;
     color: var(--text-3);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
 }
 
 .wi-clock { font-size: 11px; line-height: 1; color: var(--danger); margin-left: auto; }
