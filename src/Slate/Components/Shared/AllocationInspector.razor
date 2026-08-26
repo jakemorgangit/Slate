@@ -1,0 +1,152 @@
+@using Slate.Services
+@inject AppState State
+
+<div class="inspector" @onclick:stopPropagation="true">
+    <div class="inspector-head">
+        <span class="dot" style="background: @Ui.ColorFor(Allocation.WorkItemType); margin-top: 6px"></span>
+        <div class="grow">
+            <div style="font-weight: 600; line-height: 1.3">@Allocation.WorkItemTitle</div>
+            <div class="muted" style="font-size: 11.5px; margin-top: 2px">
+                #@Allocation.WorkItemId · @Allocation.WorkItemType · @Allocation.WorkItemState
+            </div>
+        </div>
+        <button class="btn btn-sm btn-ghost" title="Close (Esc)" @onclick="OnClose">✕</button>
+    </div>
+
+    <div class="inspector-body">
+        <div class="row wrap">
+            @if (State.ShowOutlook)
+            {
+                <span class="@Ui.SyncBadgeClass(Allocation.State)">@Ui.SyncLabel(Allocation.State)</span>
+            }
+            @if (Conflict)
+            {
+                <span class="badge badge-warn" title="Something else is already booked over this time">Overlaps Outlook</span>
+            }
+        </div>
+
+        <dl class="kv">
+            <dt>When</dt>
+            <dd>@Ui.RelativeDay(Allocation.Start), @Ui.TimeRange(Allocation.Start, Allocation.End)</dd>
+            <dt>Length</dt>
+            <dd>@Ui.Duration(Allocation.DurationMinutes)</dd>
+            @if (Allocation.SyncedAt is not null)
+            {
+                <dt>Last sent</dt>
+                <dd>@Ui.Ago(Allocation.SyncedAt)</dd>
+            }
+        </dl>
+
+        <div class="field">
+            <label>Length</label>
+            <div class="duration-row">
+                @foreach (var minutes in Presets)
+                {
+                    <button class="chip @(Allocation.DurationMinutes == minutes ? "on" : "")"
+                            @onclick="() => SetDuration(minutes)">@Ui.Duration(minutes)</button>
+                }
+                <button class="chip" title="Shorten by one slot" @onclick="() => Nudge(-SlotMinutes)">−</button>
+                <button class="chip" title="Lengthen by one slot" @onclick="() => Nudge(SlotMinutes)">+</button>
+            </div>
+        </div>
+
+        <div class="field">
+            <label for="alloc-notes">Notes <span class="muted">(added to the event body)</span></label>
+            <textarea id="alloc-notes" class="textarea" rows="3"
+                      placeholder="What are you actually going to do in this block?"
+                      value="@Allocation.Notes"
+                      @onchange="OnNotesChange"></textarea>
+        </div>
+
+        @if (State.ShowOutlook && Allocation.MissingInOutlook)
+        {
+            <div class="banner warn">
+                <span>!</span>
+                <div class="grow">
+                    <div>This event was deleted in Outlook.</div>
+                    <div class="row" style="margin-top: 8px">
+                        <button class="btn btn-sm" @onclick="OnSendNow">Send it again</button>
+                        <button class="btn btn-sm btn-danger" @onclick="OnForget">Remove from plan</button>
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (Recorded > 0)
+        {
+            <div class="banner">
+                <span style="color: var(--danger)"><ClockIcon Size="14" /></span>
+                <div class="grow">
+                    <strong>@Ui.Duration(Recorded)</strong> recorded against #@Allocation.WorkItemId.
+                    <button class="btn btn-sm btn-ghost" style="margin-left: 6px" @onclick="OnUndoTime">Undo last</button>
+                </div>
+            </div>
+        }
+
+        @if (Allocation.LastError is { } error)
+        {
+            <div class="banner error">
+                <span>✕</span>
+                <div class="grow">@error</div>
+            </div>
+        }
+    </div>
+
+    <div class="inspector-foot">
+        <button class="btn btn-sm" title="Show the full work item" @onclick="OnViewDetails">Details</button>
+
+        @if (State.CanRecordTime)
+        {
+            <button class="btn btn-sm" title="Book time against this work item" @onclick="OnRecordTime">
+                <span style="color: var(--danger)"><ClockIcon Size="13" /></span> Record time
+            </button>
+        }
+
+        @if (State.ShowOutlook)
+        {
+            <button class="btn btn-sm btn-primary" @onclick="OnSendNow"
+                    disabled="@(Allocation.State == SyncState.Synced || !State.CanUseOutlook)"
+                    title="@(State.CanUseOutlook ? "Create or update just this event" : "Sign in on the Settings page first")">
+                @(Allocation.OutlookEventId is null ? "Send to Outlook" : "Update in Outlook")
+            </button>
+        }
+
+        <span style="flex: 1"></span>
+
+        @if (State.ShowOutlook && Allocation.OutlookEventId is not null)
+        {
+            <button class="btn btn-sm btn-ghost" title="Forget this block but leave the Outlook event alone"
+                    @onclick="OnDetach">Unlink</button>
+        }
+
+        <button class="btn btn-sm btn-danger" title="Delete this block (Del)" @onclick="OnDelete">Delete</button>
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public Allocation Allocation { get; set; } = default!;
+    [Parameter] public bool Conflict { get; set; }
+    [Parameter] public int Recorded { get; set; }
+    [Parameter] public int SlotMinutes { get; set; } = 30;
+
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public EventCallback<int> OnDurationChanged { get; set; }
+    [Parameter] public EventCallback<string> OnNotesChanged { get; set; }
+    [Parameter] public EventCallback OnDelete { get; set; }
+    [Parameter] public EventCallback OnDetach { get; set; }
+    [Parameter] public EventCallback OnSendNow { get; set; }
+    [Parameter] public EventCallback OnForget { get; set; }
+    [Parameter] public EventCallback OnRecordTime { get; set; }
+    [Parameter] public EventCallback OnUndoTime { get; set; }
+    [Parameter] public EventCallback OnViewDetails { get; set; }
+
+    private static readonly int[] Presets = [30, 60, 120, 240];
+
+    private Task SetDuration(int minutes) => OnDurationChanged.InvokeAsync(minutes);
+
+    private Task Nudge(int delta) =>
+        OnDurationChanged.InvokeAsync(Math.Max(SlotMinutes, Allocation.DurationMinutes + delta));
+
+    private Task OnNotesChange(ChangeEventArgs e) =>
+        OnNotesChanged.InvokeAsync(e.Value?.ToString() ?? "");
+}

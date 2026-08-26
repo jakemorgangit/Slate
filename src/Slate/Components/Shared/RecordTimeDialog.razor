@@ -1,0 +1,176 @@
+@using System.Globalization
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Settings
+
+@if (State.RecordingFor is { } allocation)
+{
+    <div class="modal-scrim" @onclick="Cancel">
+        <div class="modal narrow" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span style="color: var(--danger); margin-top: 3px"><ClockIcon Size="18" /></span>
+                <div class="grow">
+                    <h2>Record time</h2>
+                    <div class="sub">
+                        <span class="mono">#@allocation.WorkItemId</span>
+                        <span class="truncate">@allocation.WorkItemTitle</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close" @onclick="Cancel">✕</button>
+            </div>
+
+            <div class="modal-body">
+                <div class="field">
+                    <label for="hours">Hours to record</label>
+                    <input id="hours" class="input" type="number" step="0.25" min="0.25" max="24"
+                           value="@_hours.ToString("0.##", CultureInfo.InvariantCulture)"
+                           @onchange="OnHoursChanged" />
+                    <span class="hint">
+                        This block is @Ui.Duration(allocation.DurationMinutes)
+                        (@Ui.Hours(allocation.DurationMinutes)).
+                    </span>
+                </div>
+
+                <div class="duration-row">
+                    @foreach (var preset in Presets)
+                    {
+                        <button class="chip @(Math.Abs(_hours - preset) < 0.001 ? "on" : "")"
+                                @onclick="() => _hours = preset">@preset.ToString("0.##")h</button>
+                    }
+                    <button class="chip @(Math.Abs(_hours - BlockHours) < 0.001 ? "on" : "")"
+                            @onclick="() => _hours = BlockHours">This block</button>
+                </div>
+
+                <label class="switch">
+                    <input type="checkbox" checked="@_reduceRemaining"
+                           @onchange="OnReduceChanged" />
+                    <span class="track"></span>
+                    <span class="label">Take the same off Remaining Work</span>
+                </label>
+
+                @if (Current is { } item)
+                {
+                    <div class="banner info">
+                        <span>i</span>
+                        <div class="grow">
+                            Currently <strong>@Ui.Hours(AsMinutes(item.CompletedWork))</strong> completed,
+                            <strong>@Ui.Hours(AsMinutes(item.RemainingWork))</strong> remaining.
+                            After saving: <strong>@Ui.Hours(AsMinutes((item.CompletedWork ?? 0) + _hours))</strong> completed@(_reduceRemaining
+                                ? $", {Ui.Hours(AsMinutes(Math.Max(0, (item.RemainingWork ?? 0) - _hours)))} remaining"
+                                : "").
+                        </div>
+                    </div>
+                }
+
+                @if (allocation.RecordedMinutes > 0)
+                {
+                    <p class="muted" style="font-size: 12px">
+                        @Ui.Duration(allocation.RecordedMinutes) has already been recorded from this block
+                        (@Ui.Ago(allocation.LastRecordedAt)).
+                    </p>
+                }
+            </div>
+
+            <div class="modal-foot">
+                <span class="muted" style="font-size: 11.5px">Writes to Azure DevOps straight away.</span>
+                <span style="flex: 1"></span>
+                <button class="btn" @onclick="Cancel">Cancel</button>
+                <button class="btn btn-primary" disabled="@(_saving || _hours <= 0)" @onclick="SaveAsync">
+                    @if (_saving)
+                    {
+                        <span class="spinner on-accent"></span>
+                        <span>Saving…</span>
+                    }
+                    else
+                    {
+                        <span>Record @_hours.ToString("0.##")h</span>
+                    }
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private static readonly double[] Presets = [0.25, 0.5, 1, 2, 4];
+
+    private double _hours = 1;
+    private bool _reduceRemaining = true;
+    private bool _saving;
+    private Guid _openedFor;
+
+    private double BlockHours =>
+        State.RecordingFor is { } a ? Math.Round(a.DurationMinutes / 60.0, 2) : 1;
+
+    private WorkItem? Current =>
+        State.RecordingFor is { } a ? State.WorkItems.FirstOrDefault(i => i.Id == a.WorkItemId) : null;
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    protected override void OnParametersSet() => Prime();
+
+    /// <summary>Seeds the form the first time a given block opens the dialog.</summary>
+    private void Prime()
+    {
+        if (State.RecordingFor is not { } allocation) return;
+        if (_openedFor == allocation.Id) return;
+
+        _openedFor = allocation.Id;
+        _hours = Math.Max(0.25, BlockHours);
+        _reduceRemaining = Settings.Current.Planning.ReduceRemainingOnRecord;
+        _saving = false;
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        Prime();
+        StateHasChanged();
+    });
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    private void OnReduceChanged(ChangeEventArgs e) =>
+        _reduceRemaining = e.Value is true or "true" or "on";
+
+    /// <summary>Hours as whole minutes, rounded the same way the entry itself is.</summary>
+    private static int AsMinutes(double? hours) => (int)Math.Round((hours ?? 0) * 60);
+
+    private void OnHoursChanged(ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            _hours = Math.Clamp(Math.Round(parsed, 2), 0, 24);
+    }
+
+    private void Cancel()
+    {
+        _openedFor = Guid.Empty;
+        State.CancelRecordTime();
+    }
+
+    private async Task SaveAsync()
+    {
+        if (State.RecordingFor is not { } allocation || _saving || _hours <= 0) return;
+
+        _saving = true;
+        try
+        {
+            // Remember the choice so the next block starts from the same place.
+            var settings = Settings.Current;
+            if (settings.Planning.ReduceRemainingOnRecord != _reduceRemaining)
+            {
+                settings.Planning.ReduceRemainingOnRecord = _reduceRemaining;
+                Settings.Save(settings);
+            }
+
+            if (await State.RecordTimeAsync(allocation, _hours, _reduceRemaining))
+                _openedFor = Guid.Empty;
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+}

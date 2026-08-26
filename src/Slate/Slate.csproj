@@ -1,0 +1,110 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Slate</RootNamespace>
+    <AssemblyName>Slate</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>appicon.ico</ApplicationIcon>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <Version>1.0.0</Version>
+    <Product>Slate</Product>
+    <Company>Blackcat Data Solutions Limited</Company>
+    <Authors>Jake Morgan</Authors>
+    <Copyright>Copyright (c) $([System.DateTime]::UtcNow.Year) Blackcat Data Solutions Limited</Copyright>
+
+    <!-- Stamped at compile time so the About box can say when this build was made. -->
+    <BuildDate>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd"))</BuildDate>
+
+    <!-- Single-file publish knobs; see build/publish.ps1 -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <!-- UseWPF narrows the implicit using set, so the ones this project relies on are named here. -->
+  <ItemGroup>
+    <Using Include="System.IO" />
+    <Using Include="System.Net.Http" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BuildDate</_Parameter1>
+      <_Parameter2>$(BuildDate)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <!-- Also embedded as a resource so the window and taskbar pick it up, not just the .exe. -->
+  <ItemGroup>
+    <Resource Include="appicon.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Wpf" Version="10.0.100" />
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.88.0" />
+  </ItemGroup>
+
+  <!--
+    Every static web asset (this project's wwwroot plus Blazor's own _framework scripts) is
+    compiled into the assembly under a "webassets/" prefix, which is what lets the published
+    app be a single .exe. Two rules learned the hard way:
+      1. Never list a wwwroot file as EmbeddedResource directly. A file cannot be both
+         Content and EmbeddedResource, so the SDK drops it from the static web assets and
+         wwwroot stops being copied next to the .exe - which breaks the host page.
+         Staging a copy under obj/ gives the embedded items a separate identity.
+      2. Never force ResolveStaticWebAssetsInputs with DependsOnTargets. Running it early
+         leaves the pipeline half-initialised, with the same result. Hook AfterTargets so
+         it runs at its natural point.
+    RecursiveDir yields backslashes; the file provider normalises them.
+  -->
+  <Target Name="StageAndEmbedWebAssets"
+          DependsOnTargets="ResolveStaticWebAssetsInputs"
+          BeforeTargets="AssignTargetPaths;PrepareResources">
+
+    <ItemGroup>
+      <_WebAssetSource Include="@(StaticWebAsset)">
+        <CleanPath>$([System.Text.RegularExpressions.Regex]::Replace('%(StaticWebAsset.RelativePath)', '\#\[\.\{fingerprint\}\]\?', ''))</CleanPath>
+      </_WebAssetSource>
+    </ItemGroup>
+
+    <!--
+      Stage under obj/ and embed the copies. Embedding the wwwroot files themselves would
+      make them both Content and EmbeddedResource, and the SDK then drops them from the
+      static web assets set. RecursiveDir yields backslashes; the provider normalises them.
+    -->
+    <Copy SourceFiles="@(_WebAssetSource)"
+          DestinationFiles="@(_WebAssetSource->'$(IntermediateOutputPath)webassets\%(CleanPath)')"
+          SkipUnchangedFiles="true" />
+
+    <ItemGroup>
+      <_StagedWebAsset Include="$(IntermediateOutputPath)webassets\**\*" />
+      <EmbeddedResource Include="@(_StagedWebAsset)"
+                        LogicalName="webassets/%(RecursiveDir)%(Filename)%(Extension)" />
+    </ItemGroup>
+  </Target>
+
+  <!--
+    Those same assets are also copied next to the .exe, where they are now dead weight.
+    Strip them (and the reference XML docs) so publish really does leave one file.
+  -->
+  <Target Name="TrimSingleFilePublish" AfterTargets="Publish" Condition="'$(PublishSingleFile)' == 'true'">
+    <ItemGroup>
+      <_RedundantPublishOutput Include="$(PublishDir)wwwroot\**\*" />
+      <_RedundantPublishOutput Include="$(PublishDir)*.staticwebassets.endpoints.json" />
+      <_RedundantPublishOutput Include="$(PublishDir)*.xml" />
+      <!-- Package-owned assets (blazor.webview.js and friends) land at the publish root. -->
+      <_RedundantPublishOutput Include="@(StaticWebAsset->'$(PublishDir)%(Filename)%(Extension)')" />
+    </ItemGroup>
+    <Delete Files="@(_RedundantPublishOutput)" ContinueOnError="true" />
+    <RemoveDir Directories="$(PublishDir)wwwroot" ContinueOnError="true" />
+  </Target>
+
+</Project>

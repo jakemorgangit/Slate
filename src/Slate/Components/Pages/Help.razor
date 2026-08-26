@@ -1,0 +1,467 @@
+@page "/help"
+@using System.Runtime.InteropServices
+@using Slate.Services
+
+@inject AppState State
+@inject NavigationManager Nav
+
+<PageTitle>Help</PageTitle>
+
+<div class="page">
+    <div class="page-narrow">
+
+        <div class="page-head">
+            <span class="brand-mark" style="width: 38px; height: 38px; border-radius: 11px; font-size: 20px">◧</span>
+            <div>
+                <h1>Slate</h1>
+                <p>Plan your week against Azure DevOps work items, and put it in your Outlook calendar.</p>
+            </div>
+            <div class="spacer"></div>
+            <span class="badge badge-muted">v@(Version)</span>
+        </div>
+
+        @* ---------------------------------------------------------- quick start *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Getting started</h2>
+                    <div class="sub">Two things to set up, once.</div>
+                </div>
+                <button class="btn btn-sm" @onclick="@(() => Nav.NavigateTo("settings"))">Open Settings</button>
+            </div>
+            <div class="card-body">
+                <div class="grid-2">
+                    <div>
+                        <h3 style="margin-bottom: 7px">1 · Azure DevOps</h3>
+                        <ol class="steps">
+                            <li>Put your organization URL in Settings, for example
+                                <code>https://dev.azure.com/contoso</code>.</li>
+                            <li>Either paste a <strong>personal access token</strong>
+                                (<em>User settings → Personal access tokens → New Token</em>) with the
+                                <strong>Work Items (Read &amp; Write)</strong> scope, or switch to
+                                <strong>Microsoft sign-in</strong>.</li>
+                            <li>Pick a project, then choose which items to show: assigned to me,
+                                a saved query, or your own WIQL.</li>
+                        </ol>
+                        <p class="hint" style="margin-top: 8px">
+                            Write access is only needed so you can record time. Read alone works for planning.
+                        </p>
+                    </div>
+
+                    <div>
+                        <h3 style="margin-bottom: 7px">2 · Outlook</h3>
+                        <ol class="steps">
+                            <li>Azure portal → <strong>Microsoft Entra ID</strong> →
+                                <strong>App registrations</strong> → <strong>New registration</strong>.</li>
+                            <li>Redirect URI: <strong>Public client/native</strong> with
+                                <code>http://localhost</code>.</li>
+                            <li>Copy the <strong>client ID</strong> and <strong>tenant ID</strong> into Settings.</li>
+                            <li>API permissions → Microsoft Graph → Delegated →
+                                <code>User.Read</code> and <code>Calendars.ReadWrite</code>.</li>
+                            <li>Authentication → <strong>Allow public client flows: Yes</strong>.</li>
+                            <li>Press <strong>Sign in with Microsoft</strong> and pick your calendar.</li>
+                        </ol>
+                        <button class="btn btn-sm" style="margin-top: 9px"
+                                @onclick="@(() => SystemShell.OpenUrl("https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"))">
+                            Open app registrations ↗
+                        </button>
+                    </div>
+                </div>
+
+                @if (!State.Settings.IsAdoConfigured || !State.Settings.IsCalendarConfigured)
+                {
+                    <div class="banner warn">
+                        <span>!</span>
+                        <div class="grow">
+                            @if (!State.Settings.IsAdoConfigured)
+                            {
+                                <div>Azure DevOps is not configured yet.</div>
+                            }
+                            @if (!State.Settings.IsCalendarConfigured)
+                            {
+                                <div>Outlook is not connected yet, so nothing can be sent to your calendar.</div>
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- how to use *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Planning a week</h2>
+                </div>
+            </div>
+            <div class="card-body">
+                <dl class="howto">
+                    <dt>Book time</dt>
+                    <dd>Drag a work item from the sidebar onto a slot in the grid. The preview snaps to the
+                        grid as you go, and shows how long the block will be.</dd>
+
+                    <dt>How long?</dt>
+                    <dd>New blocks default to whatever is left on the item's <em>Remaining Work</em>, rounded
+                        to the grid and capped at four hours. Change it by dragging the bottom edge, or from
+                        the block's Edit panel.</dd>
+
+                    <dt>Move and copy</dt>
+                    <dd>Drag a block to move it. Hold <span class="kbd">Ctrl</span> while dragging to leave the
+                        original where it is and drop a copy.</dd>
+
+                    <dt>Let it choose</dt>
+                    <dd>Press <span class="kbd">Enter</span> on a work item card, or hit <strong>Schedule</strong>
+                        on the Work items tab, and it books the first gap that fits.</dd>
+
+                    <dt>Your existing calendar</dt>
+                    <dd>Everything already in Outlook that week is drawn behind the plan in grey. Work is not
+                        planned on top of it — a blocked slot turns the preview red and refuses the drop. Turn
+                        that off with <em>Never plan over existing events</em> in Settings.</dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Outlook, both ways</h2>
+                </div>
+            </div>
+            <div class="card-body">
+                <dl class="howto">
+                    <dt>Sending</dt>
+                    <dd><strong>Send to Outlook</strong> in the header pushes every pending change. The badge
+                        counts what is waiting. Change a block afterwards and it is marked for re-sending.</dd>
+
+                    <dt>Coming back</dt>
+                    <dd>Move or resize one of these events in Outlook and the block follows on the next refresh
+                        (every five minutes by default). A block with unsent local edits is left alone — your
+                        edit wins until you send it.</dd>
+
+                    <dt>Deleted in Outlook</dt>
+                    <dd>The block is flagged rather than quietly removed or put back. Right-click it to
+                        <strong>Remove from plan</strong> or <strong>Send it again</strong>.</dd>
+
+                    <dt>Unlink</dt>
+                    <dd>Drops a block from the plan but leaves its Outlook event where it is.</dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Recording time</h2>
+                </div>
+            </div>
+            <div class="card-body">
+                <dl class="howto">
+                    <dt>Booking it</dt>
+                    <dd>Right-click a calendar block → <strong>Record time…</strong>. The dialog prefills the
+                        length of the block. Saving writes to Azure DevOps: <em>Completed Work</em> goes up and,
+                        unless you turn it off, <em>Remaining Work</em> comes down by the same amount.</dd>
+
+                    <dt>Seeing it</dt>
+                    <dd>Blocks with time booked get a <span style="color: var(--danger)"><ClockIcon Size="12" /></span>
+                        red clock. The <strong>Time</strong> tab shows a timesheet of the week — hours per work
+                        item per day, a daily total and a week total — plus every entry as a greyed ghost of the
+                        block it came from.</dd>
+
+                    <dt>Undoing it</dt>
+                    <dd>Right-click the block → <strong>Undo recorded time</strong>, or press Undo on any entry
+                        in the Time tab. It takes that exact booking back off the work item.</dd>
+
+                    <dt>Which items?</dt>
+                    <dd>Only ones that carry the scheduling fields — Tasks and Bugs in the stock process
+                        templates, plus anything already using Remaining or Completed Work.</dd>
+
+                    <dt>Types that cannot</dt>
+                    <dd>Features, Epics and (in the Agile process) User Stories have no Remaining or
+                        Completed Work fields. Put one on the calendar and the app says so, then offers to
+                        <strong>spawn a Task underneath it</strong>: adjust the title, add a line about what
+                        you are doing, and it is created in Azure DevOps as a child — inheriting area
+                        path, iteration and assignee, with Remaining Work seeded from the block. The calendar
+                        block then points at the new task. The block stays either way, and you can turn the
+                        offer off in Settings.</dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Priority and links</h2>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="field">
+                    <label>Basic and Advanced</label>
+                    <span class="hint">
+                        The switch in the header turns the app down to <strong>Basic</strong>: list work
+                        items and plan your time against them, and nothing at all is written back to
+                        Azure DevOps. No time recording, no raising work items, no comments, no editing,
+                        and no touching the team's priority. Your own triage priority still works, because
+                        that never leaves this machine. <strong>Advanced</strong> is the whole app.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Working without Outlook</label>
+                    <span class="hint">
+                        Until an Entra ID client ID is configured, the Outlook half is not shown at all &mdash;
+                        no sending, no syncing, no busy overlay, no sign-in &mdash; and Slate is simply a
+                        standalone planner storing your week on this machine. Add a client ID and sign in
+                        and the whole Outlook side appears, already knowing about everything you have
+                        planned.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Two priorities</label>
+                    <div class="row wrap">
+                        @foreach (var level in new[] { 1, 2, 3, 4 })
+                        {
+                            <span class="row" style="gap: 6px; margin-right: 14px">
+                                <span class="prio-pill" style="@Ui.PriorityPillStyle(level, true)">P@(level)</span>
+                                <span class="muted" style="font-size: 12px">@Ui.PriorityLabel(level)</span>
+                            </span>
+                        }
+                    </div>
+                    <span class="hint">
+                        Right-click any work item or block and you get two rows.
+                        <strong>Your triage</strong> is stored on this machine and is
+                        <strong>never written back to Azure DevOps</strong>, so you can order your own week
+                        without changing what the team sees.
+                        <strong>Azure DevOps</strong> writes to the work item's own priority field, which
+                        everyone can see and which lands in the item's history — so that one always asks
+                        first. A pill with a ring around it is yours; a plain one is Azure DevOps'.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Linked work items</label>
+                    <span class="hint">
+                        Items linked to others carry a <span class="wi-links">⇄ n</span> badge at the foot of
+                        the card, beside the age pill. Right-click to
+                        see them by kind — Parent, Child, Related, Successor, Duplicate of — and click one to
+                        jump straight to it. Inside a work item, switch <strong>Links</strong> from List to
+                        <strong>Map</strong> for a diagram: parents above, children below, everything else
+                        to the sides, colour-coded by type. Click any card to re-centre the map on it.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Sorting the table</label>
+                    <span class="hint">
+                        Every column on the Work items tab sorts, and clicking the one already in use turns
+                        it around — the small arrow in the header says which way it is pointing.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Age</label>
+                    <span class="hint">
+                        Each work item shows how many days since it was raised, bottom right of its card
+                        and as a sortable column on the Work items tab. Grey under a week, amber past a
+                        month, red past three.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Discussion</label>
+                    <span class="hint">
+                        Clicking any work item opens the whole record — description, repro steps,
+                        acceptance criteria, every field, its links and the discussion — in a scrollable
+                        window. There is a box at the bottom to add a comment, which posts straight to
+                        Azure DevOps, so leaving a note does not mean a trip to the browser. The thread runs
+                        oldest to newest, the way a conversation does; a toggle flips it to Azure DevOps'
+                        newest-first order. Links sit between the conversation and the metadata, which is
+                        at the foot of the record rather than the top.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Mentions</label>
+                    <span class="hint">
+                        Type <span class="kbd">&#64;</span> in the comment box to mention a colleague. The list
+                        comes from the teams in your project, and picking someone posts a real Azure DevOps
+                        mention that notifies them. Typing a name out in full works too — any name the app
+                        recognises becomes a mention on the way out. Anyone it cannot resolve to an identity
+                        still reads correctly, just without the link, and the picker says which is which.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Plain text, Markdown or HTML</label>
+                    <span class="hint">
+                        The comment box and the description editor both carry a
+                        <strong>Plain / Markdown / HTML</strong> switch and remember which you chose. Markdown
+                        covers headings, bold and italic, code and fenced blocks, lists, quotes, rules, links,
+                        images and pipe tables. HTML is the default for descriptions because that is what
+                        Azure DevOps already stores; switching one out of HTML flattens the existing markup
+                        to text.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Editing and raising work</label>
+                    <span class="hint">
+                        On anything assigned to you, the pencil beside the title renames the work item and
+                        <strong>Edit</strong> rewrites the description. <strong>New work item</strong> on the
+                        Work items tab, or <span class="kbd">&#65291;</span> above the Plan sidebar, raises a
+                        brand new one: project, type, title, description, assignee, area, iteration, tags,
+                        priority and an estimate, with an option to book it onto the calendar straight away.
+                        The area path is picked from the project's own tree &mdash; root, then the level below,
+                        then the one below that &mdash; so you cannot build a path that does not exist.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Images</label>
+                    <span class="hint">
+                        Screenshots attached to a work item are fetched with your credential and inlined, so
+                        they actually appear in the description and the discussion. Pictures hosted outside
+                        your organization are left alone — your token is never sent off to fetch them.
+                    </span>
+                </div>
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- shortcuts *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Keyboard</h2>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table class="data">
+                    <tbody>
+                        @foreach (var (keys, what) in Shortcuts)
+                        {
+                            <tr>
+                                <td style="width: 190px">
+                                    @foreach (var key in keys)
+                                    {
+                                        <span class="kbd" style="margin-right: 4px">@key</span>
+                                    }
+                                </td>
+                                <td>@what</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- trouble + about *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>If something goes wrong</h2>
+                </div>
+            </div>
+            <div class="card-body">
+                <dl class="howto">
+                    <dt>The window is blank</dt>
+                    <dd>The app draws through the WebView2 runtime. If its compositor gets into a bad state the
+                        window can come up empty even though the app is running fine. Closing every copy of the
+                        app and re-opening usually clears it; a reboot always does.</dd>
+
+                    <dt>Azure DevOps says 401 or 403</dt>
+                    <dd>The token has expired or lacks scope. Recording time needs
+                        <strong>Work Items (Read &amp; Write)</strong>. Re-paste the token in Settings and press
+                        <strong>Test connection</strong>.</dd>
+
+                    <dt>Graph refuses the calendar</dt>
+                    <dd>The app registration needs <code>Calendars.ReadWrite</code> as a <em>delegated</em>
+                        permission, and <strong>Allow public client flows</strong> set to Yes. Sign out and back
+                        in from Settings after changing it.</dd>
+
+                    <dt>The list looks stale</dt>
+                    <dd>Work items are re-read every 60 seconds by default; change or disable that under
+                        <strong>Your week</strong> in Settings. <span class="kbd">R</span> forces a refresh.</dd>
+
+                    <dt>Moving to another machine</dt>
+                    <dd><strong>Export config</strong> at the top of Settings writes a JSON file with the
+                        organization URL, client and tenant IDs, calendar defaults and working week.
+                        <strong>Import config</strong> reads it back. The access token is never exported,
+                        and importing keeps whichever one is already set up.</dd>
+
+                    <dt>Something else</dt>
+                    <dd>Anything unexpected is written to <code>crash.log</code> in the data folder below.</dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>About</h2>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="field-grid">
+                    <Cell Label="Version" Value="@Version" />
+                    <Cell Label="Runtime" Value="@RuntimeInformation.FrameworkDescription" />
+                    <Cell Label="WebView2 runtime" Value="@WebViewVersion" />
+                    <Cell Label="Windows" Value="@RuntimeInformation.OSDescription" />
+                </div>
+
+                <div class="banner">
+                    <span>📁</span>
+                    <div class="grow">
+                        Settings, your plan, recorded time and the sign-in cache all live here, and nowhere else:
+                        <div><code>@AppPaths.DataDirectory</code></div>
+                    </div>
+                </div>
+
+                <p class="hint">
+                    Nothing is sent anywhere except to Azure DevOps and Microsoft Graph. Your personal access
+                    token and sign-in cache are encrypted with your Windows account.
+                </p>
+            </div>
+            <div class="card-foot">
+                <button class="btn" @onclick="@(() => SystemShell.OpenFolder(AppPaths.DataDirectory))">Open data folder</button>
+                <button class="btn" @onclick="@(() => Nav.NavigateTo("settings"))">Settings</button>
+                <span style="flex: 1"></span>
+                <span class="muted" style="font-size: 11.5px">Built with .NET 10, WPF and Blazor Hybrid.</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    private static readonly (string[] Keys, string What)[] Shortcuts =
+    [
+        (["←", "→"], "Previous / next week"),
+        (["T"], "Jump back to this week"),
+        (["R"], "Reload work items from Azure DevOps"),
+        (["Ctrl", "S"], "Send everything pending to Outlook"),
+        (["Del"], "Delete the selected block"),
+        (["Esc"], "Close a menu or window, or cancel a drag in progress"),
+        (["/"], "Jump to the work item filter"),
+        (["Enter"], "On a work item card: book the next free slot"),
+        (["Ctrl", "drag"], "Copy a block instead of moving it"),
+    ];
+
+    private static string Version =>
+        typeof(App).Assembly.GetName().Version is { } v ? $"{v.Major}.{v.Minor}.{v.Build}" : "1.0.0";
+
+    /// <summary>The installed WebView2 runtime, which is what actually draws the app.</summary>
+    private static string WebViewVersion
+    {
+        get
+        {
+            try
+            {
+                return Microsoft.Web.WebView2.Core.CoreWebView2Environment
+                    .GetAvailableBrowserVersionString() ?? "not found";
+            }
+            catch (Exception)
+            {
+                return "not found";
+            }
+        }
+    }
+}

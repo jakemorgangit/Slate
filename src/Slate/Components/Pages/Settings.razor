@@ -1,0 +1,891 @@
+@page "/settings"
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Store
+@inject AzureDevOpsClient Ado
+@inject GraphCalendarClient Graph
+@inject MsalAuthService Auth
+@inject ToastService Toasts
+@inject ConfigTransfer Transfer
+
+<PageTitle>Settings</PageTitle>
+
+<div class="page">
+    <div class="page-narrow">
+
+        <div class="page-head">
+            <div>
+                <h1>Settings</h1>
+                <p>Everything is stored on this machine only. Secrets are encrypted with your Windows account.</p>
+            </div>
+            <div class="spacer"></div>
+            <button class="btn" title="Version, author and build date"
+                    @onclick="() => _showAbout = true">About</button>
+            <div class="btn-group">
+                <button class="btn" title="Write these settings to a JSON file you can share or keep"
+                        @onclick="ExportConfig">Export config…</button>
+                <button class="btn" title="Load settings from a JSON file"
+                        @onclick="ImportConfig">Import config…</button>
+            </div>
+            @if (_dirty)
+            {
+                <span class="badge badge-warn">Unsaved changes</span>
+                <button class="btn" @onclick="Discard">Discard</button>
+            }
+            <button class="btn btn-primary" disabled="@(!_dirty)" @onclick="SaveAsync">Save</button>
+        </div>
+
+        @* ---------------------------------------------------------- Azure DevOps *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>
+                        <span class="dot" style="background: @(_draft.IsAdoConfigured ? "var(--ok)" : "var(--warn)")"></span>
+                        Azure DevOps
+                    </h2>
+                    <div class="sub">Where your work items come from.</div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="field">
+                    <label for="org">Organization URL</label>
+                    <input id="org" class="input" placeholder="https://dev.azure.com/your-org"
+                           value="@_draft.Ado.OrganizationUrl" @onchange="e => Set(() => _draft.Ado.OrganizationUrl = Text(e).TrimEnd('/'))" />
+                    <span class="hint">Copy it from your browser's address bar when you are on any Azure DevOps page.</span>
+                </div>
+
+                <div class="field">
+                    <label>Sign-in method</label>
+                    <div class="row">
+                        <button class="chip @(_draft.Ado.AuthMode == AdoAuthMode.Pat ? "on" : "")"
+                                @onclick="() => Set(() => _draft.Ado.AuthMode = AdoAuthMode.Pat)">Personal access token</button>
+                        <button class="chip @(_draft.Ado.AuthMode == AdoAuthMode.Entra ? "on" : "")"
+                                @onclick="() => Set(() => _draft.Ado.AuthMode = AdoAuthMode.Entra)">Microsoft sign-in</button>
+                    </div>
+                </div>
+
+                @if (_draft.Ado.AuthMode == AdoAuthMode.Pat)
+                {
+                    <div class="field">
+                        <label for="pat">Personal access token</label>
+                        <input id="pat" class="input" type="password" autocomplete="off"
+                               placeholder="@(string.IsNullOrEmpty(_draft.Ado.PersonalAccessToken) ? "Paste your PAT" : "••••••••••••••••")"
+                               @onchange="e => Set(() => _draft.Ado.PersonalAccessToken = Text(e))" />
+                        <span class="hint">
+                            In Azure DevOps: <strong>User settings → Personal access tokens → New Token</strong>,
+                            with the <strong>Work Items (Read &amp; Write)</strong> scope - write is needed to record time. Stored encrypted with Windows DPAPI.
+                        </span>
+                    </div>
+                }
+                else
+                {
+                    <div class="banner info">
+                        <span>i</span>
+                        <div class="grow">
+                            Uses the same Microsoft sign-in as the calendar below. Your app registration also needs the
+                            <strong>Azure DevOps → user_impersonation</strong> delegated permission.
+                        </div>
+                    </div>
+                }
+
+                <div class="field">
+                    <label for="project">Project</label>
+                    <div class="row">
+                        @if (_projects.Count > 0)
+                        {
+                            <select id="project" class="select" value="@_draft.Ado.Project"
+                                    @onchange="e => Set(() => _draft.Ado.Project = Text(e))">
+                                <option value="">(all projects in the organization)</option>
+                                @foreach (var project in _projects)
+                                {
+                                    <option value="@project.Name">@project.Name</option>
+                                }
+                            </select>
+                        }
+                        else
+                        {
+                            <input id="project" class="input" placeholder="Project name (optional)"
+                                   value="@_draft.Ado.Project" @onchange="e => Set(() => _draft.Ado.Project = Text(e))" />
+                        }
+                        <button class="btn" disabled="@_busyProjects" @onclick="LoadProjectsAsync">
+                            @if (_busyProjects) { <span class="spinner"></span> }
+                            <span>Load projects</span>
+                        </button>
+                    </div>
+                    <span class="hint">Leave empty to query across every project you can see.</span>
+                </div>
+            </div>
+
+            <div class="card-foot">
+                <button class="btn" disabled="@_busyTest" @onclick="TestAdoAsync">
+                    @if (_busyTest) { <span class="spinner"></span> }
+                    <span>Test connection</span>
+                </button>
+                @if (_adoResult is { } result)
+                {
+                    <span class="badge @(_adoOk ? "badge-ok" : "badge-danger")">@result</span>
+                }
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- query *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Which work items</h2>
+                    <div class="sub">Controls the list you drag from.</div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="field">
+                    <label>Source</label>
+                    <div class="row wrap">
+                        <button class="chip @(_draft.Ado.Scope == WorkItemScope.AssignedToMe ? "on" : "")"
+                                @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.AssignedToMe)">Assigned to me</button>
+                        <button class="chip @(_draft.Ado.Scope == WorkItemScope.SavedQuery ? "on" : "")"
+                                @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.SavedQuery)">A saved query</button>
+                        <button class="chip @(_draft.Ado.Scope == WorkItemScope.CustomWiql ? "on" : "")"
+                                @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.CustomWiql)">Custom WIQL</button>
+                    </div>
+                </div>
+
+                @if (_draft.Ado.Scope == WorkItemScope.AssignedToMe)
+                {
+                    <div class="field">
+                        <label>Hide these states</label>
+                        <div class="row wrap">
+                            @foreach (var candidate in StateCandidates)
+                            {
+                                <button class="chip @(_draft.Ado.ExcludedStates.Contains(candidate) ? "on" : "")"
+                                        @onclick="() => ToggleExcludedState(candidate)">@candidate</button>
+                            }
+                        </div>
+                        <span class="hint">Work already finished does not need any more of your time.</span>
+                    </div>
+                }
+                else if (_draft.Ado.Scope == WorkItemScope.SavedQuery)
+                {
+                    <div class="field">
+                        <label for="query">Saved query</label>
+                        <div class="row">
+                            <select id="query" class="select" value="@_draft.Ado.SavedQueryId"
+                                    @onchange="e => Set(() => _draft.Ado.SavedQueryId = Text(e))">
+                                <option value="">Choose a query…</option>
+                                @foreach (var query in _queries)
+                                {
+                                    <option value="@query.Id">@query.Path</option>
+                                }
+                            </select>
+                            <button class="btn" disabled="@_busyQueries" @onclick="LoadQueriesAsync">
+                                @if (_busyQueries) { <span class="spinner"></span> }
+                                <span>Load</span>
+                            </button>
+                        </div>
+                        <span class="hint">Flat, tree and one-hop queries all work; Slate uses the target items.</span>
+                    </div>
+                }
+                else
+                {
+                    <div class="field">
+                        <label for="wiql">WIQL</label>
+                        <textarea id="wiql" class="textarea code" rows="6"
+                                  placeholder="@SampleWiql"
+                                  value="@_draft.Ado.CustomWiql"
+                                  @onchange="e => Set(() => _draft.Ado.CustomWiql = Text(e))"></textarea>
+                        <span class="hint">Only <code>[System.Id]</code> is read from the result; the rest is fetched in a batch.</span>
+                    </div>
+                }
+            </div>
+            <div class="card-foot">
+                <button class="btn" disabled="@State.IsLoadingWorkItems" @onclick="PreviewAsync">
+                    @if (State.IsLoadingWorkItems) { <span class="spinner"></span> }
+                    <span>Run it now</span>
+                </button>
+                <span class="muted">@State.WorkItems.Count work item(s) currently loaded</span>
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- Microsoft account *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>
+                        <span class="dot" style="background: @(State.SignIn.IsSignedIn ? "var(--ok)" : "var(--warn)")"></span>
+                        Microsoft account &amp; Outlook
+                    </h2>
+                    <div class="sub">Used to write events into your calendar.</div>
+                </div>
+                <button class="btn btn-sm btn-ghost" @onclick="() => _showSetup = !_showSetup">
+                    @(_showSetup ? "Hide setup steps" : "How do I get a client ID?")
+                </button>
+            </div>
+
+            <div class="card-body">
+                @if (_showSetup)
+                {
+                    <div class="banner info">
+                        <span>i</span>
+                        <div class="grow">
+                            <ol class="steps">
+                                <li>Open the <strong>Azure portal</strong> → <strong>Microsoft Entra ID</strong> →
+                                    <strong>App registrations</strong> → <strong>New registration</strong>.</li>
+                                <li>Name it anything (for example <code>Slate</code>) and pick the account
+                                    types that match your organisation.</li>
+                                <li>Under <strong>Redirect URI</strong> choose <strong>Public client/native
+                                    (mobile &amp; desktop)</strong> and enter <code>http://localhost</code>.</li>
+                                <li>Register, then copy the <strong>Application (client) ID</strong> and
+                                    <strong>Directory (tenant) ID</strong> into the boxes below.</li>
+                                <li><strong>API permissions</strong> → <strong>Add a permission</strong> →
+                                    <strong>Microsoft Graph</strong> → <strong>Delegated</strong> → add
+                                    <code>User.Read</code> and <code>Calendars.ReadWrite</code>.</li>
+                                <li>Only if you chose Microsoft sign-in for Azure DevOps above:
+                                    <strong>Add a permission</strong> → <strong>APIs my organization uses</strong> →
+                                    <strong>Azure DevOps</strong> → <code>user_impersonation</code>.</li>
+                                <li><strong>Authentication</strong> → set <strong>Allow public client flows</strong> to
+                                    <strong>Yes</strong>.</li>
+                            </ol>
+                            <button class="btn btn-sm" style="margin-top: 10px"
+                                    @onclick="@(() => SystemShell.OpenUrl("https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"))">
+                                Open app registrations ↗
+                            </button>
+                        </div>
+                    </div>
+                }
+
+                <div class="grid-2">
+                    <div class="field">
+                        <label for="client">Application (client) ID</label>
+                        <input id="client" class="input mono" placeholder="00000000-0000-0000-0000-000000000000"
+                               value="@_draft.Entra.ClientId" @onchange="e => Set(() => _draft.Entra.ClientId = Text(e))" />
+                    </div>
+                    <div class="field">
+                        <label for="tenant">Directory (tenant) ID</label>
+                        <input id="tenant" class="input mono" placeholder="common"
+                               value="@_draft.Entra.TenantId" @onchange="e => Set(() => _draft.Entra.TenantId = Text(e))" />
+                        <span class="hint">Or <code>common</code> / <code>organizations</code> / <code>consumers</code>.</span>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="calendar">Target calendar</label>
+                    <div class="row">
+                        <select id="calendar" class="select" value="@_draft.Calendar.CalendarId"
+                                @onchange="OnCalendarChanged">
+                            <option value="">Default calendar</option>
+                            @foreach (var calendar in _calendars)
+                            {
+                                <option value="@calendar.Id">@calendar.Name</option>
+                            }
+                        </select>
+                        <button class="btn" disabled="@(_busyCalendars || !State.SignIn.IsSignedIn)" @onclick="LoadCalendarsAsync">
+                            @if (_busyCalendars) { <span class="spinner"></span> }
+                            <span>Load calendars</span>
+                        </button>
+                    </div>
+                    @if (!State.SignIn.IsSignedIn)
+                    {
+                        <span class="hint">Sign in first to list your calendars.</span>
+                    }
+                </div>
+            </div>
+
+            <div class="card-foot">
+                @if (State.SignIn.IsSignedIn)
+                {
+                    <span class="badge badge-ok">Signed in as @State.SignIn.Username</span>
+                    <button class="btn btn-sm" @onclick="SignOutAsync">Sign out</button>
+                }
+                else
+                {
+                    <button class="btn btn-primary" disabled="@(_busySignIn || !_draft.Entra.IsConfigured)" @onclick="SignInAsync">
+                        @if (_busySignIn) { <span class="spinner on-accent"></span> }
+                        <span>Sign in with Microsoft</span>
+                    </button>
+                    @if (!_draft.Entra.IsConfigured)
+                    {
+                        <span class="muted">Enter a valid client ID first.</span>
+                    }
+                }
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- event defaults *@
+        @if (State.ShowOutlook)
+        {
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Calendar events</h2>
+                    <div class="sub">How each block looks once it lands in Outlook.</div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="field">
+                    <label for="subject">Subject template</label>
+                    <input id="subject" class="input" value="@_draft.Calendar.SubjectTemplate"
+                           @onchange="e => Set(() => _draft.Calendar.SubjectTemplate = Text(e))" />
+                    <span class="hint">
+                        Placeholders: <code>{id}</code> <code>{title}</code> <code>{type}</code>
+                        <code>{state}</code> <code>{project}</code>
+                    </span>
+                </div>
+
+                <div class="grid-3">
+                    <div class="field">
+                        <label for="showas">Show time as</label>
+                        <select id="showas" class="select" value="@_draft.Calendar.ShowAs"
+                                @onchange="e => Set(() => _draft.Calendar.ShowAs = Text(e))">
+                            <option value="busy">Busy</option>
+                            <option value="tentative">Tentative</option>
+                            <option value="free">Free</option>
+                            <option value="workingElsewhere">Working elsewhere</option>
+                            <option value="oof">Out of office</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="reminder">Reminder (minutes)</label>
+                        <input id="reminder" class="input" type="number" min="0" max="1440"
+                               value="@_draft.Calendar.ReminderMinutes"
+                               @onchange="e => Set(() => _draft.Calendar.ReminderMinutes = Int(e, 5, 0, 1440))" />
+                    </div>
+                    <div class="field">
+                        <label for="category">Category</label>
+                        <input id="category" class="input" placeholder="(none)"
+                               value="@_draft.Calendar.Category"
+                               @onchange="e => Set(() => _draft.Calendar.Category = Text(e))" />
+                        <span class="hint">Must already exist in Outlook to show its colour.</span>
+                    </div>
+                </div>
+
+                <div class="stack">
+                    <label class="switch">
+                        <input type="checkbox" checked="@_draft.Calendar.ReminderEnabled"
+                               @onchange="e => Set(() => _draft.Calendar.ReminderEnabled = Bool(e))" />
+                        <span class="track"></span>
+                        <span class="label">Set a reminder on each event</span>
+                    </label>
+                    <label class="switch">
+                        <input type="checkbox" checked="@_draft.Calendar.IncludeWorkItemLink"
+                               @onchange="e => Set(() => _draft.Calendar.IncludeWorkItemLink = Bool(e))" />
+                        <span class="track"></span>
+                        <span class="label">Put a link back to the work item in the event body</span>
+                    </label>
+                    <label class="switch">
+                        <input type="checkbox" checked="@_draft.Calendar.IsPrivate"
+                               @onchange="e => Set(() => _draft.Calendar.IsPrivate = Bool(e))" />
+                        <span class="track"></span>
+                        <span class="label">Mark events private</span>
+                    </label>
+                    <label class="switch">
+                        <input type="checkbox" checked="@_draft.Calendar.DeleteEventWithAllocation"
+                               @onchange="e => Set(() => _draft.Calendar.DeleteEventWithAllocation = Bool(e))" />
+                        <span class="track"></span>
+                        <span class="label">Deleting a block also removes its Outlook event</span>
+                    </label>
+                </div>
+            </div>
+        </div>
+        }
+
+        @* ---------------------------------------------------------- planning grid *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Your week</h2>
+                    <div class="sub">The shape of the planning grid.</div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="grid-3">
+                    <div class="field">
+                        <label for="start">Day starts at</label>
+                        <select id="start" class="select" value="@_draft.Planning.DayStartHour"
+                                @onchange="e => Set(() => _draft.Planning.DayStartHour = Int(e, 8, 0, 22))">
+                            @for (var h = 0; h <= 22; h++)
+                            {
+                                <option value="@h">@($"{h:00}:00")</option>
+                            }
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="end">Day ends at</label>
+                        <select id="end" class="select" value="@_draft.Planning.DayEndHour"
+                                @onchange="e => Set(() => _draft.Planning.DayEndHour = Int(e, 18, 1, 24))">
+                            @for (var h = 1; h <= 24; h++)
+                            {
+                                <option value="@h">@($"{h:00}:00")</option>
+                            }
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="slot">Grid snaps to</label>
+                        <select id="slot" class="select" value="@_draft.Planning.SlotMinutes"
+                                @onchange="e => Set(() => _draft.Planning.SlotMinutes = Int(e, 30, 5, 120))">
+                            <option value="15">15 minutes</option>
+                            <option value="30">30 minutes</option>
+                            <option value="60">1 hour</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="grid-2">
+                    <div class="field">
+                        <label for="default-dur">Default block length (minutes)</label>
+                        <input id="default-dur" class="input" type="number" min="5" max="480" step="5"
+                               value="@_draft.Planning.DefaultDurationMinutes"
+                               @onchange="e => Set(() => _draft.Planning.DefaultDurationMinutes = Int(e, 60, 5, 480))" />
+                        <span class="hint">Used when a work item has no remaining-work estimate.</span>
+                    </div>
+                    <div class="field">
+                        <label for="weekstart">Week starts on</label>
+                        <select id="weekstart" class="select" value="@((int)_draft.Planning.WeekStart)"
+                                @onchange="e => Set(() => _draft.Planning.WeekStart = (DayOfWeek)Int(e, 1, 0, 6))">
+                            @foreach (var day in AllDays)
+                            {
+                                <option value="@((int)day)">@day</option>
+                            }
+                        </select>
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label>Days shown</label>
+                    <div class="row wrap">
+                        @foreach (var day in AllDays)
+                        {
+                            <button class="chip @(_draft.Planning.WorkingDays.Contains(day) ? "on" : "")"
+                                    @onclick="() => ToggleWorkingDay(day)">@day.ToString()[..3]</button>
+                        }
+                    </div>
+                </div>
+
+                <div class="stack">
+                    @if (State.ShowOutlook)
+                    {
+                        <label class="switch">
+                            <input type="checkbox" checked="@_draft.Planning.AutoSync"
+                                   @onchange="e => Set(() => _draft.Planning.AutoSync = Bool(e))" />
+                            <span class="track"></span>
+                            <span class="label">Update Outlook automatically as I plan</span>
+                        </label>
+                        <label class="switch">
+                            <input type="checkbox" checked="@_draft.Planning.ShowExistingEvents"
+                                   @onchange="e => Set(() => _draft.Planning.ShowExistingEvents = Bool(e))" />
+                            <span class="track"></span>
+                            <span class="label">Show what is already in my Outlook calendar</span>
+                        </label>
+                        <label class="switch">
+                            <input type="checkbox" checked="@_draft.Planning.PreventOverlap"
+                                   @onchange="e => Set(() => _draft.Planning.PreventOverlap = Bool(e))" />
+                            <span class="track"></span>
+                            <span class="label">Never plan over existing events</span>
+                        </label>
+                        <label class="switch">
+                            <input type="checkbox" checked="@_draft.Planning.WarnOnConflict"
+                                   @onchange="e => Set(() => _draft.Planning.WarnOnConflict = Bool(e))" />
+                            <span class="track"></span>
+                            <span class="label">Warn me when a block lands on an existing event</span>
+                        </label>
+                        <label class="switch">
+                            <input type="checkbox" checked="@_draft.Planning.TwoWaySync"
+                                   @onchange="e => Set(() => _draft.Planning.TwoWaySync = Bool(e))" />
+                            <span class="track"></span>
+                            <span class="label">Pull changes made in Outlook back into the plan</span>
+                        </label>
+                    }
+                    @if (State.CanRecordTime)
+                    {
+                        <label class="switch">
+                            <input type="checkbox" checked="@_draft.Planning.OfferTaskForUntrackable"
+                                   @onchange="e => Set(() => _draft.Planning.OfferTaskForUntrackable = Bool(e))" />
+                            <span class="track"></span>
+                            <span class="label">
+                                Offer to spawn a task when I plan a type that cannot record time
+                            </span>
+                        </label>
+                    }
+                </div>
+
+                <div class="grid-2">
+                    @if (State.ShowOutlook && _draft.Planning.AutoSync)
+                    {
+                    <div class="field">
+                        <label for="autosync">Send changes after (seconds of no edits)</label>
+                        <input id="autosync" class="input" type="number" min="1" max="60"
+                               value="@_draft.Planning.AutoSyncSeconds"
+                               @onchange="e => Set(() => _draft.Planning.AutoSyncSeconds = Int(e, 4, 1, 60))" />
+                        <span class="hint">Waits for you to stop, so a rearranged week is one write per block.</span>
+                    </div>
+                    }
+                    @if (State.ShowOutlook)
+                    {
+                    <div class="field">
+                        <label for="refresh">Re-read the calendar every (minutes)</label>
+                        <input id="refresh" class="input" type="number" min="0" max="120"
+                               value="@_draft.Planning.RefreshMinutes"
+                               @onchange="e => Set(() => _draft.Planning.RefreshMinutes = Int(e, 5, 0, 120))" />
+                        <span class="hint">Zero turns background refreshing off.</span>
+                    </div>
+                    }
+                    <div class="field">
+                        <label for="wi-refresh">Re-read work items every (seconds)</label>
+                        <input id="wi-refresh" class="input" type="number" min="0" max="3600"
+                               value="@_draft.Planning.WorkItemRefreshSeconds"
+                               @onchange="e => Set(() => _draft.Planning.WorkItemRefreshSeconds = Int(e, 60, 0, 3600))" />
+                        <span class="hint">Keeps the list in step with Azure DevOps. Zero turns it off.</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- appearance *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Appearance</h2>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="grid-2">
+                    <div class="field">
+                        <label>Theme</label>
+                        <div class="row">
+                            @foreach (var mode in Enum.GetValues<ThemeMode>())
+                            {
+                                <button class="chip @(_draft.Ui.Theme == mode ? "on" : "")"
+                                        @onclick="() => Set(() => _draft.Ui.Theme = mode)">@mode</button>
+                            }
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label>Accent</label>
+                        <div class="row">
+                            @foreach (var accent in Accents)
+                            {
+                                <button class="chip @(_draft.Ui.Accent == accent ? "on" : "")"
+                                        @onclick="() => Set(() => _draft.Ui.Accent = accent)">
+                                    <span class="dot" style="background: @AccentSwatch(accent)"></span>
+                                    @accent
+                                </button>
+                            }
+                        </div>
+                    </div>
+                </div>
+                <label class="switch">
+                    <input type="checkbox" checked="@_draft.Ui.CompactDensity"
+                           @onchange="e => Set(() => _draft.Ui.CompactDensity = Bool(e))" />
+                    <span class="track"></span>
+                    <span class="label">Compact grid (fits more hours on screen)</span>
+                </label>
+            </div>
+        </div>
+
+        @* ---------------------------------------------------------- data *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Data</h2>
+                    <div class="sub">Settings, your plan and the sign-in cache all live in one folder.</div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="banner">
+                    <span>📁</span>
+                    <div class="grow"><code>@AppPaths.DataDirectory</code></div>
+                </div>
+            </div>
+            <div class="card-foot">
+                <button class="btn" @onclick="@(() => SystemShell.OpenFolder(AppPaths.DataDirectory))">Open folder</button>
+                <span class="muted">@State.Planner.Allocations.Count block(s) in the plan.</span>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<AboutDialog @bind-Show="_showAbout" />
+
+@code {
+    private bool _showAbout;
+
+    private AppSettings _draft = new();
+    private bool _dirty;
+    private bool _showSetup;
+
+    private bool _busyTest, _busyProjects, _busyQueries, _busyCalendars, _busySignIn;
+    private string? _adoResult;
+    private bool _adoOk;
+
+    private List<AdoProject> _projects = [];
+    private List<AdoQuery> _queries = [];
+    private List<GraphCalendar> _calendars = [];
+
+    private static readonly string[] StateCandidates =
+        ["New", "Active", "Resolved", "Closed", "Done", "Removed", "Committed", "Approved", "In Progress"];
+
+    private static readonly string[] Accents = ["violet", "blue", "teal", "amber", "rose"];
+
+    private static readonly DayOfWeek[] AllDays =
+    [
+        DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday,
+        DayOfWeek.Friday, DayOfWeek.Saturday, DayOfWeek.Sunday,
+    ];
+
+    private const string SampleWiql =
+        "SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me AND [System.State] = 'Active'";
+
+    protected override void OnInitialized()
+    {
+        _draft = Store.CreateDraft();
+        State.Changed += OnChanged;
+    }
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    // ---------------------------------------------------------------- draft plumbing
+
+    private void Set(Action mutate)
+    {
+        mutate();
+        _dirty = true;
+    }
+
+    private static string Text(ChangeEventArgs e) => e.Value?.ToString()?.Trim() ?? "";
+
+    private static bool Bool(ChangeEventArgs e) => e.Value is true or "true" or "on";
+
+    private static int Int(ChangeEventArgs e, int fallback, int min, int max) =>
+        int.TryParse(e.Value?.ToString(), out var parsed) ? Math.Clamp(parsed, min, max) : fallback;
+
+    private void ToggleExcludedState(string state)
+    {
+        Set(() =>
+        {
+            if (!_draft.Ado.ExcludedStates.Remove(state)) _draft.Ado.ExcludedStates.Add(state);
+        });
+    }
+
+    private void ToggleWorkingDay(DayOfWeek day)
+    {
+        Set(() =>
+        {
+            if (!_draft.Planning.WorkingDays.Remove(day)) _draft.Planning.WorkingDays.Add(day);
+            _draft.Planning.WorkingDays.Sort();
+        });
+    }
+
+    private void OnCalendarChanged(ChangeEventArgs e)
+    {
+        var id = Text(e);
+        Set(() =>
+        {
+            _draft.Calendar.CalendarId = id;
+            _draft.Calendar.CalendarName = _calendars.FirstOrDefault(c => c.Id == id)?.Name ?? "Default calendar";
+        });
+    }
+
+    /// <summary>
+    /// Writes the current configuration to a file. The personal access token is left out on
+    /// purpose - it is encrypted to this Windows account and would not travel anyway.
+    /// </summary>
+    private void ExportConfig()
+    {
+        CommitIfDirty();
+
+        var path = SystemShell.AskWhereToSave(ConfigTransfer.SuggestedFileName);
+        if (path is null) return;
+
+        try
+        {
+            Transfer.ExportTo(path);
+            Toasts.Success("Configuration exported", $"Written to {path}. The access token was not included.");
+        }
+        catch (Exception ex)
+        {
+            Toasts.Error("Could not export the configuration", ex.Message);
+        }
+    }
+
+    private void ImportConfig()
+    {
+        var path = SystemShell.AskWhatToOpen();
+        if (path is null) return;
+
+        var result = Transfer.ImportFrom(path);
+        if (!result.Success)
+        {
+            Toasts.Error("Could not import that file", result.Message);
+            return;
+        }
+
+        _draft = Store.CreateDraft();
+        _dirty = false;
+        _projects = [];
+        _queries = [];
+
+        Toasts.Success("Configuration imported", string.Join(", ", result.Applied) + ". Your access token was kept.");
+        _ = State.LoadWorkItemsAsync();
+    }
+
+    private void Discard()
+    {
+        _draft = Store.CreateDraft();
+        _dirty = false;
+    }
+
+    private Task SaveAsync()
+    {
+        Store.Save(_draft);
+        _draft = Store.CreateDraft();
+        _dirty = false;
+        Toasts.Success("Settings saved");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Actions that hit the network need the draft persisted first.</summary>
+    private void CommitIfDirty()
+    {
+        if (!_dirty) return;
+        Store.Save(_draft);
+        _draft = Store.CreateDraft();
+        _dirty = false;
+    }
+
+    private static string AccentSwatch(string accent) => accent switch
+    {
+        "blue" => "#2f7cf6",
+        "teal" => "#14a99a",
+        "amber" => "#e08a1e",
+        "rose" => "#e0447a",
+        _ => "#7c5cff",
+    };
+
+    // ---------------------------------------------------------------- actions
+
+    private async Task TestAdoAsync()
+    {
+        CommitIfDirty();
+        _busyTest = true;
+        _adoResult = null;
+
+        try
+        {
+            var who = await Ado.TestConnectionAsync();
+            _adoOk = true;
+            _adoResult = $"Connected as {who}";
+        }
+        catch (Exception ex) when (ex is AzureDevOpsException or InteractiveSignInRequiredException or InvalidOperationException)
+        {
+            _adoOk = false;
+            _adoResult = ex.Message;
+        }
+        finally
+        {
+            _busyTest = false;
+        }
+    }
+
+    private async Task LoadProjectsAsync()
+    {
+        CommitIfDirty();
+        _busyProjects = true;
+
+        try
+        {
+            _projects = await Ado.GetProjectsAsync();
+            Toasts.Success($"Found {_projects.Count} project(s)");
+        }
+        catch (Exception ex) when (ex is AzureDevOpsException or InteractiveSignInRequiredException or InvalidOperationException)
+        {
+            Toasts.Error("Could not list projects", ex.Message);
+        }
+        finally
+        {
+            _busyProjects = false;
+        }
+    }
+
+    private async Task LoadQueriesAsync()
+    {
+        CommitIfDirty();
+        _busyQueries = true;
+
+        try
+        {
+            _queries = await Ado.GetSavedQueriesAsync();
+            Toasts.Success($"Found {_queries.Count} saved quer{(_queries.Count == 1 ? "y" : "ies")}");
+        }
+        catch (Exception ex) when (ex is AzureDevOpsException or InteractiveSignInRequiredException or InvalidOperationException)
+        {
+            Toasts.Error("Could not list saved queries", ex.Message);
+        }
+        finally
+        {
+            _busyQueries = false;
+        }
+    }
+
+    private async Task LoadCalendarsAsync()
+    {
+        CommitIfDirty();
+        _busyCalendars = true;
+
+        try
+        {
+            _calendars = await Graph.GetCalendarsAsync();
+            Toasts.Success($"Found {_calendars.Count} calendar(s)");
+        }
+        catch (Exception ex) when (ex is GraphException or InteractiveSignInRequiredException or InvalidOperationException)
+        {
+            Toasts.Error("Could not list calendars", ex.Message);
+        }
+        finally
+        {
+            _busyCalendars = false;
+        }
+    }
+
+    private async Task PreviewAsync()
+    {
+        CommitIfDirty();
+        await State.LoadWorkItemsAsync(showToast: true);
+    }
+
+    private async Task SignInAsync()
+    {
+        CommitIfDirty();
+        _busySignIn = true;
+
+        try
+        {
+            await Auth.SignInAsync();
+            await State.RefreshSignInAsync();
+
+            var profile = await Graph.GetProfileAsync();
+            Toasts.Success("Signed in", $"Connected to Outlook as {profile.Mail}.");
+
+            await LoadCalendarsAsync();
+            await State.LoadEventsAsync();
+        }
+        catch (Exception ex) when (ex is Microsoft.Identity.Client.MsalException or GraphException or InvalidOperationException)
+        {
+            Toasts.Error("Sign-in failed", ex.Message);
+        }
+        finally
+        {
+            _busySignIn = false;
+        }
+    }
+
+    private async Task SignOutAsync()
+    {
+        await Auth.SignOutAsync();
+        await State.RefreshSignInAsync();
+        _calendars = [];
+        Toasts.Info("Signed out");
+    }
+}

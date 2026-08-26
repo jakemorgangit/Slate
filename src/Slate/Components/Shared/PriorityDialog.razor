@@ -1,0 +1,100 @@
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+
+@* Azure DevOps' priority is a shared field, so it never moves without being asked about. *@
+@if (State.PriorityPrompt is { } prompt)
+{
+    <div class="modal-scrim" @onclick="Cancel" @onkeydown="OnKeyDown" tabindex="-1">
+        <div class="modal narrow" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span class="dot" style="background: @Ui.PriorityColor(prompt.To); margin-top: 7px"></span>
+                <div class="grow">
+                    <h2>Change the priority in Azure DevOps?</h2>
+                    <div class="sub">
+                        <span class="mono">#@prompt.WorkItemId</span>
+                        <span>·</span>
+                        <span class="truncate">@Ui.Clip(prompt.Title, 70)</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-body">
+                <div class="prio-change">
+                    <div class="prio-change-side">
+                        <span class="label">Now</span>
+                        @if (prompt.From is >= 1 and <= 4)
+                        {
+                            <span class="prio-pill"
+                                  style="background: @Ui.PriorityColor(prompt.From); color: @Ui.PriorityTextColor(prompt.From)">
+                                P@(prompt.From)
+                            </span>
+                        }
+                        else
+                        {
+                            <span class="muted">Not set</span>
+                        }
+                    </div>
+
+                    <span class="prio-change-arrow">→</span>
+
+                    <div class="prio-change-side">
+                        <span class="label">After</span>
+                        @if (prompt.To is >= 1 and <= 4)
+                        {
+                            <span class="prio-pill"
+                                  style="background: @Ui.PriorityColor(prompt.To); color: @Ui.PriorityTextColor(prompt.To)">
+                                P@(prompt.To)
+                            </span>
+                        }
+                        else
+                        {
+                            <span class="muted">Cleared</span>
+                        }
+                    </div>
+                </div>
+
+                <p class="hint" style="margin-top: 14px">
+                    This writes to the work item itself, so everyone on the team sees it and it shows
+                    up in the item's history. If you only want to order your own week, set a
+                    <strong>triage</strong> priority instead — that one never leaves this machine.
+                </p>
+            </div>
+
+            <div class="modal-foot">
+                <span style="flex: 1"></span>
+                <button class="btn" disabled="@State.IsSavingPriority" @onclick="Cancel">Cancel</button>
+                <button class="btn btn-primary" disabled="@State.IsSavingPriority" @onclick="Confirm">
+                    @if (State.IsSavingPriority)
+                    {
+                        <span class="spinner on-accent"></span>
+                        <span>Saving…</span>
+                    }
+                    else
+                    {
+                        <span>@(prompt.To is >= 1 and <= 4 ? $"Set to P{prompt.To}" : "Clear the priority")</span>
+                    }
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    private void Cancel() => State.CancelPriorityChange();
+
+    private Task Confirm() => State.ConfirmPriorityChangeAsync();
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Cancel();
+    }
+}

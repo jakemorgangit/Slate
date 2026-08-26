@@ -1,0 +1,36 @@
+@* A right-click menu positioned at the pointer, kept inside the window. *@
+
+@if (Visible)
+{
+    <div class="modal-scrim" style="background: transparent; backdrop-filter: none; padding: 0"
+         @onclick="Close" @oncontextmenu="Close" @oncontextmenu:preventDefault="true">
+
+        <div class="menu" style="@PositionStyle" @onclick:stopPropagation="true">
+            @if (!string.IsNullOrWhiteSpace(Heading))
+            {
+                <div class="heading" title="@Heading">@Heading</div>
+                <div class="sep"></div>
+            }
+            @ChildContent
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool Visible { get; set; }
+    [Parameter] public double X { get; set; }
+    [Parameter] public double Y { get; set; }
+    [Parameter] public string? Heading { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+
+    /// <summary>
+    /// Anchors the menu at the pointer. Flipping is done in CSS terms rather than by
+    /// measuring, so a menu near the right or bottom edge opens back towards the middle.
+    /// </summary>
+    private string PositionStyle =>
+        $"left: min({X.ToString("0", System.Globalization.CultureInfo.InvariantCulture)}px, calc(100vw - 232px)); " +
+        $"top: min({Y.ToString("0", System.Globalization.CultureInfo.InvariantCulture)}px, calc(100vh - 260px));";
+
+    private Task Close() => OnClose.InvokeAsync();
+}

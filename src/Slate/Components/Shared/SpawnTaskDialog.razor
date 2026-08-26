@@ -1,0 +1,194 @@
+@using System.Globalization
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Settings
+
+@* Two steps: the notice that this type cannot carry time, then the form to spawn a task. *@
+
+@if (State.SpawnFor is { } allocation && State.SpawnParent is { } parent)
+{
+    <div class="modal-scrim" @onclick="Cancel">
+        <div class="modal narrow" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span style="color: var(--warn); font-size: 17px; margin-top: 1px">!</span>
+                <div class="grow">
+                    <h2>@(_showForm ? "New task" : "Time cannot be recorded here")</h2>
+                    <div class="sub">
+                        <span class="dot" style="background: @Ui.ColorFor(parent.WorkItemType)"></span>
+                        <span class="mono">#@parent.Id</span>
+                        <span class="truncate">@parent.Title</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close" @onclick="Cancel">✕</button>
+            </div>
+
+            @if (!_showForm)
+            {
+                <div class="modal-body">
+                    <p>
+                        A <strong>@parent.WorkItemType</strong> does not carry the Remaining and Completed
+                        Work fields, so hours cannot be booked against it.
+                    </p>
+                    <p class="muted">
+                        You can create a <strong>@TypeName</strong> underneath it and put that on the slot
+                        instead. The block keeps its time — @Ui.RelativeDay(allocation.Start),
+                        @Ui.TimeRange(allocation.Start, allocation.End) — and the new item inherits the
+                        area path, iteration and assignee.
+                    </p>
+
+                    <label class="switch">
+                        <input type="checkbox" checked="@_stopAsking" @onchange="OnStopAskingChanged" />
+                        <span class="track"></span>
+                        <span class="label">Stop offering this</span>
+                    </label>
+                </div>
+
+                <div class="modal-foot">
+                    <span class="muted" style="font-size: 11.5px">The block stays either way.</span>
+                    <span style="flex: 1"></span>
+                    <button class="btn" @onclick="Cancel">Leave it</button>
+                    <button class="btn btn-primary" @onclick="ShowForm">Create a @TypeName…</button>
+                </div>
+            }
+            else
+            {
+                <div class="modal-body">
+                    <div class="field">
+                        <label for="spawn-title">Title</label>
+                        <input id="spawn-title" class="input" value="@_title" @onchange="e => _title = Text(e)" />
+                    </div>
+
+                    <div class="field">
+                        <label for="spawn-desc">What are you doing? <span class="muted">(optional)</span></label>
+                        <textarea id="spawn-desc" class="textarea" rows="3"
+                                  placeholder="A line or two so the task means something later"
+                                  value="@_description" @onchange="e => _description = Text(e)"></textarea>
+                    </div>
+
+                    <div class="grid-2">
+                        <div class="field">
+                            <label for="spawn-type">Type</label>
+                            <input id="spawn-type" class="input" value="@_type" @onchange="e => _type = Text(e)" />
+                            <span class="hint">Must exist in this project's process.</span>
+                        </div>
+                        <div class="field">
+                            <label for="spawn-hours">Remaining Work (hours)</label>
+                            <input id="spawn-hours" class="input" type="number" step="0.25" min="0" max="200"
+                                   value="@_hours.ToString("0.##", CultureInfo.InvariantCulture)"
+                                   @onchange="OnHoursChanged" />
+                            <span class="hint">Seeded from the length of the block.</span>
+                        </div>
+                    </div>
+
+                    <div class="banner info">
+                        <span>i</span>
+                        <div class="grow">
+                            Created under <strong>#@parent.Id</strong> in
+                            <strong>@(string.IsNullOrWhiteSpace(parent.AreaPath) ? parent.Project : parent.AreaPath)</strong>,
+                            then put on the calendar slot in its place.
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal-foot">
+                    <button class="btn btn-sm btn-ghost" @onclick="() => _showForm = false">Back</button>
+                    <span style="flex: 1"></span>
+                    <button class="btn" @onclick="Cancel">Cancel</button>
+                    <button class="btn btn-primary" disabled="@(State.IsSpawning || string.IsNullOrWhiteSpace(_title))"
+                            @onclick="CreateAsync">
+                        @if (State.IsSpawning)
+                        {
+                            <span class="spinner on-accent"></span>
+                            <span>Creating…</span>
+                        }
+                        else
+                        {
+                            <span>Create and use it</span>
+                        }
+                    </button>
+                </div>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    private bool _showForm;
+    private bool _stopAsking;
+    private string _title = "";
+    private string _description = "";
+    private string _type = "Task";
+    private double _hours;
+    private Guid _primedFor;
+
+    private string TypeName => string.IsNullOrWhiteSpace(_type) ? "Task" : _type;
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    protected override void OnParametersSet() => Prime();
+
+    /// <summary>Seeds the form the first time a given block opens this dialog.</summary>
+    private void Prime()
+    {
+        if (State.SpawnFor is not { } allocation || State.SpawnParent is not { } parent) return;
+        if (_primedFor == allocation.Id) return;
+
+        _primedFor = allocation.Id;
+        _showForm = false;
+        _stopAsking = false;
+        _type = Settings.Current.Planning.SpawnedTaskType;
+        _title = parent.Title;
+        _description = "";
+        _hours = Math.Round(allocation.DurationMinutes / 60.0, 2);
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        Prime();
+        StateHasChanged();
+    });
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    private static string Text(ChangeEventArgs e) => e.Value?.ToString() ?? "";
+
+    private void OnHoursChanged(ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            _hours = Math.Clamp(Math.Round(parsed, 2), 0, 200);
+    }
+
+    private void OnStopAskingChanged(ChangeEventArgs e)
+    {
+        _stopAsking = e.Value is true or "true" or "on";
+
+        var settings = Settings.Current;
+        settings.Planning.OfferTaskForUntrackable = !_stopAsking;
+        Settings.Save(settings);
+    }
+
+    private void ShowForm() => _showForm = true;
+
+    private void Cancel()
+    {
+        _primedFor = Guid.Empty;
+        State.CancelSpawn();
+    }
+
+    private async Task CreateAsync()
+    {
+        // Remember the type so the next spawn starts from the same place.
+        var settings = Settings.Current;
+        if (settings.Planning.SpawnedTaskType != TypeName)
+        {
+            settings.Planning.SpawnedTaskType = TypeName;
+            Settings.Save(settings);
+        }
+
+        if (await State.SpawnTaskAsync(_title, _description, TypeName, _hours))
+            _primedFor = Guid.Empty;
+    }
+}

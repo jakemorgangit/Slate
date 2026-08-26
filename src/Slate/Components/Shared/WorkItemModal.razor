@@ -1,0 +1,742 @@
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Settings
+@inject IJSRuntime Js
+
+@if (State.DetailWorkItemId is int id)
+{
+    @* Handles its own Escape so closing never depends on another component's shortcuts. *@
+    <div class="modal-scrim" @onclick="Close" @onkeydown="OnKeyDown" tabindex="-1">
+        <div class="modal" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span class="dot" style="background: @Ui.ColorFor(TypeName); margin-top: 7px"></span>
+                <div class="grow">
+                    @if (_editingTitle)
+                    {
+                        <div class="title-edit">
+                            <input id="wi-title" class="input" value="@_titleDraft"
+                                   disabled="@State.IsSavingTitle"
+                                   @onchange="e => _titleDraft = e.Value?.ToString() ?? string.Empty" />
+                            <button class="btn btn-sm" disabled="@State.IsSavingTitle"
+                                    @onclick="() => _editingTitle = false">Cancel</button>
+                            <button class="btn btn-sm btn-primary"
+                                    disabled="@(State.IsSavingTitle || string.IsNullOrWhiteSpace(_titleDraft))"
+                                    @onclick="SaveTitleAsync">
+                                @if (State.IsSavingTitle)
+                                {
+                                    <span class="spinner on-accent"></span>
+                                    <span>Saving…</span>
+                                }
+                                else
+                                {
+                                    <span>Rename</span>
+                                }
+                            </button>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="title-row">
+                            <h2>@(State.Detail?.Title ?? Fallback?.Title ?? $"Work item #{id}")</h2>
+                            @if (State.CanEditWorkItems && State.Detail is { } editable && CanEdit(editable))
+                            {
+                                <button class="btn btn-sm btn-ghost title-edit-btn" title="Rename this work item"
+                                        @onclick="() => StartEditingTitle(editable)">✎</button>
+                            }
+                        </div>
+                    }
+
+                    <div class="sub">
+                        <span class="mono">#@id</span>
+                        <span>·</span>
+                        <span>@TypeName</span>
+                        @if (StateName is { Length: > 0 })
+                        {
+                            <span>·</span>
+                            <span>@StateName</span>
+                        }
+                        @if (State.Detail is { } d)
+                        {
+                            @if (!string.IsNullOrWhiteSpace(d.AssignedTo))
+                            {
+                                <span>·</span>
+                                <span>@d.AssignedTo</span>
+                            }
+                            @foreach (var tag in d.Tags)
+                            {
+                                <span class="badge badge-muted">@tag</span>
+                            }
+                        }
+                        @if (Badge.Any)
+                        {
+                            <span class="prio-pill @(Badge.IsLocal ? "prio-mine" : "")"
+                                  style="@Ui.PriorityPillStyle(Badge.Level, true)"
+                                  title="@Ui.PriorityTooltip(Badge)">P@(Badge.Level)</span>
+                        }
+                        @if (PlannedMinutes > 0)
+                        {
+                            <span class="badge badge-accent">@Ui.Duration(PlannedMinutes) planned</span>
+                        }
+                        @if (RecordedMinutes > 0)
+                        {
+                            <span class="badge badge-danger"><ClockIcon Size="11" /> @Ui.Duration(RecordedMinutes) recorded</span>
+                        }
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close (Esc)" @onclick="Close">✕</button>
+            </div>
+
+            <div class="modal-body">
+                @if (State.IsLoadingDetail)
+                {
+                    <div class="row"><span class="spinner"></span> <span class="muted">Loading the work item…</span></div>
+                }
+                else if (State.DetailError is { } error)
+                {
+                    <div class="banner error">
+                        <span>✕</span>
+                        <div class="grow">@error</div>
+                    </div>
+                }
+                else if (State.Detail is { } detail)
+                {
+                    @* ------------------------------------------------ description *@
+                    <div class="modal-section">
+                        <div class="row" style="margin-bottom: 7px">
+                            <h3 style="margin: 0">Description</h3>
+                            <span style="flex: 1"></span>
+                            @if (_editingDescription)
+                            {
+                                <FormatPicker Value="DescriptionFormat" ValueChanged="OnDescriptionFormatChanged"
+                                              AllowHtml="true" />
+                            }
+                            else if (State.CanEditWorkItems && CanEdit(detail))
+                            {
+                                <button class="btn btn-sm" @onclick="() => StartEditingDescription(detail)">Edit</button>
+                            }
+                            else if (State.CanEditWorkItems)
+                            {
+                                <span class="muted" style="font-size: 11.5px"
+                                      title="Only work items assigned to you can be edited from here">
+                                    Assigned to @detail.AssignedTo
+                                </span>
+                            }
+                        </div>
+
+                        @if (_editingDescription)
+                        {
+                            <textarea class="textarea @(DescriptionFormat == TextFormat.PlainText ? "" : "code")"
+                                      rows="12"
+                                      value="@_descriptionDraft"
+                                      disabled="@State.IsSavingDescription"
+                                      @onchange="e => _descriptionDraft = e.Value?.ToString() ?? string.Empty"></textarea>
+                            <div class="row" style="margin-top: 8px">
+                                <span class="hint">@DescriptionHint</span>
+                                <span style="flex: 1"></span>
+                                <button class="btn btn-sm" disabled="@State.IsSavingDescription"
+                                        @onclick="CancelEditingDescription">Cancel</button>
+                                <button class="btn btn-sm btn-primary" disabled="@State.IsSavingDescription"
+                                        @onclick="SaveDescriptionAsync">
+                                    @if (State.IsSavingDescription)
+                                    {
+                                        <span class="spinner on-accent"></span>
+                                        <span>Saving…</span>
+                                    }
+                                    else
+                                    {
+                                        <span>Save description</span>
+                                    }
+                                </button>
+                            </div>
+                        }
+                        else if (string.IsNullOrWhiteSpace(detail.DescriptionHtml))
+                        {
+                            <p class="muted">No description on this work item.</p>
+                        }
+                        else
+                        {
+                            <div class="wi-html">@((MarkupString)detail.DescriptionHtml)</div>
+                        }
+                    </div>
+
+                    @* ------------------------------------------------ acceptance criteria, repro steps, anything else rich *@
+                    @foreach (var field in detail.RichFields)
+                    {
+                        <div class="modal-section" @key="field.Name">
+                            <h3>@field.DisplayName</h3>
+                            <div class="wi-html">@((MarkupString)field.Html)</div>
+                        </div>
+                    }
+
+                    @* ------------------------------------------------ discussion *@
+                    <div class="modal-section">
+                        <div class="row" style="margin-bottom: 7px">
+                            <h3 style="margin: 0">Discussion</h3>
+                            @if (State.Comments.Count > 0)
+                            {
+                                <span class="muted" style="font-size: 11.5px">@State.Comments.Count</span>
+                            }
+                            <span style="flex: 1"></span>
+                            @if (State.Comments.Count > 1)
+                            {
+                                <div class="btn-group">
+                                    <button class="btn btn-sm @(_newestFirst ? "" : "btn-primary")"
+                                            title="Reads like a conversation - newest at the bottom"
+                                            @onclick="() => _newestFirst = false">Oldest first</button>
+                                    <button class="btn btn-sm @(_newestFirst ? "btn-primary" : "")"
+                                            title="The order Azure DevOps uses"
+                                            @onclick="() => _newestFirst = true">Newest first</button>
+                                </div>
+                            }
+                        </div>
+
+                        @if (State.IsLoadingComments)
+                        {
+                            <div class="row"><span class="spinner"></span> <span class="muted">Loading the discussion…</span></div>
+                        }
+                        else if (State.CommentError is { } commentError)
+                        {
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">Could not read the discussion. @commentError</div>
+                            </div>
+                        }
+                        else if (State.Comments.Count == 0)
+                        {
+                            <p class="muted">No comments yet. Start the conversation below.</p>
+                        }
+                        else
+                        {
+                            <div class="thread">
+                                @foreach (var comment in OrderedComments)
+                                {
+                                    <div class="comment @(IsFromMe(comment) ? "mine" : "")" @key="comment.Id">
+                                        <span class="comment-avatar" title="@comment.Author">@comment.Initials</span>
+                                        <div class="grow">
+                                            <div class="comment-head">
+                                                <strong>@comment.Author</strong>
+                                                <span class="muted">@Ui.Ago(comment.CreatedDate)</span>
+                                                @if (comment.WasEdited)
+                                                {
+                                                    <span class="muted">· edited</span>
+                                                }
+                                            </div>
+                                            <div class="wi-html comment-body">@((MarkupString)comment.Html)</div>
+                                        </div>
+                                    </div>
+                                }
+                            </div>
+                        }
+
+                        @if (State.CanDiscuss)
+                        {
+                        <div class="comment-compose">
+                            <div class="row" style="margin-bottom: 6px">
+                                <span class="hint">Type <span class="kbd">@@</span> to mention someone.</span>
+                                <span style="flex: 1"></span>
+                                <FormatPicker Value="CommentFormat" ValueChanged="OnCommentFormatChanged" />
+                            </div>
+
+                            <div class="mention-anchor">
+                                <textarea id="comment-box" class="textarea" rows="3"
+                                          placeholder="Add to the discussion — this posts straight to Azure DevOps"
+                                          value="@_draftComment"
+                                          disabled="@State.IsPostingComment"
+                                          @oninput="OnDraftInputAsync"></textarea>
+
+                                @if (MentionMatches is { Count: > 0 } matches)
+                                {
+                                    <div class="mention-list">
+                                        <div class="mention-head">
+                                            @(_mentionQuery.Length == 0 ? "Mention a colleague" : $"Matching \"{_mentionQuery}\"")
+                                        </div>
+                                        @foreach (var member in matches)
+                                        {
+                                            <button class="mention-row" @key="member.DisplayName"
+                                                    @onclick="() => PickMentionAsync(member)">
+                                                <span class="comment-avatar">@member.Initials</span>
+                                                <span class="grow">
+                                                    <span class="mention-name">@member.DisplayName</span>
+                                                    @if (!string.IsNullOrWhiteSpace(member.UniqueName))
+                                                    {
+                                                        <span class="mention-mail">@member.UniqueName</span>
+                                                    }
+                                                </span>
+                                                @if (!member.CanLink)
+                                                {
+                                                    <span class="muted" style="font-size: 10.5px"
+                                                          title="This one goes in as plain text - Azure DevOps did not give us an identity to link to">
+                                                        no link
+                                                    </span>
+                                                }
+                                            </button>
+                                        }
+                                    </div>
+                                }
+                            </div>
+
+                            <div class="row" style="margin-top: 7px">
+                                <span class="hint">@CommentHint</span>
+                                <span style="flex: 1"></span>
+                                @if (!string.IsNullOrWhiteSpace(_draftComment))
+                                {
+                                    <button class="btn btn-sm" disabled="@State.IsPostingComment"
+                                            @onclick="ClearDraft">Discard</button>
+                                }
+                                <button class="btn btn-sm btn-primary"
+                                        disabled="@(State.IsPostingComment || string.IsNullOrWhiteSpace(_draftComment))"
+                                        @onclick="PostCommentAsync">
+                                    @if (State.IsPostingComment)
+                                    {
+                                        <span class="spinner on-accent"></span>
+                                        <span>Posting…</span>
+                                    }
+                                    else
+                                    {
+                                        <span>Comment</span>
+                                    }
+                                </button>
+                            </div>
+                        </div>
+                        }
+                    </div>
+
+                    @* ------------------------------------------------ links, between the conversation and the small print *@
+                    @if (detail.Relations.Count > 0)
+                    {
+                        <div class="modal-section">
+                            <div class="row" style="margin-bottom: 7px">
+                                <h3 style="margin: 0">Links</h3>
+                                <span style="flex: 1"></span>
+                                <div class="btn-group">
+                                    <button class="btn btn-sm @(_linksAsMap ? "" : "btn-primary")"
+                                            @onclick="() => _linksAsMap = false">List</button>
+                                    <button class="btn btn-sm @(_linksAsMap ? "btn-primary" : "")"
+                                            @onclick="() => _linksAsMap = true">Map</button>
+                                </div>
+                            </div>
+
+                            @if (_linksAsMap)
+                            {
+                                <RelationshipMap CentreId="id"
+                                                 CentreTitle="@detail.Title"
+                                                 CentreType="@detail.WorkItemType"
+                                                 Relations="detail.Relations"
+                                                 ResolveType="TypeOf"
+                                                 OnSelect="linked => State.ShowWorkItemAsync(linked)" />
+                            }
+                            else
+                            {
+                                @foreach (var relation in detail.Relations)
+                                {
+                                    <div class="relation-row">
+                                        <span class="kind">@relation.Kind</span>
+                                        <span class="grow truncate" title="@relation.Title">@relation.Title</span>
+                                        @if (relation.WorkItemId is int linked)
+                                        {
+                                            <button class="btn btn-sm btn-ghost" title="Open this work item here"
+                                                    @onclick="() => State.ShowWorkItemAsync(linked)">Open</button>
+                                        }
+                                        else if (relation.Url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            <button class="btn btn-sm btn-ghost" title="Open in your browser"
+                                                    @onclick="() => SystemShell.OpenUrl(relation.Url)">↗</button>
+                                        }
+                                    </div>
+                                }
+                            }
+                        </div>
+                    }
+
+                    @* ------------------------------------------------ metadata, last *@
+                    <div class="modal-section metadata">
+                        <h3>Metadata</h3>
+                        <div class="field-grid">
+                            <Cell Label="State" Value="@detail.State" />
+                            <Cell Label="Reason" Value="@detail.Reason" />
+                            <Cell Label="Assigned to" Value="@detail.AssignedTo" />
+                            <Cell Label="Created by" Value="@detail.CreatedBy" />
+                            <Cell Label="Area path" Value="@detail.AreaPath" />
+                            <Cell Label="Iteration" Value="@detail.IterationPath" />
+                            <Cell Label="Created" Value="@Moment(detail.CreatedDate)" />
+                            <Cell Label="Changed" Value="@Moment(detail.ChangedDate)" />
+                            @foreach (var field in detail.Fields)
+                            {
+                                <Cell Label="@field.DisplayName" Value="@field.Value" />
+                            }
+                        </div>
+                    </div>
+                }
+            </div>
+
+            <div class="modal-foot wrap">
+                @* Two priorities: yours, which stays here, and the one on the work item itself. *@
+                <div class="prio-group">
+                    <span class="prio-group-label" title="Never written back to Azure DevOps">Your triage</span>
+                    <div class="prio-choices">
+                        @foreach (var level in PriorityLevels)
+                        {
+                            <button class="prio-pill prio-pick"
+                                    style="@Ui.PriorityPillStyle(level, LocalPriority == level)"
+                                    title="@Ui.PriorityLabel(level)"
+                                    @onclick="() => SetLocalPriority(level)">P@(level)</button>
+                        }
+                        <button class="chip prio-clear" @onclick="() => SetLocalPriority(0)">Clear</button>
+                    </div>
+                </div>
+
+                @if (State.CanSetAdoPriority)
+                {
+                <div class="prio-group">
+                    <span class="prio-group-label" title="This is the work item's own field - the team sees it">
+                        Azure DevOps
+                    </span>
+                    <div class="prio-choices">
+                        @foreach (var level in PriorityLevels)
+                        {
+                            <button class="prio-pill prio-pick"
+                                    style="@Ui.PriorityPillStyle(level, AdoPriority == level)"
+                                    title="@($"Set Azure DevOps' priority to P{level}")"
+                                    @onclick="() => State.BeginAdoPriorityChange(id, level)">P@(level)</button>
+                        }
+                        <button class="chip prio-clear" title="Clear the priority on the work item itself"
+                                @onclick="() => State.BeginAdoPriorityChange(id, 0)">Clear</button>
+                    </div>
+                </div>
+                }
+
+                <span style="flex: 1"></span>
+                <button class="btn" @onclick="OpenInAdo">Open in Azure DevOps ↗</button>
+                @if (Fallback is { } item)
+                {
+                    <button class="btn" title="Book the next free slot for this item"
+                            @onclick="() => Schedule(item)">Schedule next free slot</button>
+                }
+                <button class="btn btn-primary" @onclick="Close">Close</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public EventCallback<WorkItem> OnSchedule { get; set; }
+
+    private static readonly int[] PriorityLevels = [1, 2, 3, 4];
+
+    private const int MaxMentionSuggestions = 8;
+
+    private bool _linksAsMap;
+    private bool _newestFirst;
+    private bool _editingDescription;
+    private bool _editingTitle;
+    private string _descriptionDraft = "";
+    private string _titleDraft = "";
+    private string _draftComment = "";
+
+    /// <summary>Where the "@" being typed starts, or -1 when no mention is in progress.</summary>
+    private int _mentionAt = -1;
+    private string _mentionQuery = "";
+
+    private int? _draftFor;
+    private int? _focusedFor;
+
+    private static string Moment(DateTimeOffset? when) => when?.ToLocalTime().ToString("f") ?? "";
+
+    private WorkItem? Fallback => State.DetailListEntry;
+
+    private string TypeName => State.Detail?.WorkItemType ?? Fallback?.WorkItemType ?? "";
+    private string StateName => State.Detail?.State ?? Fallback?.State ?? "";
+
+    private int LocalPriority =>
+        State.DetailWorkItemId is int id ? State.Planner.LocalPriority(id) : 0;
+
+    private int AdoPriority => Fallback?.Priority ?? 0;
+
+    private Ui.PriorityBadge Badge => Ui.Badge(LocalPriority, AdoPriority);
+
+    private int PlannedMinutes =>
+        State.DetailWorkItemId is int id ? State.Planner.AllocatedMinutes(id) : 0;
+
+    private int RecordedMinutes =>
+        State.DetailWorkItemId is int id ? State.Planner.RecordedMinutes(id) : 0;
+
+    private TextFormat CommentFormat
+    {
+        get => Settings.Current.Ui.CommentFormat;
+        set => Settings.Update(s => s.Ui.CommentFormat = value);
+    }
+
+    private TextFormat DescriptionFormat
+    {
+        get => Settings.Current.Ui.DescriptionFormat;
+        set => Settings.Update(s => s.Ui.DescriptionFormat = value);
+    }
+
+    private string CommentHint => CommentFormat switch
+    {
+        TextFormat.Markdown => "Markdown: **bold**, `code`, - lists, [links](url) and tables.",
+        TextFormat.Html => "Passed through as markup. Scripts and event handlers are stripped.",
+        _ => "Exactly what you type; line breaks are kept.",
+    };
+
+    private string DescriptionHint => DescriptionFormat switch
+    {
+        TextFormat.Markdown => "Written as Markdown and saved as the HTML Azure DevOps stores.",
+        TextFormat.Html => "This is the raw HTML Azure DevOps stores, so existing formatting survives the round trip.",
+        _ => "Plain text; line breaks are kept and nothing else is interpreted.",
+    };
+
+    /// <summary>Oldest first by default, so the newest sits at the end like a conversation.</summary>
+    private IEnumerable<WorkItemComment> OrderedComments =>
+        _newestFirst
+            ? State.Comments.OrderByDescending(c => c.CreatedDate)
+            : State.Comments.OrderBy(c => c.CreatedDate);
+
+    /// <summary>Colleagues matching what has been typed after the "@", or null when none is.</summary>
+    private IReadOnlyList<OrgMember>? MentionMatches
+    {
+        get
+        {
+            if (_mentionAt < 0) return null;
+
+            var matches = State.Members
+                .Where(m => m.Matches(_mentionQuery))
+                .OrderByDescending(m => m.CanLink)
+                .ThenBy(m => m.DisplayName, StringComparer.OrdinalIgnoreCase)
+                .Take(MaxMentionSuggestions)
+                .ToList();
+
+            return matches.Count > 0 ? matches : null;
+        }
+    }
+
+    private bool IsFromMe(WorkItemComment comment) =>
+        State.Identity.Length > 0 &&
+        string.Equals(comment.Author, State.Identity, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Work item types for linked ids, when they happen to be loaded.</summary>
+    private string TypeOf(int workItemId) =>
+        State.WorkItems.FirstOrDefault(i => i.Id == workItemId)?.WorkItemType ?? "";
+
+    private bool CanEdit(WorkItemDetail detail) => State.IsMine(detail.AssignedTo);
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (State.DetailWorkItemId != _draftFor)
+        {
+            _draftFor = State.DetailWorkItemId;
+            _draftComment = "";
+            _linksAsMap = false;
+            _editingDescription = false;
+            _editingTitle = false;
+            ClearMention();
+
+            // The mention list is only worth fetching once somebody has a work item open.
+            if (State.DetailWorkItemId is not null) _ = State.EnsureMembersAsync();
+        }
+
+        // Focus the scrim so it receives key events as soon as it opens.
+        if (State.DetailWorkItemId is not null && _focusedFor != State.DetailWorkItemId)
+        {
+            _focusedFor = State.DetailWorkItemId;
+            try
+            {
+                await Js.InvokeVoidAsync("planner.focusSelector", ".modal-scrim");
+            }
+            catch (Exception ex) when (ex is JSDisconnectedException or InvalidOperationException)
+            {
+            }
+        }
+        else if (State.DetailWorkItemId is null)
+        {
+            _focusedFor = null;
+        }
+    }
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key != "Escape") return;
+
+        // Escape backs out of the mention list first, then the modal.
+        if (_mentionAt >= 0)
+        {
+            ClearMention();
+            StateHasChanged();
+            return;
+        }
+
+        Close();
+    }
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    private void Close() => State.CloseWorkItem();
+
+    // ---------------------------------------------------------------- mentions
+
+    private async Task OnDraftInputAsync(ChangeEventArgs e)
+    {
+        _draftComment = e.Value?.ToString() ?? "";
+
+        var caret = _draftComment.Length;
+        try
+        {
+            caret = await Js.InvokeAsync<int>("planner.caretIndex", "#comment-box");
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or InvalidOperationException or JSException)
+        {
+            // Without a caret position, assume they are typing at the end.
+        }
+
+        UpdateMention(caret);
+    }
+
+    /// <summary>
+    /// Works out whether the caret is sitting inside an "@name" being typed, which is what
+    /// puts the picker on screen.
+    /// </summary>
+    private void UpdateMention(int caret)
+    {
+        if (caret < 0 || caret > _draftComment.Length) caret = _draftComment.Length;
+
+        var start = caret - 1;
+        while (start >= 0 && !char.IsWhiteSpace(_draftComment[start]) && _draftComment[start] != '@') start--;
+
+        var isMention = start >= 0
+                        && _draftComment[start] == '@'
+                        && (start == 0 || char.IsWhiteSpace(_draftComment[start - 1]))
+                        && caret - start - 1 <= 40;
+
+        if (!isMention)
+        {
+            ClearMention();
+            return;
+        }
+
+        _mentionAt = start;
+        _mentionQuery = _draftComment[(start + 1)..caret];
+    }
+
+    private void ClearMention()
+    {
+        _mentionAt = -1;
+        _mentionQuery = "";
+    }
+
+    private async Task PickMentionAsync(OrgMember member)
+    {
+        if (_mentionAt < 0) return;
+
+        var end = Math.Min(_draftComment.Length, _mentionAt + 1 + _mentionQuery.Length);
+        var insert = "@" + member.DisplayName + " ";
+
+        _draftComment = _draftComment[.._mentionAt] + insert + _draftComment[end..];
+        var caret = _mentionAt + insert.Length;
+        ClearMention();
+
+        try
+        {
+            await Js.InvokeVoidAsync("planner.setCaret", "#comment-box", caret);
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or InvalidOperationException or JSException)
+        {
+            // Cosmetic: the text is right either way.
+        }
+    }
+
+    private void ClearDraft()
+    {
+        _draftComment = "";
+        ClearMention();
+    }
+
+    private async Task PostCommentAsync()
+    {
+        // Every known colleague is offered as a mention candidate, so a name typed out by
+        // hand becomes a real mention just as one picked from the list does.
+        if (await State.AddCommentAsync(_draftComment, CommentFormat, State.Members)) ClearDraft();
+    }
+
+    private void OnCommentFormatChanged(TextFormat format)
+    {
+        CommentFormat = format;
+        StateHasChanged();
+    }
+
+    // ---------------------------------------------------------------- editing
+
+    private void StartEditingTitle(WorkItemDetail detail)
+    {
+        _titleDraft = detail.Title;
+        _editingTitle = true;
+    }
+
+    private async Task SaveTitleAsync()
+    {
+        if (await State.SaveTitleAsync(_titleDraft)) _editingTitle = false;
+    }
+
+    private void StartEditingDescription(WorkItemDetail detail)
+    {
+        _descriptionDraft = DescriptionFormat == TextFormat.Html
+            ? detail.DescriptionHtml
+            : Html.ToPlainTextBlock(detail.DescriptionHtml);
+
+        _editingDescription = true;
+    }
+
+    /// <summary>
+    /// Switching format re-reads the stored description in the new one. Going from HTML to
+    /// anything else flattens the markup, which the hint says out loud rather than leaving to
+    /// be discovered on save.
+    /// </summary>
+    private void OnDescriptionFormatChanged(TextFormat format)
+    {
+        var wasHtml = DescriptionFormat == TextFormat.Html;
+        DescriptionFormat = format;
+
+        // Only re-read the stored markup when nothing has been typed over it: coming back
+        // to HTML to check the output should not discard the replacement just written.
+        if (format == TextFormat.Html && !wasHtml && State.Detail is { } detail
+            && string.IsNullOrWhiteSpace(_descriptionDraft))
+            _descriptionDraft = detail.DescriptionHtml;
+        else if (format != TextFormat.Html && wasHtml)
+            _descriptionDraft = Html.ToPlainTextBlock(_descriptionDraft);
+
+        StateHasChanged();
+    }
+
+    private void CancelEditingDescription() => _editingDescription = false;
+
+    private async Task SaveDescriptionAsync()
+    {
+        var html = Html.FromFormat(_descriptionDraft, DescriptionFormat);
+        if (await State.SaveDescriptionAsync(html)) _editingDescription = false;
+    }
+
+    /// <summary>In-app only: this is never written back to Azure DevOps.</summary>
+    private void SetLocalPriority(int priority)
+    {
+        if (State.DetailWorkItemId is not int id) return;
+        State.Planner.SetLocalPriority(id, priority);
+    }
+
+    private void OpenInAdo()
+    {
+        var url = State.Detail?.Url ?? Fallback?.Url;
+        SystemShell.OpenUrl(url);
+    }
+
+    private async Task Schedule(WorkItem item)
+    {
+        Close();
+        await OnSchedule.InvokeAsync(item);
+    }
+}

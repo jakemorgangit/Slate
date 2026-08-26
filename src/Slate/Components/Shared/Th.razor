@@ -1,0 +1,28 @@
+@using Slate.Services
+@inject AppState State
+
+@* A sortable column header. Clicking the column already in use turns it around, which the
+   arrow shows, so nothing depends on remembering which way round it was left. *@
+<th class="@Class" style="@Style" title="@Tooltip" @onclick="() => OnSort.InvokeAsync(Sort)">
+    @Label<span class="sort-arrow">@Ui.SortArrow(Active, State.SortDescending)</span>
+</th>
+
+@code {
+    [Parameter, EditorRequired] public WorkItemSort Sort { get; set; }
+    [Parameter, EditorRequired] public string Label { get; set; } = "";
+    [Parameter] public string? Width { get; set; }
+    [Parameter] public bool Numeric { get; set; }
+    [Parameter] public EventCallback<WorkItemSort> OnSort { get; set; }
+
+    private bool Active => State.Sort == Sort;
+
+    private string Class =>
+        string.Join(' ', new[] { Numeric ? "cell-num" : null, Active ? "sorted" : null }.Where(c => c is not null));
+
+    private string? Style => Width is null ? null : $"width: {Width}";
+
+    private string Tooltip =>
+        Active
+            ? $"Sorted by {Label.ToLowerInvariant()}, {(State.SortDescending ? "descending" : "ascending")} - click to reverse"
+            : $"Sort by {Label.ToLowerInvariant()}";
+}

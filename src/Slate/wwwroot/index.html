@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Slate</title>
+    <base href="/" />
+    <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+    <div id="app">
+        <div class="boot">
+            <div class="boot-spinner"></div>
+            <p>Starting Slate…</p>
+        </div>
+    </div>
+
+    <div id="blazor-error-ui">
+        <span class="err-text">Something went wrong. Reload to continue.</span>
+        <a href="" class="reload">Reload</a>
+        <span class="dismiss">🗙</span>
+    </div>
+
+    <script src="_framework/blazor.webview.js" autostart="false"></script>
+    <script src="js/planner.js"></script>
+    <script>
+        // Blazor Hybrid needs an explicit start when autostart is off, which lets the
+        // interop module register before the first component renders.
+        Blazor.start();
+    </script>
+</body>
+</html>

@@ -1,0 +1,277 @@
+@page "/time"
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject PlannerService Plan
+@inject ToastService Toasts
+@inject NavigationManager Nav
+
+<PageTitle>Time recorded</PageTitle>
+
+@* Reachable by URL as well as by the tab, so the route guards itself. *@
+@if (!State.CanRecordTime)
+{
+    <div class="page">
+        <div class="empty-state">
+            <span class="glyph">◔</span>
+            <h2>Time recording is an Advanced feature</h2>
+            <p>Switch the toggle in the header to Advanced to record time against work items.</p>
+            <button class="btn" style="margin-top: 10px" @onclick="@(() => Nav.NavigateTo(""))">Back to the plan</button>
+        </div>
+    </div>
+    return;
+}
+
+<div class="page">
+    <div class="page-head">
+        <div>
+            <h1>Time recorded</h1>
+            <p>Everything booked against Azure DevOps from your calendar blocks.</p>
+        </div>
+        <div class="spacer"></div>
+
+        <div class="btn-group">
+            <button class="btn btn-icon" title="Previous week" @onclick="() => State.GoToWeek(-1)">‹</button>
+            <button class="btn" title="Jump to this week" @onclick="State.GoToToday">This week</button>
+            <button class="btn btn-icon" title="Next week" @onclick="() => State.GoToWeek(1)">›</button>
+        </div>
+
+        <div>
+            <div class="cal-range">@WeekLabel</div>
+            <div class="cal-sub">@Ui.Hours(WeekMinutes) recorded across @_entries.Count entr@(_entries.Count == 1 ? "y" : "ies")</div>
+        </div>
+    </div>
+
+    @if (_entries.Count == 0)
+    {
+        <div class="empty-state">
+            <span class="glyph"><ClockIcon Size="34" /></span>
+            <h2>No time recorded this week</h2>
+            <p>
+                Right-click a block on the Plan tab and choose <strong>Record time…</strong>.
+                Entries you book show up here, and on the work item in Azure DevOps.
+            </p>
+        </div>
+    }
+    else
+    {
+        @* ------------------------------------------------ timesheet grid *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Week summary</h2>
+                    <div class="sub">Hours per work item per day, the way a timesheet reads.</div>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table class="data timesheet">
+                    <thead>
+                        <tr>
+                            <th class="sticky-col">Work item</th>
+                            @foreach (var day in _days)
+                            {
+                                <th class="cell-num @(day.Date == DateTime.Today ? "today" : "")">
+                                    <div class="dow">@day.ToString("ddd")</div>
+                                    <div class="dom">@day.Day</div>
+                                </th>
+                            }
+                            <th class="cell-num total-col">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var row in _rows)
+                        {
+                            <tr @key="row.WorkItemId">
+                                <td class="sticky-col">
+                                    <button class="link-cell" title="Open this work item"
+                                            @onclick="() => State.ShowWorkItemAsync(row.WorkItemId)">
+                                        <span class="dot" style="background: @Ui.ColorFor(row.WorkItemType)"></span>
+                                        <span class="mono muted">#@row.WorkItemId</span>
+                                        <span class="truncate">@row.Title</span>
+                                    </button>
+                                </td>
+                                @foreach (var day in _days)
+                                {
+                                    var minutes = row.MinutesOn(day);
+                                    <td class="cell-num @(minutes > 0 ? "has-time" : "")">
+                                        @(minutes > 0 ? Ui.DecimalHours(minutes) : "")
+                                    </td>
+                                }
+                                <td class="cell-num total-col">@Ui.DecimalHours(row.TotalMinutes)</td>
+                            </tr>
+                        }
+                    </tbody>
+                    <tfoot>
+                        <tr>
+                            <td class="sticky-col"><strong>Daily total</strong></td>
+                            @foreach (var day in _days)
+                            {
+                                var minutes = MinutesOn(day);
+                                <td class="cell-num @(minutes > 0 ? "has-time" : "")">
+                                    <strong>@(minutes > 0 ? Ui.DecimalHours(minutes) : "—")</strong>
+                                </td>
+                            }
+                            <td class="cell-num total-col"><strong>@Ui.DecimalHours(WeekMinutes)</strong></td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+
+        @* ------------------------------------------------ ghost entries *@
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Entries</h2>
+                    <div class="sub">Each one mirrors the calendar block it came from.</div>
+                </div>
+            </div>
+            <div class="card-body">
+                @foreach (var day in _days.Where(d => MinutesOn(d) > 0))
+                {
+                    <div class="entry-day" @key="day.Ticks">
+                        <div class="entry-day-head">
+                            <span class="@(day.Date == DateTime.Today ? "today" : "")">@day.ToString("dddd d MMMM")</span>
+                            <span class="topbar-spacer"></span>
+                            <span class="muted">@Ui.Hours(MinutesOn(day))</span>
+                        </div>
+
+                        @foreach (var entry in _entries.Where(e => e.Date.Date == day.Date))
+                        {
+                            var live = Plan.Find(entry.AllocationId) is not null;
+                            <div class="ghost-entry" @key="entry.Id" style="--wi-color: @Ui.ColorFor(entry.WorkItemType)">
+                                <div class="ghost-time">
+                                    <div class="range">@Ui.TimeRange(entry.Start, entry.End)</div>
+                                    <div class="muted">@Ui.Duration(entry.BlockMinutes) block</div>
+                                </div>
+
+                                <div class="grow">
+                                    <button class="link-cell" title="Open this work item"
+                                            @onclick="() => State.ShowWorkItemAsync(entry.WorkItemId)">
+                                        <span class="mono muted">#@entry.WorkItemId</span>
+                                        <span class="truncate">@entry.WorkItemTitle</span>
+                                    </button>
+                                    <div class="ghost-meta">
+                                        <span>@entry.WorkItemType</span>
+                                        <span>·</span>
+                                        <span>recorded @Ui.Ago(entry.RecordedAt)</span>
+                                        @if (!entry.ReducedRemaining)
+                                        {
+                                            <span class="badge badge-muted">Remaining untouched</span>
+                                        }
+                                        @if (!live)
+                                        {
+                                            <span class="badge badge-muted" title="The calendar block it came from has gone">Block deleted</span>
+                                        }
+                                    </div>
+                                </div>
+
+                                <div class="ghost-hours">
+                                    <ClockIcon Size="12" />
+                                    <span>@Ui.DecimalHours(entry.Minutes)h</span>
+                                </div>
+
+                                <button class="btn btn-sm btn-danger" title="Take this time back off the work item"
+                                        disabled="@(_undoing == entry.Id)"
+                                        @onclick="() => UndoAsync(entry)">
+                                    @if (_undoing == entry.Id)
+                                    {
+                                        <span class="spinner"></span>
+                                    }
+                                    <span>Undo</span>
+                                </button>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+    }
+</div>
+
+<WorkItemModal />
+<PriorityDialog />
+
+@code {
+    private List<TimeEntry> _entries = [];
+    private List<DateTime> _days = [];
+    private List<Row> _rows = [];
+    private Guid? _undoing;
+
+    /// <summary>One work item's week: its per-day totals.</summary>
+    private sealed record Row(int WorkItemId, string Title, string WorkItemType, Dictionary<DateTime, int> ByDay)
+    {
+        public int MinutesOn(DateTime day) => ByDay.GetValueOrDefault(day.Date);
+        public int TotalMinutes => ByDay.Values.Sum();
+    }
+
+    private string WeekLabel
+    {
+        get
+        {
+            var start = State.WeekStart;
+            var end = start.AddDays(6);
+            var prefix = State.IsCurrentWeek ? "This week · " : "";
+            return start.Month == end.Month
+                ? $"{prefix}{start:d} – {end:d MMM yyyy}"
+                : $"{prefix}{start:d MMM} – {end:d MMM yyyy}";
+        }
+    }
+
+    private int WeekMinutes => _entries.Sum(e => e.Minutes);
+
+    private int MinutesOn(DateTime day) =>
+        _entries.Where(e => e.Date.Date == day.Date).Sum(e => e.Minutes);
+
+    protected override void OnInitialized()
+    {
+        State.Changed += OnChanged;
+        Plan.Changed += OnChanged;
+        Recompute();
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        Recompute();
+        StateHasChanged();
+    });
+
+    public void Dispose()
+    {
+        State.Changed -= OnChanged;
+        Plan.Changed -= OnChanged;
+    }
+
+    private void Recompute()
+    {
+        // The whole week, not just working days - time can land on a Saturday.
+        _days = [.. Enumerable.Range(0, 7).Select(i => State.WeekStart.AddDays(i))];
+        _entries = [.. Plan.EntriesInRange(State.WeekStart, State.WeekStart.AddDays(7))];
+
+        _rows = [.. _entries
+            .GroupBy(e => e.WorkItemId)
+            .Select(g => new Row(
+                g.Key,
+                g.First().WorkItemTitle,
+                g.First().WorkItemType,
+                g.GroupBy(e => e.Date.Date).ToDictionary(d => d.Key, d => d.Sum(e => e.Minutes))))
+            .OrderByDescending(r => r.TotalMinutes)
+            .ThenBy(r => r.WorkItemId)];
+    }
+
+    private async Task UndoAsync(TimeEntry entry)
+    {
+        if (_undoing is not null) return;
+
+        _undoing = entry.Id;
+        try
+        {
+            await State.UndoTimeEntryAsync(entry);
+        }
+        finally
+        {
+            _undoing = null;
+        }
+    }
+}

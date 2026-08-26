@@ -1,0 +1,1126 @@
+@page "/"
+@using System.Globalization
+@using Slate.Services
+@implements IAsyncDisposable
+
+@inject AppState State
+@inject PlannerService Plan
+@inject SettingsStore Settings
+@inject ToastService Toasts
+@inject IJSRuntime Js
+@inject NavigationManager Nav
+
+<PageTitle>Plan</PageTitle>
+
+<div class="planner @(_sidebarOpen ? "" : "no-sidebar")">
+
+    @* ------------------------------------------------------------ sidebar *@
+    <aside class="sidebar">
+        <div class="sidebar-head">
+            <div class="sidebar-title">
+                <h2>Work items</h2>
+                @if (State.IsLoadingWorkItems)
+                {
+                    <span class="spinner"></span>
+                }
+                @if (State.CanCreateWorkItems)
+                {
+                    <button class="btn btn-sm btn-ghost" title="Raise a new work item in Azure DevOps"
+                            @onclick="() => State.BeginCreateAsync()">＋</button>
+                }
+                <button class="btn btn-sm btn-ghost" title="Reload from Azure DevOps (R)"
+                        disabled="@State.IsLoadingWorkItems" @onclick="ReloadAsync">⟳</button>
+            </div>
+
+            <div class="search-wrap">
+                <span class="icon">⌕</span>
+                <input id="wi-search" class="input" placeholder="Filter by title, id, tag…"
+                       value="@State.Search" @oninput="OnSearchInput" />
+                @if (!string.IsNullOrEmpty(State.Search))
+                {
+                    <button class="clear" title="Clear" @onclick="ClearSearch">✕</button>
+                }
+            </div>
+
+            @if (State.AvailableTypes.Count > 1)
+            {
+                <div class="filter-row">
+                    @foreach (var type in State.AvailableTypes)
+                    {
+                        <button class="chip @(State.TypeFilter.Contains(type) ? "on" : "")"
+                                @onclick="() => ToggleType(type)">
+                            <span class="dot" style="background: @Ui.ColorFor(type)"></span>
+                            @type
+                        </button>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="sidebar-list">
+            @if (State.WorkItemError is { } error)
+            {
+                <div class="banner error">
+                    <span>✕</span>
+                    <div class="grow">
+                        <div>@error</div>
+                        <button class="btn btn-sm" style="margin-top: 8px" @onclick="@(() => Nav.NavigateTo("settings"))">
+                            Open settings
+                        </button>
+                    </div>
+                </div>
+            }
+            else if (State.IsLoadingWorkItems && State.WorkItems.Count == 0)
+            {
+                <p class="muted" style="padding: 12px">Loading work items…</p>
+            }
+            else if (_visibleItems.Count == 0)
+            {
+                <div class="empty-state" style="padding: 28px 12px">
+                    <span class="glyph">◔</span>
+                    <p>@(State.WorkItems.Count == 0 ? "No work items came back from that query." : "Nothing matches these filters.")</p>
+                </div>
+            }
+            else
+            {
+                @foreach (var item in _visibleItems)
+                {
+                    <WorkItemCard @key="item.Id"
+                                  Item="item"
+                                  Allocated="@Plan.AllocatedMinutes(item.Id)"
+                                  Recorded="@Plan.RecordedMinutes(item.Id)"
+                                  Priority="@Plan.LocalPriority(item.Id)"
+                                  OnSelect="item => State.ShowWorkItemAsync(item.Id)"
+                                  OnDragStarted="BeginItemDragAsync"
+                                  OnContextMenu="OpenItemMenu"
+                                  OnSchedule="ScheduleNextFree" />
+                }
+            }
+        </div>
+
+        <div class="sidebar-foot">
+            <span>@_visibleItems.Count of @State.WorkItems.Count shown</span>
+            <span class="topbar-spacer"></span>
+            <span>Synced @Ui.Ago(State.WorkItemsLoadedAt)</span>
+        </div>
+    </aside>
+
+    @* ------------------------------------------------------------ calendar *@
+    <section class="calendar">
+        <div class="cal-toolbar">
+            <button class="btn btn-icon btn-ghost" title="Collapse the work item list"
+                    @onclick="() => _sidebarOpen = !_sidebarOpen">@(_sidebarOpen ? "◧" : "▣")</button>
+
+            <div class="btn-group">
+                <button class="btn btn-icon" title="Previous week (←)" @onclick="() => State.GoToWeek(-1)">‹</button>
+                <button class="btn" title="Jump to this week (T)" @onclick="State.GoToToday">Today</button>
+                <button class="btn btn-icon" title="Next week (→)" @onclick="() => State.GoToWeek(1)">›</button>
+            </div>
+
+            <div>
+                <div class="cal-range">@WeekLabel</div>
+                <div class="cal-sub">
+                    @Ui.Duration(WeekMinutes) planned
+                    @if (_days.Count > 0)
+                    {
+                        <text>· @Ui.Duration(WeekMinutes / _days.Count) a day</text>
+                    }
+                </div>
+            </div>
+
+            <div class="spacer"></div>
+
+            @if (State.IsLoadingEvents)
+            {
+                <span class="chip static"><span class="spinner"></span> Reading calendar…</span>
+            }
+            else if (State.EventError is not null)
+            {
+                <span class="chip static" title="@State.EventError">
+                    <span class="dot" style="background: var(--warn)"></span> Calendar unavailable
+                </span>
+            }
+
+            @if (State.ShowOutlook)
+            {
+                <button class="chip @(Settings.Current.Planning.ShowExistingEvents ? "on" : "")"
+                        title="@(Settings.Current.Planning.ShowExistingEvents
+                            ? "Everything already in your Outlook calendar is shown behind the plan"
+                            : "Your existing Outlook events are hidden - click to show them behind the plan")"
+                        @onclick="ToggleBusyOverlay">
+                    Outlook events
+                    @if (Settings.Current.Planning.ShowExistingEvents && WeekBusyCount > 0)
+                    {
+                        <span class="badge badge-muted">@WeekBusyCount</span>
+                    }
+                </button>
+            }
+
+            <button class="chip @(Settings.Current.Ui.CompactDensity ? "on" : "")"
+                    title="Fit more hours on screen" @onclick="ToggleDensity">Compact</button>
+
+            @if (WeekMinutes > 0)
+            {
+                <button class="btn btn-sm btn-danger" title="Remove every allocation in this week"
+                        @onclick="ClearWeek">Clear week</button>
+            }
+        </div>
+
+        <div class="cal-scroll">
+            <div class="cal-grid"
+                 style="--slot-h: @(SlotPx)px; grid-template-columns: var(--gutter-w) repeat(@_days.Count, minmax(118px, 1fr));">
+
+                @* header row *@
+                <div class="col-head gutter"></div>
+                @foreach (var day in _days)
+                {
+                    var minutes = DayMinutes(day);
+                    <div class="col-head @(day.Date == DateTime.Today ? "today" : "")" @key="@("h" + day.Ticks)">
+                        <div class="dow">@day.ToString("ddd")</div>
+                        <div class="dom">@day.Day</div>
+                        <div class="load @(minutes > CapacityMinutes ? "heavy" : "")">
+                            @(minutes == 0 ? "—" : Ui.Duration(minutes))
+                        </div>
+                    </div>
+                }
+
+                @* body row *@
+                <div class="gutter-col">
+                    @for (var i = 0; i < SlotCount; i++)
+                    {
+                        var time = DayStart + TimeSpan.FromMinutes(i * SlotMinutes);
+                        var isHour = time.Minutes == 0;
+                        <div class="gutter-cell @(isHour ? "hour" : "")">
+                            @if (isHour)
+                            {
+                                <span>@time.ToString(@"hh\:mm")</span>
+                            }
+                        </div>
+                    }
+                </div>
+
+                @foreach (var day in _days)
+                {
+                    var isWeekend = day.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
+                    <div class="day-col @(isWeekend ? "weekend" : "")" @key="@("d" + day.Ticks)">
+
+                        @* Slots are click-to-place targets, and carry the day/index that the
+                           pointer-drag code in planner.js hit-tests against. *@
+                        @for (var i = 0; i < SlotCount; i++)
+                        {
+                            var index = i;
+                            var time = DayStart + TimeSpan.FromMinutes(index * SlotMinutes);
+                            var slotStart = day.Date + time;
+                            var busy = State.IsBusy(slotStart, slotStart.AddMinutes(SlotMinutes));
+
+                            <div class="slot @(time.Minutes == 0 ? "hour" : "") @(busy ? "busy" : "")"
+                                 data-day="@DayKey(day)"
+                                 data-slot="@index"
+                                 data-busy="@(busy ? "1" : "0")"
+                                 @onclick="() => State.SelectAllocation(null)"></div>
+                        }
+
+                        @* what Outlook already has booked *@
+                        @if (State.ShowOutlook && Settings.Current.Planning.ShowExistingEvents)
+                        {
+                            @foreach (var busy in State.BusyOn(day))
+                            {
+                                var top = OffsetPx(day, busy.Start);
+                                var height = SpanPx(day, busy.Start, busy.End);
+                                if (height <= 0) { continue; }
+
+                                @* Not Slate's event: read-only here, and solid to the pointer
+                                   whenever the overlap rule means nothing could be dropped on it
+                                   anyway - which is also what lets it explain itself on hover. *@
+                                <div class="busy-block @(busy.ShowAs == "tentative" ? "tentative" : "") @(Settings.Current.Planning.PreventOverlap ? "locked" : "")"
+                                     style="top: @(top)px; height: @(height)px"
+                                     title="@BusyTooltip(busy)"
+                                     @key="busy.Id">
+                                    <div class="busy-subject">
+                                        <span class="busy-lock" aria-hidden="true">┈</span>@busy.Subject
+                                    </div>
+                                    @if (height > 26)
+                                    {
+                                        <div class="busy-time">@Ui.TimeRange(busy.Start, busy.End)</div>
+                                    }
+                                </div>
+                            }
+                        }
+
+                        @* the plan *@
+                        @foreach (var placed in Layout(Plan.ForDay(day).ToList()))
+                        {
+                            var a = placed.Allocation;
+                            var top = OffsetPx(day, a.Start);
+                            var height = SpanPx(day, a.Start, a.End);
+                            if (height <= 0) { continue; }
+
+                            var width = 100.0 / placed.Lanes;
+                            var left = width * placed.Lane;
+                            var tiny = height < 34;
+
+                            <div class="alloc @(tiny ? "tiny" : "") @(State.SelectedAllocationId == a.Id ? "selected" : "") @(a.MissingInOutlook ? "missing" : "") @(State.HasConflict(a.Start, a.End) ? "conflict" : "")"
+                                 @key="a.Id"
+                                 data-alloc-id="@a.Id"
+                                 style="--alloc-color: @Ui.ColorFor(a.WorkItemType); top: @(top)px; height: @(height - 2)px; left: calc(@(N(left))% + 2px); width: calc(@(N(width))% - 4px);"
+                                 draggable="false"
+                                 title="@AllocationTooltip(a)"
+                                 @onpointerdown="e => BeginBlockDragAsync(a, e)"
+                                 @onclick="() => State.ShowWorkItemAsync(a.WorkItemId)"
+                                 @onclick:stopPropagation="true"
+                                 @oncontextmenu="e => OpenBlockMenu(a, e)"
+                                 @oncontextmenu:preventDefault="true"
+                                 @oncontextmenu:stopPropagation="true">
+
+                                <span class="alloc-flag @Ui.StateClass(a.State)"></span>
+                                <div class="alloc-title">
+                                    @{ var badge = Ui.Badge(Plan.LocalPriority(a.WorkItemId), AdoPriority(a.WorkItemId)); }
+                                    @if (badge.Any)
+                                    {
+                                        <span class="prio-pill sm @(badge.IsLocal ? "prio-mine" : "")"
+                                              style="background: @Ui.PriorityColor(badge.Level); color: @Ui.PriorityTextColor(badge.Level)"
+                                              title="@Ui.PriorityTooltip(badge)">P@(badge.Level)</span>
+                                    }
+                                    <span>#@a.WorkItemId @a.WorkItemTitle</span>
+                                </div>
+                                <div class="alloc-time">@Ui.TimeRange(a.Start, a.End) · @Ui.Duration(a.DurationMinutes)</div>
+
+                                @if (Plan.RecordedMinutesForBlock(a.Id) is var recorded && recorded > 0)
+                                {
+                                    <span class="alloc-clock"
+                                          title="@($"{Ui.Duration(recorded)} recorded against #{a.WorkItemId}")"><ClockIcon /></span>
+                                }
+
+                                <div class="alloc-resize"
+                                     @onpointerdown="e => StartResizeAsync(a, e)"
+                                     @onpointerdown:stopPropagation="true"></div>
+                            </div>
+                        }
+
+                        @if (day.Date == DateTime.Today && NowOffsetPx is int nowTop)
+                        {
+                            <div class="now-line" style="top: @(nowTop)px"></div>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+
+        @if (State.SelectedAllocation is { } selected && _inspectorOpen)
+        {
+            <AllocationInspector Allocation="selected"
+                                 Conflict="@State.HasConflict(selected.Start, selected.End)"
+                                 SlotMinutes="SlotMinutes"
+                                 OnClose="CloseInspector"
+                                 OnDurationChanged="m => Plan.Resize(selected.Id, m)"
+                                 OnNotesChanged="n => Plan.UpdateNotes(selected.Id, n)"
+                                 OnDelete="() => DeleteAllocation(selected.Id)"
+                                 OnDetach="() => Plan.Detach(selected.Id)"
+                                 OnSendNow="() => SendOneAsync(selected.Id)"
+                                 OnForget="() => ForgetBlock(selected)"
+                                 Recorded="@Plan.RecordedMinutesForBlock(selected.Id)"
+                                 OnRecordTime="() => StartRecording(selected)"
+                                 OnUndoTime="() => UndoLatestFor(selected)"
+                                 OnViewDetails="() => OpenDetails(selected.WorkItemId)" />
+        }
+    </section>
+</div>
+
+<ContextMenu Visible="_menu is not null" X="_menuX" Y="_menuY" Heading="@_menuHeading" OnClose="CloseMenu">
+    @if (_menu is BlockMenu block)
+    {
+        <button @onclick="() => OpenDetails(block.Allocation.WorkItemId)">
+            <span class="glyph">☰</span> View work item
+        </button>
+        @if (State.CanRecordTime)
+        {
+            <button disabled="@(!CanRecordTime(block.Allocation))"
+                    title="@(CanRecordTime(block.Allocation) ? "Book time against this work item" : "This work item type does not track time")"
+                    @onclick="() => StartRecording(block.Allocation)">
+                <span class="glyph" style="color: var(--danger)"><ClockIcon Size="13" /></span> Record time…
+            </button>
+            @if (Plan.LatestEntryForBlock(block.Allocation.Id) is { } lastEntry)
+            {
+                <button title="Take this booking back off the work item in Azure DevOps"
+                        @onclick="() => UndoRecordedTime(lastEntry)">
+                    <span class="glyph">↺</span> Undo recorded time (@Ui.DecimalHours(lastEntry.Minutes)h)
+                </button>
+                <button title="See every entry booked this week" @onclick="ShowTimeView">
+                    <span class="glyph">▤</span> Time recorded…
+                </button>
+            }
+        }
+        <div class="sep"></div>
+
+        <div class="sep"></div>
+        <div class="heading">Your triage <span class="muted">(this app only)</span></div>
+        <div class="prio-choices menu-prio">
+            @foreach (var level in PriorityLevels)
+            {
+                <button class="prio-pill prio-pick"
+                        style="@Ui.PriorityPillStyle(level, Plan.LocalPriority(block.Allocation.WorkItemId) == level)"
+                        title="@Ui.PriorityLabel(level)"
+                        @onclick="() => SetPriority(block.Allocation.WorkItemId, level)">P@(level)</button>
+            }
+            <button class="chip prio-clear" title="Remove your triage priority"
+                    @onclick="() => SetPriority(block.Allocation.WorkItemId, 0)">Clear</button>
+        </div>
+
+        @if (State.CanSetAdoPriority)
+        {
+        <div class="heading">Azure DevOps <span class="muted">(everyone sees this)</span></div>
+        <div class="prio-choices menu-prio">
+            @foreach (var level in PriorityLevels)
+            {
+                <button class="prio-pill prio-pick"
+                        style="@Ui.PriorityPillStyle(level, AdoPriority(block.Allocation.WorkItemId) == level)"
+                        title="@($"Set Azure DevOps' priority to P{level}")"
+                        @onclick="() => State.BeginAdoPriorityChange(block.Allocation.WorkItemId, level)">P@(level)</button>
+            }
+            <button class="chip prio-clear" title="Clear the priority on the work item itself"
+                    @onclick="() => State.BeginAdoPriorityChange(block.Allocation.WorkItemId, 0)">Clear</button>
+        </div>
+        }
+
+        @if (LinkedItems(block.Allocation.WorkItemId) is { Count: > 0 } linked)
+        {
+            <div class="sep"></div>
+            <div class="heading">Linked work items</div>
+            @foreach (var link in linked.Take(8))
+            {
+                <button title="@($"{link.Kind}: #{link.WorkItemId} {link.Title}")"
+                        @onclick="() => OpenDetails(link.WorkItemId)">
+                    <span class="glyph" style="color: @Ui.ColorFor(link.WorkItemType)">⇄</span>
+                    <span class="menu-rel">@link.Kind</span>
+                    <span class="truncate">#@link.WorkItemId @link.Title</span>
+                </button>
+            }
+        }
+
+        <div class="sep"></div>
+        <button @onclick="() => OpenInspector(block.Allocation)">
+            <span class="glyph">✎</span> Edit block
+        </button>
+        <button @onclick="() => DuplicateBlock(block.Allocation)">
+            <span class="glyph">⧉</span> Duplicate
+        </button>
+        @if (State.ShowOutlook && block.Allocation.MissingInOutlook)
+        {
+            <div class="sep"></div>
+            <button @onclick="() => SendAgain(block.Allocation)">
+                <span class="glyph">↗</span> Send to Outlook again
+            </button>
+            <button class="danger" @onclick="() => ForgetBlock(block.Allocation)">
+                <span class="glyph">✕</span> Remove from plan
+            </button>
+        }
+        else
+        {
+            @if (State.ShowOutlook)
+            {
+                <button @onclick="() => SendBlockAsync(block.Allocation)">
+                    <span class="glyph">↗</span> Send to Outlook
+                </button>
+            }
+            <div class="sep"></div>
+            <button class="danger" @onclick="() => DeleteBlock(block.Allocation)">
+                <span class="glyph">🗑</span> Delete block
+            </button>
+        }
+    }
+    else if (_menu is ItemMenu item)
+    {
+        <button @onclick="() => OpenDetails(item.Item.Id)">
+            <span class="glyph">☰</span> View work item
+        </button>
+        <button @onclick="() => ScheduleFromMenu(item.Item)">
+            <span class="glyph">＋</span> Schedule next free slot
+        </button>
+
+
+        <div class="sep"></div>
+        <div class="heading">Your triage <span class="muted">(this app only)</span></div>
+        <div class="prio-choices menu-prio">
+            @foreach (var level in PriorityLevels)
+            {
+                <button class="prio-pill prio-pick"
+                        style="@Ui.PriorityPillStyle(level, Plan.LocalPriority(item.Item.Id) == level)"
+                        title="@Ui.PriorityLabel(level)"
+                        @onclick="() => SetPriority(item.Item.Id, level)">P@(level)</button>
+            }
+            <button class="chip prio-clear" title="Remove your triage priority"
+                    @onclick="() => SetPriority(item.Item.Id, 0)">Clear</button>
+        </div>
+
+        @if (State.CanSetAdoPriority)
+        {
+        <div class="heading">Azure DevOps <span class="muted">(everyone sees this)</span></div>
+        <div class="prio-choices menu-prio">
+            @foreach (var level in PriorityLevels)
+            {
+                <button class="prio-pill prio-pick"
+                        style="@Ui.PriorityPillStyle(level, AdoPriority(item.Item.Id) == level)"
+                        title="@($"Set Azure DevOps' priority to P{level}")"
+                        @onclick="() => State.BeginAdoPriorityChange(item.Item.Id, level)">P@(level)</button>
+            }
+            <button class="chip prio-clear" title="Clear the priority on the work item itself"
+                    @onclick="() => State.BeginAdoPriorityChange(item.Item.Id, 0)">Clear</button>
+        </div>
+        }
+
+        @if (item.Item.HasLinks)
+        {
+            <div class="sep"></div>
+            <div class="heading">Linked work items</div>
+            @foreach (var link in item.Item.Links.Take(10))
+            {
+                <button title="@($"{link.Kind}: #{link.WorkItemId} {link.Title}")"
+                        @onclick="() => OpenDetails(link.WorkItemId)">
+                    <span class="glyph" style="color: @Ui.ColorFor(link.WorkItemType)">⇄</span>
+                    <span class="menu-rel">@link.Kind</span>
+                    <span class="truncate">#@link.WorkItemId @link.Title</span>
+                </button>
+            }
+            @if (item.Item.Links.Count > 10)
+            {
+                <div class="heading">+@(item.Item.Links.Count - 10) more - see the work item</div>
+            }
+        }
+
+        <div class="sep"></div>
+        <button @onclick="() => OpenExternal(item.Item.Url)">
+            <span class="glyph">↗</span> Open in Azure DevOps
+        </button>
+    }
+</ContextMenu>
+
+<WorkItemModal OnSchedule="ScheduleNextFree" />
+<RecordTimeDialog />
+<SpawnTaskDialog />
+<PriorityDialog />
+<NewWorkItemDialog OnSchedule="ScheduleNextFree" />
+
+@code {
+    private DotNetObjectReference<Planner>? _self;
+
+    private bool _sidebarOpen = true;
+    private bool _inspectorOpen;
+
+    // Context menu state. The record is either a block menu or a work item menu.
+    private object? _menu;
+    private double _menuX, _menuY;
+    private string? _menuHeading;
+
+    private static readonly int[] PriorityLevels = [1, 2, 3, 4];
+
+    private sealed record BlockMenu(Allocation Allocation);
+    private sealed record ItemMenu(WorkItem Item);
+
+    private IReadOnlyList<WorkItem> _visibleItems = [];
+    private IReadOnlyList<DateTime> _days = [];
+
+    private PlanningSettings P => Settings.Current.Planning;
+    private int SlotMinutes => Math.Clamp(P.SlotMinutes, 5, 120);
+    private int SlotPx => Settings.Current.Ui.CompactDensity ? 22 : 30;
+    private int DayStartHour => Math.Clamp(P.DayStartHour, 0, 23);
+    private TimeSpan DayStart => TimeSpan.FromHours(DayStartHour);
+
+    // Clamped against DayStartHour rather than the raw setting: Math.Clamp throws outright
+    // when min exceeds max, and an imported config can carry any hour it likes.
+    private TimeSpan DayEnd => TimeSpan.FromHours(Math.Clamp(P.DayEndHour, DayStartHour + 1, 24));
+    private int SlotCount => (int)((DayEnd - DayStart).TotalMinutes / SlotMinutes);
+    private int CapacityMinutes => (int)(DayEnd - DayStart).TotalMinutes;
+
+    private string WeekLabel
+    {
+        get
+        {
+            var start = State.WeekStart;
+            var end = start.AddDays(6);
+            var prefix = State.IsCurrentWeek ? "This week · " : "";
+            return start.Month == end.Month
+                ? $"{prefix}{start:d} – {end:d MMM yyyy}"
+                : $"{prefix}{start:d MMM} – {end:d MMM yyyy}";
+        }
+    }
+
+    private int WeekMinutes => _days.Sum(DayMinutes);
+
+    private int DayMinutes(DateTime day) => Plan.ForDay(day).Sum(a => a.DurationMinutes);
+
+    private int? NowOffsetPx
+    {
+        get
+        {
+            var now = DateTime.Now.TimeOfDay;
+            if (now < DayStart || now > DayEnd) return null;
+            return (int)((now - DayStart).TotalMinutes / SlotMinutes * SlotPx);
+        }
+    }
+
+    // ---------------------------------------------------------------- lifecycle
+
+    protected override void OnInitialized()
+    {
+        State.Changed += OnChanged;
+        Plan.Changed += OnChanged;
+        Settings.Changed += OnChanged;
+        Recompute();
+    }
+
+    protected override void OnParametersSet() => Recompute();
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        _self = DotNetObjectReference.Create(this);
+        await Js.InvokeVoidAsync("planner.registerShortcuts", _self);
+
+        // Open on the current time rather than the top of the day.
+        await Js.InvokeVoidAsync("planner.scrollCalendarTo", NowOffsetPx ?? 0);
+    }
+
+    private void Recompute()
+    {
+        _visibleItems = State.FilteredWorkItems;
+        _days = State.VisibleDays;
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        Recompute();
+        StateHasChanged();
+    });
+
+    public async ValueTask DisposeAsync()
+    {
+        State.Changed -= OnChanged;
+        Plan.Changed -= OnChanged;
+        Settings.Changed -= OnChanged;
+
+        try
+        {
+            // A gesture still in flight holds window listeners and a reference back to this
+            // component; both have to go before the object reference below is disposed.
+            await Js.InvokeVoidAsync("planner.cancelDrag");
+            await Js.InvokeVoidAsync("planner.cancelResize");
+            await Js.InvokeVoidAsync("planner.unregisterShortcuts");
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or ObjectDisposedException or InvalidOperationException)
+        {
+            // The WebView is already going away.
+        }
+
+        _self?.Dispose();
+    }
+
+    // ---------------------------------------------------------------- sidebar
+
+    private void OnSearchInput(ChangeEventArgs e)
+    {
+        State.Search = e.Value?.ToString() ?? "";
+        Recompute();
+    }
+
+    private void ClearSearch()
+    {
+        State.Search = "";
+        Recompute();
+    }
+
+    private void ToggleType(string type)
+    {
+        if (!State.TypeFilter.Add(type)) State.TypeFilter.Remove(type);
+        Recompute();
+    }
+
+    private async Task ReloadAsync() => await State.LoadWorkItemsAsync(showToast: true);
+
+    // ---------------------------------------------------------------- placing time
+
+    private DateTime SlotStart(DateTime day, int index) => day.Date + DayStart + TimeSpan.FromMinutes(index * SlotMinutes);
+
+    /// <summary>
+    /// The day key written into the grid and read back from planner.js. Invariant on both
+    /// sides: the current culture would otherwise write its own calendar's year, and a
+    /// Buddhist or Hijri year parses back as a Gregorian one without complaint.
+    /// </summary>
+    private static string DayKey(DateTime day) => day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+    /// <summary>A number bound for CSS, where a comma decimal separator voids the rule.</summary>
+    private static string N(double value) => value.ToString("0.##", CultureInfo.InvariantCulture);
+
+    /// <summary>Arms a drag of a work item out of the sidebar onto the grid.</summary>
+    private async Task BeginItemDragAsync((WorkItem Item, PointerEventArgs Pointer) e)
+    {
+        await Js.InvokeVoidAsync("planner.beginDrag", _self,
+            "workitem", e.Item.Id.ToString(),
+            $"#{e.Item.Id} {e.Item.Title}",
+            Plan.SuggestedDuration(e.Item),
+            e.Pointer.ClientX, e.Pointer.ClientY,
+            SlotPx, SlotMinutes,
+            $"[data-wi-id='{e.Item.Id}']",
+            Settings.Current.Planning.PreventOverlap);
+    }
+
+    /// <summary>Arms a drag of an existing block to a new time.</summary>
+    private async Task BeginBlockDragAsync(Allocation allocation, PointerEventArgs e)
+    {
+        if (e.Button != 0) return;
+
+        await Js.InvokeVoidAsync("planner.beginDrag", _self,
+            "allocation", allocation.Id.ToString(),
+            $"#{allocation.WorkItemId} {allocation.WorkItemTitle}",
+            allocation.DurationMinutes,
+            e.ClientX, e.ClientY,
+            SlotPx, SlotMinutes,
+            $"[data-alloc-id='{allocation.Id}']",
+            Settings.Current.Planning.PreventOverlap);
+    }
+
+    /// <summary>
+    /// Called by planner.js when a drag is released over a slot. Ctrl held means copy rather
+    /// than move, which is the usual calendar convention.
+    /// </summary>
+    [JSInvokable]
+    public void OnPointerDrop(string kind, string id, string day, int slotIndex, bool copy)
+    {
+        if (!DateTime.TryParseExact(day, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out var date))
+            return;
+
+        if (slotIndex < 0 || slotIndex >= SlotCount) return;
+        var start = SlotStart(date, slotIndex);
+
+        if (kind == "workitem" && int.TryParse(id, out var workItemId))
+        {
+            var item = State.WorkItems.FirstOrDefault(i => i.Id == workItemId);
+            if (item is null) return;
+
+            var minutes = Plan.SuggestedDuration(item);
+            if (Reject(start, start.AddMinutes(minutes))) return;
+
+            var allocation = Plan.Add(item, start, minutes);
+            State.SelectAllocation(allocation.Id);
+            WarnIfConflict(allocation);
+            State.OfferTaskIfUntrackable(allocation);
+        }
+        else if (kind == "allocation" && Guid.TryParse(id, out var allocationId))
+        {
+            if (Plan.Find(allocationId) is not { } existing) return;
+            if (Reject(start, start.AddMinutes(existing.DurationMinutes))) return;
+
+            if (copy)
+            {
+                var duplicate = Plan.Duplicate(allocationId, start);
+                if (duplicate is null) return;
+                State.SelectAllocation(duplicate.Id);
+                WarnIfConflict(duplicate);
+            }
+            else
+            {
+                Plan.Move(allocationId, start);
+                State.SelectAllocation(allocationId);
+                if (Plan.Find(allocationId) is { } moved) WarnIfConflict(moved);
+            }
+        }
+
+        InvokeAsync(StateHasChanged);
+    }
+
+    /// <summary>Books the item into the next free gap, or says why it could not.</summary>
+    private void ScheduleNextFree(WorkItem item)
+    {
+        var allocation = State.ScheduleNextFree(item);
+
+        if (allocation is null)
+        {
+            Toasts.Warning("No free slot in the next two weeks",
+                "Widen your working hours in Settings, or place it by hand.");
+            return;
+        }
+
+        State.SelectAllocation(allocation.Id);
+        if (allocation.Start.Date != State.WeekStart.Date) State.WeekStart = allocation.Start;
+        State.OfferTaskIfUntrackable(allocation);
+
+        Toasts.Success($"Scheduled #{item.Id}",
+            $"{Ui.RelativeDay(allocation.Start)} at {allocation.Start:HH:mm} for {Ui.Duration(allocation.DurationMinutes)}.");
+    }
+
+    private void WarnIfConflict(Allocation allocation)
+    {
+        if (!State.HasConflict(allocation.Start, allocation.End)) return;
+        Toasts.Warning("Overlaps something in Outlook",
+            $"{Ui.RelativeDay(allocation.Start)} {Ui.TimeRange(allocation.Start, allocation.End)} already has an event.");
+    }
+
+    // ---------------------------------------------------------------- allocation actions
+
+    private void DeleteAllocation(Guid id)
+    {
+        Plan.Remove(id);
+        State.SelectAllocation(null);
+        _inspectorOpen = false;
+    }
+
+    private async Task SendOneAsync(Guid id)
+    {
+        if (!State.Settings.IsCalendarConfigured)
+        {
+            Toasts.Error("Outlook is not connected", "Add your Entra ID client ID and sign in from Settings.");
+            return;
+        }
+
+        if (await Plan.SyncOneAsync(id))
+        {
+            Toasts.Success("Sent to Outlook");
+            await State.LoadEventsAsync();
+        }
+        else
+        {
+            Toasts.Error("Could not send that block", Plan.Find(id)?.LastError);
+        }
+    }
+
+    private async Task StartResizeAsync(Allocation allocation, PointerEventArgs e)
+    {
+        State.SelectAllocation(allocation.Id);
+        await Js.InvokeVoidAsync("planner.startResize", _self, allocation.Id.ToString(),
+            e.ClientY, allocation.DurationMinutes, SlotPx, SlotMinutes);
+    }
+
+    [JSInvokable]
+    public void OnResized(string allocationId, int minutes)
+    {
+        if (!Guid.TryParse(allocationId, out var id)) return;
+
+        // Growing a block downwards can reach an existing calendar entry just as dropping one
+        // can, so it is refused the same way rather than quietly booking over a meeting.
+        var allocation = Plan.Find(id);
+        if (allocation is not null && Reject(allocation.Start, allocation.Start.AddMinutes(minutes)))
+        {
+            InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        Plan.Resize(id, minutes);
+    }
+
+    [JSInvokable]
+    public void OnResizeCancelled() => InvokeAsync(StateHasChanged);
+
+    // ---------------------------------------------------------------- toolbar
+
+    /// <summary>How many existing calendar entries fall in the week on screen.</summary>
+    private int WeekBusyCount => _days.Sum(day => State.BusyOn(day).Count());
+
+    private void ToggleBusyOverlay()
+    {
+        var settings = Settings.Current;
+        settings.Planning.ShowExistingEvents = !settings.Planning.ShowExistingEvents;
+
+        // Now it is a decision made with the calendar in front of you, so it stands.
+        settings.Planning.OverlayChosen = true;
+        Settings.Save(settings);
+        _ = State.LoadEventsAsync();
+    }
+
+    private void ToggleDensity()
+    {
+        var settings = Settings.Current;
+        settings.Ui.CompactDensity = !settings.Ui.CompactDensity;
+        Settings.Save(settings);
+    }
+
+    private void ClearWeek()
+    {
+        var count = Plan.InRange(State.WeekStart, State.WeekStart.AddDays(7)).Count();
+        Plan.ClearRange(State.WeekStart, State.WeekStart.AddDays(7));
+        State.SelectAllocation(null);
+        Toasts.Info($"Cleared {count} block(s)",
+            State.ShowOutlook ? "Press Send to Outlook to remove the matching events." : "");
+    }
+
+    // ---------------------------------------------------------------- shortcuts
+
+    [JSInvokable]
+    public async Task OnShortcut(string combo)
+    {
+        switch (combo)
+        {
+            case "arrowleft": State.GoToWeek(-1); break;
+            case "arrowright": State.GoToWeek(1); break;
+            case "t": State.GoToToday(); break;
+            case "r": await State.LoadWorkItemsAsync(showToast: true); break;
+            case "ctrl+s": if (State.CanUseOutlook) await State.SyncAsync(); break;
+            case "delete":
+                if (State.SelectedAllocationId is Guid id) DeleteAllocation(id);
+                break;
+            case "escape":
+                CloseMenu();
+                State.CloseWorkItem();
+                State.CancelRecordTime();
+                State.SelectAllocation(null);
+                _inspectorOpen = false;
+                break;
+            case "f":
+            case "/":
+            case "ctrl+f":
+                await Js.InvokeVoidAsync("planner.focusSelector", "#wi-search");
+                break;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    // ---------------------------------------------------------------- context menu
+
+    private void OpenBlockMenu(Allocation allocation, MouseEventArgs e)
+    {
+        State.SelectAllocation(allocation.Id);
+        _menu = new BlockMenu(allocation);
+        _menuHeading = $"#{allocation.WorkItemId} {Ui.Clip(allocation.WorkItemTitle, 34)}";
+        _menuX = e.ClientX;
+        _menuY = e.ClientY;
+    }
+
+    private void OpenItemMenu((WorkItem Item, MouseEventArgs Pointer) e)
+    {
+        _menu = new ItemMenu(e.Item);
+        _menuHeading = $"#{e.Item.Id} {Ui.Clip(e.Item.Title, 34)}";
+        _menuX = e.Pointer.ClientX;
+        _menuY = e.Pointer.ClientY;
+    }
+
+    private void CloseInspector()
+    {
+        _inspectorOpen = false;
+        State.SelectAllocation(null);
+    }
+
+    private void CloseMenu()
+    {
+        _menu = null;
+        _menuHeading = null;
+    }
+
+    /// <summary>Azure DevOps' own priority for a work item, when it is one of the loaded ones.</summary>
+    private int AdoPriority(int workItemId) =>
+        State.WorkItems.FirstOrDefault(i => i.Id == workItemId)?.Priority ?? 0;
+
+    /// <summary>Sets the in-app priority. Zero clears it. Never leaves this machine.</summary>
+    private void SetPriority(int workItemId, int priority)
+    {
+        Plan.SetLocalPriority(workItemId, priority);
+        CloseMenu();
+    }
+
+    /// <summary>Links for a work item, when it is one of the loaded ones.</summary>
+    private IReadOnlyList<WorkItemLink> LinkedItems(int workItemId) =>
+        State.WorkItems.FirstOrDefault(i => i.Id == workItemId)?.Links ?? [];
+
+    /// <summary>Time can only be booked where the work item actually carries the fields for it.</summary>
+    private bool CanRecordTime(Allocation allocation) =>
+        State.WorkItems.FirstOrDefault(i => i.Id == allocation.WorkItemId)?.TracksTime ?? false;
+
+    private async Task OpenDetails(int workItemId)
+    {
+        CloseMenu();
+        await State.ShowWorkItemAsync(workItemId);
+    }
+
+    private void StartRecording(Allocation allocation)
+    {
+        CloseMenu();
+        State.BeginRecordTime(allocation);
+    }
+
+    private async Task UndoRecordedTime(TimeEntry entry)
+    {
+        CloseMenu();
+        await State.UndoTimeEntryAsync(entry);
+    }
+
+    private async Task UndoLatestFor(Allocation allocation)
+    {
+        if (Plan.LatestEntryForBlock(allocation.Id) is not { } entry) return;
+        await State.UndoTimeEntryAsync(entry);
+    }
+
+    private void ShowTimeView()
+    {
+        CloseMenu();
+        Nav.NavigateTo("time");
+    }
+
+    private void OpenInspector(Allocation allocation)
+    {
+        CloseMenu();
+        State.SelectAllocation(allocation.Id);
+        _inspectorOpen = true;
+    }
+
+    private void DuplicateBlock(Allocation allocation)
+    {
+        CloseMenu();
+        var copy = Plan.Duplicate(allocation.Id, allocation.Start.AddMinutes(allocation.DurationMinutes));
+        if (copy is not null) State.SelectAllocation(copy.Id);
+    }
+
+    private void DeleteBlock(Allocation allocation)
+    {
+        CloseMenu();
+        DeleteAllocation(allocation.Id);
+    }
+
+    private void ForgetBlock(Allocation allocation)
+    {
+        CloseMenu();
+        Plan.ForgetMissing(allocation.Id);
+        State.SelectAllocation(null);
+        Toasts.Info("Removed from the plan", "The Outlook event was already gone.");
+    }
+
+    private async Task SendBlockAsync(Allocation allocation)
+    {
+        CloseMenu();
+        await SendOneAsync(allocation.Id);
+    }
+
+    private async Task SendAgain(Allocation allocation)
+    {
+        CloseMenu();
+        await SendOneAsync(allocation.Id);
+    }
+
+    private async Task ScheduleFromMenu(WorkItem item)
+    {
+        CloseMenu();
+        ScheduleNextFree(item);
+        await Task.CompletedTask;
+    }
+
+    private void OpenExternal(string url)
+    {
+        CloseMenu();
+        SystemShell.OpenUrl(url);
+    }
+
+    /// <summary>Refuses a placement that would sit on top of an existing calendar entry.</summary>
+    private bool Reject(DateTime start, DateTime end)
+    {
+        if (!State.BlocksPlacement(start, end)) return false;
+
+        Toasts.Warning("That time is already taken",
+            "Something is in your Outlook calendar there. Turn off \"Never plan over existing events\" in Settings to allow it.");
+        return true;
+    }
+
+    /// <summary>Called by planner.js when a drag is released somewhere it cannot land.</summary>
+    [JSInvokable]
+    public void OnDropRejected()
+    {
+        Toasts.Warning("That time is already taken",
+            "Pick a slot that is free, or allow overlaps in Settings.");
+        InvokeAsync(StateHasChanged);
+    }
+
+    // ---------------------------------------------------------------- geometry
+
+    private int OffsetPx(DateTime day, DateTime time)
+    {
+        var minutes = (time - (day.Date + DayStart)).TotalMinutes;
+        return (int)Math.Round(Math.Max(0, minutes) / SlotMinutes * SlotPx);
+    }
+
+    private int SpanPx(DateTime day, DateTime start, DateTime end)
+    {
+        var dayOpen = day.Date + DayStart;
+        var dayClose = day.Date + DayEnd;
+
+        var from = start < dayOpen ? dayOpen : start;
+        var to = end > dayClose ? dayClose : end;
+        if (to <= from) return 0;
+
+        return (int)Math.Round((to - from).TotalMinutes / SlotMinutes * SlotPx);
+    }
+
+    private string BusyTooltip(ExistingEvent busy) => string.Join(Environment.NewLine, NonEmpty(
+    [
+        busy.Subject,
+        $"{Ui.TimeRange(busy.Start, busy.End)}{(busy.ShowAs == "tentative" ? " - tentative" : "")}",
+        "This is not Slate's. It cannot be moved, resized or deleted from here,",
+        "and Slate will never change it in Outlook.",
+        Settings.Current.Planning.PreventOverlap
+            ? "Work is not planned on top of it."
+            : "Work can be planned on top of it - turn on \"Never plan over existing events\" to stop that.",
+    ]));
+
+    private string AllocationTooltip(Allocation a) => string.Join("\n", NonEmpty(
+    [
+        $"#{a.WorkItemId} {a.WorkItemTitle}",
+        $"{Ui.RelativeDay(a.Start)} {Ui.TimeRange(a.Start, a.End)} ({Ui.Duration(a.DurationMinutes)})",
+        State.ShowOutlook ? Ui.SyncLabel(a.State) : "",
+        "Drag to move · Ctrl+drag to copy · drag the bottom edge to resize",
+    ]));
+
+    /// <summary>Drops the lines that turned out to have nothing to say.</summary>
+    private static IEnumerable<string> NonEmpty(IEnumerable<string> lines) =>
+        lines.Where(line => !string.IsNullOrWhiteSpace(line));
+
+    // ---------------------------------------------------------------- overlap layout
+
+    private sealed record Placed(Allocation Allocation, int Lane, int Lanes);
+
+    /// <summary>Packs overlapping blocks into side-by-side lanes, the way a calendar does.</summary>
+    private static List<Placed> Layout(List<Allocation> allocations)
+    {
+        var result = new List<Placed>();
+        var sorted = allocations.OrderBy(a => a.Start).ThenBy(a => a.DurationMinutes).ToList();
+
+        var i = 0;
+        while (i < sorted.Count)
+        {
+            // Collect one cluster of transitively overlapping blocks.
+            var cluster = new List<Allocation> { sorted[i] };
+            var clusterEnd = sorted[i].End;
+            var j = i + 1;
+
+            while (j < sorted.Count && sorted[j].Start < clusterEnd)
+            {
+                cluster.Add(sorted[j]);
+                if (sorted[j].End > clusterEnd) clusterEnd = sorted[j].End;
+                j++;
+            }
+
+            // Greedily place each block in the first lane that has come free.
+            var laneEnds = new List<DateTime>();
+            var lanes = new int[cluster.Count];
+
+            for (var k = 0; k < cluster.Count; k++)
+            {
+                var lane = laneEnds.FindIndex(end => end <= cluster[k].Start);
+                if (lane < 0)
+                {
+                    laneEnds.Add(cluster[k].End);
+                    lane = laneEnds.Count - 1;
+                }
+                else
+                {
+                    laneEnds[lane] = cluster[k].End;
+                }
+
+                lanes[k] = lane;
+            }
+
+            for (var k = 0; k < cluster.Count; k++)
+                result.Add(new Placed(cluster[k], lanes[k], laneEnds.Count));
+
+            i = j;
+        }
+
+        return result;
+    }
+}

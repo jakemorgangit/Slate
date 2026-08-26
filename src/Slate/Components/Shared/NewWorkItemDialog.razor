@@ -1,0 +1,300 @@
+@using System.Globalization
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Settings
+
+@* Raising work without leaving Slate. Only the project, type and title are required;
+   everything below that is here so an item can be filled in properly in one go. *@
+@if (State.Creating is { } draft)
+{
+    <div class="modal-scrim" @onclick="Cancel" @onkeydown="OnKeyDown" tabindex="-1">
+        <div class="modal" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span class="dot" style="background: @Ui.ColorFor(draft.WorkItemType); margin-top: 7px"></span>
+                <div class="grow">
+                    <h2>New work item</h2>
+                    <div class="sub">
+                        <span>@(string.IsNullOrWhiteSpace(draft.Project) ? "No project chosen" : draft.Project)</span>
+                        @if (draft.ParentId is int parent)
+                        {
+                            <span>·</span>
+                            <span>under <span class="mono">#@parent</span></span>
+                        }
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close (Esc)" @onclick="Cancel">✕</button>
+            </div>
+
+            <div class="modal-body">
+                <div class="grid-2">
+                    <div class="field">
+                        <label for="new-project">Project</label>
+                        @if (State.Projects.Count > 0)
+                        {
+                            <select id="new-project" class="input" value="@draft.Project" @onchange="OnProjectChanged">
+                                @foreach (var project in State.Projects)
+                                {
+                                    <option value="@project.Name">@project.Name</option>
+                                }
+                            </select>
+                        }
+                        else
+                        {
+                            <input id="new-project" class="input" value="@draft.Project"
+                                   @onchange="OnProjectChanged" />
+                        }
+                    </div>
+
+                    <div class="field">
+                        <label for="new-type">Type</label>
+                        @if (State.CreatableTypes.Count > 0)
+                        {
+                            <select id="new-type" class="input" value="@draft.WorkItemType"
+                                    @onchange="e => Set(() => draft.WorkItemType = Text(e))">
+                                @foreach (var type in State.CreatableTypes)
+                                {
+                                    <option value="@type">@type</option>
+                                }
+                            </select>
+                        }
+                        else
+                        {
+                            <input id="new-type" class="input" value="@draft.WorkItemType"
+                                   @onchange="e => Set(() => draft.WorkItemType = Text(e))" />
+                            <span class="hint">
+                                @(string.IsNullOrEmpty(State.CreateOptionsNote)
+                                    ? "Must exist in this project's process."
+                                    : State.CreateOptionsNote)
+                            </span>
+                        }
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="new-title">Title</label>
+                    <input id="new-title" class="input" placeholder="What needs doing?"
+                           value="@draft.Title" @onchange="e => Set(() => draft.Title = Text(e))" />
+                </div>
+
+                <div class="field">
+                    <div class="row" style="margin-bottom: 6px">
+                        <label for="new-desc" style="margin: 0">Description <span class="muted">(optional)</span></label>
+                        <span style="flex: 1"></span>
+                        <FormatPicker Value="Format" ValueChanged="OnFormatChanged" AllowHtml="true" />
+                    </div>
+                    <textarea id="new-desc" class="textarea @(Format == TextFormat.PlainText ? "" : "code")" rows="6"
+                              placeholder="@Placeholder"
+                              value="@_description" @onchange="e => _description = Text(e)"></textarea>
+                    <span class="hint">@Hint</span>
+                </div>
+
+                <div class="grid-2">
+                    <div class="field">
+                        <label for="new-assignee">Assigned to</label>
+                        <input id="new-assignee" class="input" list="new-people" placeholder="Leave blank for unassigned"
+                               value="@draft.AssignedTo" @onchange="e => Set(() => draft.AssignedTo = Text(e))" />
+                        <datalist id="new-people">
+                            @foreach (var member in State.Members)
+                            {
+                                <option value="@member.DisplayName">@member.UniqueName</option>
+                            }
+                        </datalist>
+                    </div>
+
+                    <div class="field">
+                        <label>Priority in Azure DevOps</label>
+                        <div class="prio-choices">
+                            @foreach (var level in PriorityLevels)
+                            {
+                                <button class="prio-pill prio-pick"
+                                        style="@Ui.PriorityPillStyle(level, draft.Priority == level)"
+                                        title="@Ui.PriorityLabel(level)"
+                                        @onclick="() => Set(() => draft.Priority = draft.Priority == level ? 0 : level)">
+                                    P@(level)
+                                </button>
+                            }
+                        </div>
+                        <span class="hint">Left alone, the process template's default applies.</span>
+                    </div>
+                </div>
+
+                <div class="grid-2">
+                    <div class="field">
+                        <label for="new-area">Area path</label>
+                        <AreaPathPicker Id="new-area"
+                                        Root="State.AreaTree"
+                                        Note="@State.CreateOptionsNote"
+                                        Value="@draft.AreaPath"
+                                        ValueChanged="path => Set(() => draft.AreaPath = path)" />
+                    </div>
+                    <div class="field">
+                        <label for="new-iteration">Iteration <span class="muted">(optional)</span></label>
+                        <input id="new-iteration" class="input" placeholder="Defaults to the project root"
+                               value="@draft.IterationPath" @onchange="e => Set(() => draft.IterationPath = Text(e))" />
+                    </div>
+                </div>
+
+                <div class="grid-2">
+                    <div class="field">
+                        <label for="new-tags">Tags <span class="muted">(optional)</span></label>
+                        <input id="new-tags" class="input" placeholder="Separated by semicolons"
+                               value="@draft.Tags" @onchange="e => Set(() => draft.Tags = Text(e))" />
+                    </div>
+                    <div class="field">
+                        <label for="new-hours">Estimate in hours <span class="muted">(optional)</span></label>
+                        <input id="new-hours" class="input" type="number" step="0.25" min="0" max="500"
+                               value="@_hours" @onchange="OnHoursChanged" />
+                        <span class="hint">Fills in Remaining and Original Estimate, and sizes the block on the calendar.</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-foot">
+                <label class="switch">
+                    <input type="checkbox" checked="@_scheduleAfter" @onchange="e => _scheduleAfter = e.Value is true" />
+                    <span class="track"></span>
+                    <span class="label">Book the next free slot for it</span>
+                </label>
+
+                <span style="flex: 1"></span>
+                <button class="btn" disabled="@State.IsCreating" @onclick="Cancel">Cancel</button>
+                <button class="btn btn-primary" disabled="@(State.IsCreating || !draft.IsValid)" @onclick="Create">
+                    @if (State.IsCreating)
+                    {
+                        <span class="spinner on-accent"></span>
+                        <span>Creating…</span>
+                    }
+                    else
+                    {
+                        <span>Create @draft.WorkItemType</span>
+                    }
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    /// <summary>Raised once the work item exists, so the page behind can react to it.</summary>
+    [Parameter] public EventCallback<WorkItem> OnCreated { get; set; }
+
+    /// <summary>Raised when "book the next free slot" was ticked.</summary>
+    [Parameter] public EventCallback<WorkItem> OnSchedule { get; set; }
+
+    private static readonly int[] PriorityLevels = [1, 2, 3, 4];
+
+    private string _description = "";
+    private string _hours = "";
+    private bool _scheduleAfter;
+    private bool _wasOpen;
+
+    private TextFormat Format
+    {
+        get => Settings.Current.Ui.DescriptionFormat;
+        set => Settings.Update(s => s.Ui.DescriptionFormat = value);
+    }
+
+    private string Placeholder => Format switch
+    {
+        TextFormat.Markdown => "A line or two so this means something later.\n\n- **bold**, `code`, lists and [links](https://example.com) all work",
+        TextFormat.Html => "<p>Raw HTML, exactly as Azure DevOps stores it.</p>",
+        _ => "A line or two so this means something later.",
+    };
+
+    private string Hint => Format switch
+    {
+        TextFormat.Markdown => "Markdown: headings, lists, tables, code fences, links and emphasis.",
+        TextFormat.Html => "Passed through as markup. Scripts and event handlers are stripped.",
+        _ => "Exactly what you type; line breaks are kept.",
+    };
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        // Reset the parts of the form this component owns each time it opens.
+        var open = State.Creating is not null;
+        if (open == _wasOpen) return;
+
+        _wasOpen = open;
+        if (!open) return;
+
+        _description = "";
+        _hours = "";
+        _scheduleAfter = false;
+        _ = State.EnsureMembersAsync();
+        StateHasChanged();
+    }
+
+    private static string Text(ChangeEventArgs e) => e.Value?.ToString() ?? "";
+
+    private void Set(Action change)
+    {
+        change();
+        StateHasChanged();
+    }
+
+    private async Task OnProjectChanged(ChangeEventArgs e)
+    {
+        if (State.Creating is not { } draft) return;
+
+        var project = Text(e);
+        if (string.Equals(project, draft.Project, StringComparison.OrdinalIgnoreCase)) return;
+
+        // Area and iteration belong to the project that was chosen before. Carried over,
+        // they name a tree the new project does not have and Azure DevOps rejects the create.
+        draft.Project = project;
+        draft.AreaPath = "";
+        draft.IterationPath = "";
+        StateHasChanged();
+
+        // The type list belongs to the project, so it has to come along.
+        await State.LoadCreateOptionsAsync(draft.Project);
+    }
+
+    private void OnFormatChanged(TextFormat format)
+    {
+        Format = format;
+        StateHasChanged();
+    }
+
+    private void OnHoursChanged(ChangeEventArgs e)
+    {
+        _hours = Text(e);
+        if (State.Creating is { } draft)
+        {
+            draft.EstimateHours =
+                double.TryParse(_hours, NumberStyles.Float, CultureInfo.InvariantCulture, out var hours) && hours > 0
+                    ? hours
+                    : null;
+        }
+    }
+
+    private void Cancel() => State.CancelCreate();
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Cancel();
+    }
+
+    private async Task Create()
+    {
+        if (State.Creating is not { } draft) return;
+
+        draft.DescriptionHtml = Html.FromFormat(_description, Format);
+
+        var schedule = _scheduleAfter;
+        var created = await State.CreateWorkItemAsync();
+        if (created is null) return;
+
+        await OnCreated.InvokeAsync(created);
+        if (schedule) await OnSchedule.InvokeAsync(created);
+    }
+}

@@ -1,0 +1,35 @@
+@implements IDisposable
+@inject ToastService Store
+
+<div class="toasts">
+    @foreach (var toast in Store.Toasts)
+    {
+        <div class="toast @toast.Level.ToString().ToLowerInvariant()" @key="toast.Id">
+            <span>@Glyph(toast.Level)</span>
+            <div class="grow">
+                <div class="t-title">@toast.Title</div>
+                @if (!string.IsNullOrWhiteSpace(toast.Detail))
+                {
+                    <div class="t-detail">@toast.Detail</div>
+                }
+            </div>
+            <button class="close" title="Dismiss" @onclick="() => Store.Dismiss(toast.Id)">✕</button>
+        </div>
+    }
+</div>
+
+@code {
+    private static string Glyph(ToastLevel level) => level switch
+    {
+        ToastLevel.Success => "✓",
+        ToastLevel.Warning => "!",
+        ToastLevel.Error => "✕",
+        _ => "i",
+    };
+
+    protected override void OnInitialized() => Store.Changed += OnChanged;
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Store.Changed -= OnChanged;
+}

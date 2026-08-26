@@ -1,0 +1,15 @@
+<Router AppAssembly="@typeof(Routes).Assembly">
+    <Found Context="routeData">
+        <RouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)" />
+        <FocusOnNavigate RouteData="@routeData" Selector="h1" />
+    </Found>
+    <NotFound>
+        <LayoutView Layout="@typeof(MainLayout)">
+            <div class="empty-state">
+                <h1>Nothing here</h1>
+                <p>That page does not exist.</p>
+                <a class="btn btn-primary" href="/">Back to the plan</a>
+            </div>
+        </LayoutView>
+    </NotFound>
+</Router>

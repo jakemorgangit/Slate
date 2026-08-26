@@ -1,0 +1,291 @@
+@page "/work-items"
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject PlannerService Plan
+@inject ToastService Toasts
+@inject NavigationManager Nav
+
+<PageTitle>Work items</PageTitle>
+
+<div class="page">
+    <div class="page-head">
+        <div>
+            <h1>Work items</h1>
+            <p>
+                @State.WorkItems.Count loaded from Azure DevOps · updated @Ui.Ago(State.WorkItemsLoadedAt)
+                @if (TotalPlannedMinutes > 0)
+                {
+                    <text> · @Ui.Duration(TotalPlannedMinutes) planned in total</text>
+                }
+            </p>
+        </div>
+        <div class="spacer"></div>
+
+        <div class="search-wrap" style="width: 260px">
+            <span class="icon">⌕</span>
+            <input class="input" placeholder="Filter…" value="@State.Search" @oninput="OnSearch" />
+        </div>
+
+        <label class="switch">
+            <input type="checkbox" checked="@State.HideFullyAllocated" @onchange="OnHideToggled" />
+            <span class="track"></span>
+            <span class="label">Hide fully planned</span>
+        </label>
+
+        <button class="btn" disabled="@State.IsLoadingWorkItems" @onclick="() => State.LoadWorkItemsAsync(true)">
+            @if (State.IsLoadingWorkItems) { <span class="spinner"></span> }
+            <span>Refresh</span>
+        </button>
+
+        @if (State.CanCreateWorkItems)
+        {
+            <button class="btn btn-primary" title="Raise a new work item in Azure DevOps"
+                    @onclick="() => State.BeginCreateAsync()">New work item</button>
+        }
+    </div>
+
+    @if (State.WorkItemError is { } error)
+    {
+        <div class="banner error">
+            <span>✕</span>
+            <div class="grow">
+                <div>@error</div>
+                <button class="btn btn-sm" style="margin-top: 8px" @onclick="@(() => Nav.NavigateTo("settings"))">
+                    Open settings
+                </button>
+            </div>
+        </div>
+    }
+    else if (_rows.Count == 0)
+    {
+        <div class="empty-state">
+            <span class="glyph">◔</span>
+            <h2>@(State.WorkItems.Count == 0 ? "Nothing loaded yet" : "Nothing matches that filter")</h2>
+            <p>
+                @if (State.WorkItems.Count == 0)
+                {
+                    <text>Check the query on the Settings page, then hit Refresh.</text>
+                }
+                else
+                {
+                    <text>Try a different search term or clear the filter.</text>
+                }
+            </p>
+        </div>
+    }
+    else
+    {
+        <div class="card">
+            <div class="table-wrap">
+                <table class="data">
+                    <thead>
+                        @* Every column sorts, and clicking the one already in use turns it around. *@
+                        <tr>
+                            <Th Sort="WorkItemSort.Id" Label="Id" Width="74px" OnSort="SortBy" />
+                            <Th Sort="WorkItemSort.Type" Label="Type" Width="128px" OnSort="SortBy" />
+                            <Th Sort="WorkItemSort.Title" Label="Title" OnSort="SortBy" />
+                            <Th Sort="WorkItemSort.State" Label="State" Width="108px" OnSort="SortBy" />
+                            <Th Sort="WorkItemSort.Priority" Label="Priority" Width="104px" OnSort="SortBy" />
+                            <Th Sort="WorkItemSort.Age" Label="Age" Width="84px" Numeric="true" OnSort="SortBy" />
+                            <Th Sort="WorkItemSort.Estimate" Label="Estimate" Width="92px" Numeric="true" OnSort="SortBy" />
+                            <Th Sort="WorkItemSort.Allocated" Label="Planned" Width="92px" Numeric="true" OnSort="SortBy" />
+                            @if (State.CanRecordTime)
+                            {
+                                <Th Sort="WorkItemSort.Recorded" Label="Recorded" Width="92px" Numeric="true" OnSort="SortBy" />
+                            }
+                            <th style="width: 168px" class="no-sort"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var item in _rows)
+                        {
+                            var planned = Plan.AllocatedMinutes(item.Id);
+                            var estimate = item.EstimateMinutes;
+
+                            <tr @key="item.Id" class="clickable"
+                                title="Click for the full work item"
+                                @onclick="() => State.ShowWorkItemAsync(item.Id)">
+                                <td class="mono muted">
+                                    <span>#@item.Id</span>
+                                </td>
+                                <td>
+                                    <span class="row">
+                                        <span class="dot" style="background: @Ui.ColorFor(item.WorkItemType)"></span>
+                                        <span class="truncate">@item.WorkItemType</span>
+                                    </span>
+                                </td>
+                                <td class="cell-title">
+                                    <div>@item.Title</div>
+                                    @if (!string.IsNullOrWhiteSpace(item.ParentTitle) || item.Tags.Length > 0 || item.HasLinks)
+                                    {
+                                        <div class="row wrap" style="margin-top: 3px">
+                                            @if (!string.IsNullOrWhiteSpace(item.ParentTitle))
+                                            {
+                                                <span class="muted" style="font-size: 11.5px">↳ @Ui.Clip(item.ParentTitle, 60)</span>
+                                            }
+                                            @foreach (var tag in item.Tags.Take(3))
+                                            {
+                                                <span class="badge badge-muted">@tag</span>
+                                            }
+                                            @if (item.HasLinks)
+                                            {
+                                                <span class="badge badge-accent"
+                                                      title="@string.Join(Environment.NewLine, item.Links.Select(l => $"{l.Kind}: #{l.WorkItemId} {l.Title}"))">
+                                                    ⇄ @item.Links.Count linked
+                                                </span>
+                                            }
+                                        </div>
+                                    }
+                                </td>
+                                <td>@item.State</td>
+                                <td>
+                                    @{ var badge = Ui.Badge(Plan.LocalPriority(item.Id), item.Priority); }
+                                    @if (badge.Any)
+                                    {
+                                        <span class="row">
+                                            <span class="prio-pill sm @(badge.IsLocal ? "prio-mine" : "")"
+                                                  style="background: @Ui.PriorityColor(badge.Level); color: @Ui.PriorityTextColor(badge.Level)"
+                                                  title="@Ui.PriorityTooltip(badge)">P@(badge.Level)</span>
+                                            @if (badge.Overrides)
+                                            {
+                                                <span class="muted" style="font-size: 10.5px">was P@(badge.AdoLevel)</span>
+                                            }
+                                        </span>
+                                    }
+                                    else
+                                    {
+                                        <span class="muted">—</span>
+                                    }
+                                </td>
+                                <td class="cell-num">
+                                    @if (item.AgeDays is int age && item.CreatedDate is { } created)
+                                    {
+                                        <span class="age-pill @Ui.AgeClass(age)" title="@Ui.AgeTooltip(created, age)">@Ui.AgeLabel(age)</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="muted">—</span>
+                                    }
+                                </td>
+                                <td class="cell-num">@(estimate is int e ? Ui.Hours(e) : "—")</td>
+                                <td class="cell-num">
+                                    @if (planned == 0)
+                                    {
+                                        <span class="muted">—</span>
+                                    }
+                                    else
+                                    {
+                                        <span style="color: @(estimate is int target && planned > target ? "var(--warn)" : "var(--accent)")">
+                                            @Ui.Duration(planned)
+                                        </span>
+                                    }
+                                </td>
+                                @if (State.CanRecordTime)
+                                {
+                                    <td class="cell-num">
+                                        @if (Plan.RecordedMinutes(item.Id) is var recorded && recorded > 0)
+                                        {
+                                            <span class="row" style="color: var(--danger); justify-content: flex-end">
+                                                <ClockIcon Size="11" /> @Ui.Duration(recorded)
+                                            </span>
+                                        }
+                                        else
+                                        {
+                                            <span class="muted">—</span>
+                                        }
+                                    </td>
+                                }
+                                <td>
+                                    <div class="row" style="justify-content: flex-end">
+                                        <button class="btn btn-sm" title="Book the next free slot for this item"
+                                                @onclick="() => Schedule(item)"
+                                                @onclick:stopPropagation="true">Schedule</button>
+                                        <button class="btn btn-sm btn-ghost" title="Open in Azure DevOps"
+                                                @onclick="() => SystemShell.OpenUrl(item.Url)"
+                                                @onclick:stopPropagation="true">↗</button>
+                                    </div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    }
+</div>
+
+<WorkItemModal OnSchedule="Schedule" />
+<SpawnTaskDialog />
+<PriorityDialog />
+<NewWorkItemDialog OnCreated="Created" OnSchedule="Schedule" />
+
+@code {
+    private IReadOnlyList<WorkItem> _rows = [];
+
+    private int TotalPlannedMinutes => Plan.Allocations.Sum(a => a.DurationMinutes);
+
+    protected override void OnInitialized()
+    {
+        State.Changed += OnChanged;
+        Plan.Changed += OnChanged;
+        _rows = State.FilteredWorkItems;
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        _rows = State.FilteredWorkItems;
+        StateHasChanged();
+    });
+
+    public void Dispose()
+    {
+        State.Changed -= OnChanged;
+        Plan.Changed -= OnChanged;
+    }
+
+    private void OnSearch(ChangeEventArgs e)
+    {
+        State.Search = e.Value?.ToString() ?? "";
+        _rows = State.FilteredWorkItems;
+    }
+
+    private void OnHideToggled(ChangeEventArgs e)
+    {
+        State.HideFullyAllocated = e.Value is true or "true" or "on";
+        _rows = State.FilteredWorkItems;
+    }
+
+    private void SortBy(WorkItemSort sort)
+    {
+        State.SortByColumn(sort);
+        _rows = State.FilteredWorkItems;
+    }
+
+    /// <summary>A freshly raised work item is already in the list; just show it.</summary>
+    private void Created(WorkItem item)
+    {
+        _rows = State.FilteredWorkItems;
+        StateHasChanged();
+    }
+
+    private void Schedule(WorkItem item)
+    {
+        var allocation = State.ScheduleNextFree(item);
+
+        if (allocation is null)
+        {
+            Toasts.Warning("No free slot in the next two weeks",
+                "Widen your working hours in Settings, or place it by hand on the Plan tab.");
+            return;
+        }
+
+        State.WeekStart = allocation.Start;
+        State.SelectAllocation(allocation.Id);
+        State.OfferTaskIfUntrackable(allocation);
+
+        Toasts.Success($"Scheduled #{item.Id}",
+            $"{Ui.RelativeDay(allocation.Start)} at {allocation.Start:HH:mm} for {Ui.Duration(allocation.DurationMinutes)}. Open Plan to adjust it.");
+    }
+}

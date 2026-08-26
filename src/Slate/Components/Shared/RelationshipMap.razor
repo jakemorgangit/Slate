@@ -1,0 +1,192 @@
+@using System.Globalization
+@using Slate.Services
+
+@* A one-hop map of what this work item is linked to. Clicking a node re-centres on it.
+   SVG <text> is emitted through MarkupString because Razor reserves that tag name. *@
+
+@if (_nodes.Count == 0)
+{
+    <p class="muted">Nothing links to this work item, so there is no map to draw.</p>
+}
+else
+{
+    <div class="relmap-scroll">
+        <svg class="relmap" viewBox="0 0 @N(_width) @N(_height)" width="@N(_width)" height="@N(_height)"
+             role="img" aria-label="Map of linked work items">
+
+            @* Edges first, so the cards sit on top of them. *@
+            @foreach (var node in _nodes)
+            {
+                <line x1="@N(CX(_centreX))" y1="@N(CY(_centreY))"
+                      x2="@N(CX(node.X))" y2="@N(CY(node.Y))" class="relmap-edge" />
+            }
+
+            <g class="relmap-node is-centre">
+                <rect x="@N(_centreX)" y="@N(_centreY)" width="@N(NodeW)" height="@N(NodeH)" rx="10"
+                      style="stroke: @Ui.ColorFor(CentreType)" />
+                @Text(_centreX + 13, _centreY + 22, "relmap-id", $"#{CentreId}")
+                @Text(_centreX + 13, _centreY + 41, "relmap-title", Ui.Clip(CentreTitle, 25))
+            </g>
+
+            @foreach (var node in _nodes)
+            {
+                <g class="relmap-node" @key="node.Id" @onclick="() => OnSelect.InvokeAsync(node.Id)">
+                    <rect x="@N(node.X)" y="@N(node.Y)" width="@N(NodeW)" height="@N(NodeH)" rx="10"
+                          style="stroke: @Ui.ColorFor(node.Type)">
+                        <title>@node.Kind: #@node.Id @node.Title</title>
+                    </rect>
+                    @Text(node.X + 13, node.Y + 22, "relmap-id", $"#{node.Id}")
+                    @Text(node.X + 13, node.Y + 41, "relmap-title", Ui.Clip(node.Title, 25))
+                </g>
+            }
+
+            @* Labels last so a card can never sit on top of one. *@
+            @foreach (var node in _nodes)
+            {
+                var lx = (CX(_centreX) + CX(node.X)) / 2;
+                var ly = (CY(_centreY) + CY(node.Y)) / 2;
+                var w = (node.Kind.Length * 6.4) + 14;
+
+                <rect x="@N(lx - (w / 2))" y="@N(ly - 9)" width="@N(w)" height="18" rx="9" class="relmap-kind-bg" />
+                @Label(lx, ly + 4, "relmap-kind", node.Kind)
+            }
+        </svg>
+    </div>
+
+    <p class="hint" style="margin-top: 8px">
+        Parents sit above, children below, everything else to the sides. Click any card to open it.
+    </p>
+}
+
+@code {
+    [Parameter, EditorRequired] public int CentreId { get; set; }
+    [Parameter] public string CentreTitle { get; set; } = "";
+    [Parameter] public string CentreType { get; set; } = "";
+    [Parameter] public IReadOnlyList<WorkItemRelation> Relations { get; set; } = [];
+    [Parameter] public EventCallback<int> OnSelect { get; set; }
+
+    /// <summary>Resolves a work item type for a linked id, when that item happens to be loaded.</summary>
+    [Parameter] public Func<int, string>? ResolveType { get; set; }
+
+    private const double NodeW = 214;
+    private const double NodeH = 56;
+    private const double GapX = 24;
+
+    /// <summary>Wider than GapX: the side links' labels sit on a short horizontal edge.</summary>
+    private const double SideGapX = 120;
+
+    private const double GapY = 84;
+    private const double Pad = 16;
+
+    private sealed record Node(int Id, string Title, string Type, string Kind, double X, double Y);
+
+    private readonly List<Node> _nodes = [];
+    private double _centreX, _centreY;
+    private double _width = 480;
+    private double _height = 300;
+
+    /// <summary>Kinds that read as "above" and "below" in a hierarchy.</summary>
+    private static readonly string[] Above = ["Parent", "Predecessor"];
+    private static readonly string[] Below = ["Child", "Successor"];
+
+    protected override void OnParametersSet() => Layout();
+
+    private void Layout()
+    {
+        _nodes.Clear();
+
+        // Only work item links can be navigated; attachments and hyperlinks are not nodes.
+        var links = Relations
+            .Where(r => r.WorkItemId is int linked && linked != CentreId)
+            .GroupBy(r => r.WorkItemId!.Value)
+            .Select(g => g.First())
+            .ToList();
+
+        if (links.Count == 0) return;
+
+        var parents = links.Where(r => Above.Contains(r.Kind)).ToList();
+        var children = links.Where(r => Below.Contains(r.Kind)).ToList();
+        var others = links.Except(parents).Except(children).ToList();
+
+        // The middle row is: half the "other" links, the centre card, then the rest.
+        var left = others.Take(others.Count / 2).ToList();
+        var right = others.Skip(left.Count).ToList();
+
+        var topWidth = RowWidth(parents.Count);
+        var midWidth = MidRowWidth(left.Count, right.Count);
+        var bottomWidth = RowWidth(children.Count);
+
+        _width = Math.Max(Math.Max(topWidth, midWidth), bottomWidth) + (Pad * 2);
+
+        var rows = 1 + (parents.Count > 0 ? 1 : 0) + (children.Count > 0 ? 1 : 0);
+        _height = (rows * NodeH) + ((rows - 1) * GapY) + (Pad * 2);
+
+        var y = Pad;
+        if (parents.Count > 0)
+        {
+            PlaceRow(parents, StartX(topWidth), y);
+            y += NodeH + GapY;
+        }
+
+        var midStart = StartX(midWidth);
+        PlaceRow(left, midStart, y);
+        _centreX = midStart + (left.Count == 0 ? 0 : RowWidth(left.Count) + SideGapX);
+        _centreY = y;
+        PlaceRow(right, _centreX + NodeW + SideGapX, y);
+
+        if (children.Count > 0)
+            PlaceRow(children, StartX(bottomWidth), y + NodeH + GapY);
+    }
+
+    private static double RowWidth(int count) =>
+        count <= 0 ? 0 : (count * NodeW) + ((count - 1) * GapX);
+
+    /// <summary>The centre row: side links, the centre card, and the wider gaps around it.</summary>
+    private static double MidRowWidth(int left, int right)
+    {
+        var width = NodeW;
+        if (left > 0) width += RowWidth(left) + SideGapX;
+        if (right > 0) width += RowWidth(right) + SideGapX;
+        return width;
+    }
+
+    private double StartX(double rowWidth) => (_width - rowWidth) / 2;
+
+    private void PlaceRow(List<WorkItemRelation> links, double startX, double y)
+    {
+        for (var i = 0; i < links.Count; i++)
+        {
+            var link = links[i];
+            var id = link.WorkItemId!.Value;
+
+            _nodes.Add(new Node(
+                id,
+                StripId(link.Title, id),
+                ResolveType?.Invoke(id) ?? "",
+                link.Kind,
+                startX + (i * (NodeW + GapX)),
+                y));
+        }
+    }
+
+    /// <summary>Titles arrive as "#123 Something"; the id is drawn separately.</summary>
+    private static string StripId(string title, int id)
+    {
+        var prefix = $"#{id} ";
+        return title.StartsWith(prefix, StringComparison.Ordinal) ? title[prefix.Length..] : title;
+    }
+
+    private static double CX(double x) => x + (NodeW / 2);
+    private static double CY(double y) => y + (NodeH / 2);
+
+    private static string N(double value) => value.ToString("0.##", CultureInfo.InvariantCulture);
+
+    private static MarkupString Text(double x, double y, string cssClass, string content) =>
+        new($"<text x=\"{N(x)}\" y=\"{N(y)}\" class=\"{cssClass}\">{Escape(content)}</text>");
+
+    private static MarkupString Label(double x, double y, string cssClass, string content) =>
+        new($"<text x=\"{N(x)}\" y=\"{N(y)}\" class=\"{cssClass}\" text-anchor=\"middle\">{Escape(content)}</text>");
+
+    private static string Escape(string value) =>
+        value.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+}

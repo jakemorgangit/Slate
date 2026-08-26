@@ -1,0 +1,127 @@
+@using Slate.Services
+
+@* One dropdown per level of the area tree, each one narrowing the next, for as many levels as
+   the project actually has. The value handed back is the concatenation Azure DevOps wants in
+   System.AreaPath: project, then each level chosen.
+
+   Falls back to a plain text box whenever the tree could not be read, because a token that
+   cannot list classification nodes can still perfectly well create work items in them. *@
+@if (Root is null)
+{
+    <input id="@Id" class="input" placeholder="Defaults to the project root"
+           value="@Value" @onchange="OnTyped" />
+    <span class="hint">@(string.IsNullOrEmpty(Note) ? "Backslash separated, starting with the project." : Note)</span>
+}
+else
+{
+    <div class="area-picker">
+        @for (var depth = 0; depth < Levels.Count; depth++)
+        {
+            var level = depth;
+
+            if (level > 0)
+            {
+                <span class="area-sep">\</span>
+            }
+
+            <select class="input" value="@Chosen(level)" @onchange="e => Choose(level, Text(e))">
+                @if (level > 0)
+                {
+                    <option value="">@AnyLabel</option>
+                }
+                @foreach (var node in Levels[level])
+                {
+                    <option value="@node.Path">@node.Name</option>
+                }
+            </select>
+        }
+    </div>
+
+    <span class="hint">
+        Goes in as <span class="mono">@(string.IsNullOrWhiteSpace(Value) ? Root.Path : Value)</span>
+    </span>
+}
+
+@code {
+    [Parameter, EditorRequired] public string Value { get; set; } = "";
+    [Parameter] public EventCallback<string> ValueChanged { get; set; }
+
+    /// <summary>The project's area tree, or null when it could not be read.</summary>
+    [Parameter] public AreaNode? Root { get; set; }
+
+    [Parameter] public string Id { get; set; } = "area-path";
+
+    /// <summary>Shown under the text box when the tree is missing, to say why.</summary>
+    [Parameter] public string Note { get; set; } = "";
+
+    private const string AnyLabel = "(none)";
+
+    /// <summary>
+    /// The chain of nodes matching the current value, root first. A value the tree does not
+    /// contain - one from another project, or from deeper than the fetch reached - falls back
+    /// to the root, so the dropdowns describe something real rather than showing blanks.
+    /// </summary>
+    private IReadOnlyList<AreaNode> Trail
+    {
+        get
+        {
+            if (Root is null) return [];
+
+            var found = Root.Trail(string.IsNullOrWhiteSpace(Value) ? Root.Path : Value);
+            return found.Count > 0 ? found : [Root];
+        }
+    }
+
+    /// <summary>
+    /// The options at each level: the project, then the children of whatever was chosen above.
+    /// One level deeper than the trail whenever the deepest choice still has children to offer.
+    /// </summary>
+    private List<IReadOnlyList<AreaNode>> Levels
+    {
+        get
+        {
+            var trail = Trail;
+            if (trail.Count == 0) return [];
+
+            var levels = new List<IReadOnlyList<AreaNode>>();
+            levels.Add([trail[0]]);
+
+            foreach (var node in trail)
+            {
+                if (!node.HasChildren) break;
+                levels.Add(node.Children);
+            }
+
+            return levels;
+        }
+    }
+
+    /// <summary>The path selected at a given level, or empty when nothing is chosen there.</summary>
+    private string Chosen(int level)
+    {
+        var trail = Trail;
+        return level < trail.Count ? trail[level].Path : "";
+    }
+
+    private static string Text(ChangeEventArgs e) => e.Value?.ToString() ?? "";
+
+    /// <summary>
+    /// Choosing a level replaces everything below it: keeping a deeper area under a different
+    /// parent would build a path that does not exist.
+    /// </summary>
+    private Task Choose(int level, string path)
+    {
+        if (Root is null) return Task.CompletedTask;
+
+        var trail = Trail;
+
+        // An empty choice means "stop here", which is the level above.
+        var chosen = path.Length > 0
+            ? path
+            : level >= 1 && level - 1 < trail.Count ? trail[level - 1].Path : Root.Path;
+
+        return ValueChanged.InvokeAsync(chosen);
+    }
+
+    private Task OnTyped(ChangeEventArgs e) => ValueChanged.InvokeAsync(Text(e));
+}

@@ -1,0 +1,31 @@
+@using Slate.Services
+
+@* How the box below reads what you type. Sticks between sessions, so whichever you prefer
+   is the one you get next time. *@
+<div class="btn-group format-picker">
+    <button class="btn btn-sm @(Value == TextFormat.PlainText ? "btn-primary" : "")"
+            title="Exactly what you type, line breaks kept"
+            @onclick="() => Pick(TextFormat.PlainText)">Plain</button>
+
+    <button class="btn btn-sm @(Value == TextFormat.Markdown ? "btn-primary" : "")"
+            title="**bold**, `code`, - lists, # headings, [links](url) and tables"
+            @onclick="() => Pick(TextFormat.Markdown)">Markdown</button>
+
+    @if (AllowHtml)
+    {
+        <button class="btn btn-sm @(Value == TextFormat.Html ? "btn-primary" : "")"
+                title="The raw HTML Azure DevOps stores"
+                @onclick="() => Pick(TextFormat.Html)">HTML</button>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public TextFormat Value { get; set; }
+    [Parameter] public EventCallback<TextFormat> ValueChanged { get; set; }
+
+    /// <summary>Offered where the existing content is already markup, such as a description.</summary>
+    [Parameter] public bool AllowHtml { get; set; }
+
+    private Task Pick(TextFormat format) =>
+        format == Value ? Task.CompletedTask : ValueChanged.InvokeAsync(format);
+}

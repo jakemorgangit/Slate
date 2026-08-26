@@ -1,0 +1,14 @@
+@* One label/value pair inside a .field-grid. Renders nothing when the value is empty. *@
+
+@if (!string.IsNullOrWhiteSpace(Value))
+{
+    <div class="cell">
+        <div class="k">@Label</div>
+        <div class="v">@Value</div>
+    </div>
+}
+
+@code {
+    [Parameter, EditorRequired] public string Label { get; set; } = "";
+    [Parameter] public string? Value { get; set; }
+}

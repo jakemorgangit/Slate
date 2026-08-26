@@ -1,0 +1,224 @@
+@inherits LayoutComponentBase
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Settings
+@inject PlannerService Planner
+@inject ToastService Toasts
+@inject IJSRuntime Js
+@inject NavigationManager Nav
+
+<div class="app-shell">
+    <header class="topbar">
+        <div class="brand">
+            <span class="brand-mark">◧</span>
+            <span>Slate</span>
+        </div>
+
+        <nav class="nav">
+            <NavLink href="" Match="NavLinkMatch.All">Plan</NavLink>
+            <NavLink href="work-items">Work items</NavLink>
+            @if (State.CanRecordTime)
+            {
+                <NavLink href="time">Time</NavLink>
+            }
+            <NavLink href="settings">Settings</NavLink>
+            <NavLink href="help">Help</NavLink>
+        </nav>
+
+        <div class="topbar-spacer"></div>
+
+        @* The mode switch: Basic lists and plans, Advanced writes back to Azure DevOps. *@
+        <label class="switch mode-switch" title="@ModeTooltip">
+            <input type="checkbox" checked="@State.IsAdvanced" @onchange="OnModeToggled" />
+            <span class="track"></span>
+            <span class="label">@(State.IsAdvanced ? "Advanced" : "Basic")</span>
+        </label>
+
+        @if (!State.Settings.IsAdoConfigured)
+        {
+            <button class="chip" @onclick="@(() => Nav.NavigateTo("settings"))" title="Connect to Azure DevOps to get started">
+                <span class="dot" style="background: var(--warn)"></span>
+                Setup needed
+            </button>
+        }
+        else if (State.Outlook == OutlookState.NeedsSignIn)
+        {
+            <button class="chip" @onclick="@(() => Nav.NavigateTo("settings"))" title="Sign in to reach your Outlook calendar">
+                <span class="dot" style="background: var(--warn)"></span>
+                Not signed in
+            </button>
+        }
+        else if (State.Outlook == OutlookState.Ready)
+        {
+            <span class="chip static truncate" style="max-width: 220px" title="@State.SignIn.Username">
+                <span class="dot" style="background: var(--ok)"></span>
+                @State.SignIn.Username
+            </span>
+        }
+
+        @* With automatic sync on this is a status, not a control - until something needs
+           attention, at which point it becomes the way to try again. *@
+        @if (State.ShowOutlook)
+        {
+            @if (State.AutoSyncOn)
+            {
+                <button class="chip sync-status @SyncClass"
+                        disabled="@(State.IsSyncing || !State.CanUseOutlook)"
+                        @onclick="State.SyncAsync"
+                        title="@SyncTooltip">
+                    @if (State.IsSyncing)
+                    {
+                        <span class="spinner"></span>
+                        <span>Updating Outlook…</span>
+                    }
+                    else if (State.AutoSyncFailed)
+                    {
+                        <span class="dot" style="background: var(--danger)"></span>
+                        <span>Retry</span>
+                    }
+                    else if (Planner.PendingCount > 0)
+                    {
+                        <span class="dot" style="background: var(--warn)"></span>
+                        <span>@Planner.PendingCount to send</span>
+                    }
+                    else
+                    {
+                        <span class="dot" style="background: var(--ok)"></span>
+                        <span>In Outlook</span>
+                    }
+                </button>
+            }
+            else
+            {
+                <button class="btn btn-primary"
+                        disabled="@(State.IsSyncing || Planner.PendingCount == 0 || !State.CanUseOutlook)"
+                        @onclick="State.SyncAsync"
+                        title="@(State.CanUseOutlook
+                            ? "Create or update the Outlook events for every pending change"
+                            : "Sign in on the Settings page first")">
+                    @if (State.IsSyncing)
+                    {
+                        <span class="spinner on-accent"></span>
+                        <span>Syncing…</span>
+                    }
+                    else
+                    {
+                        <span>↗</span>
+                        <span>Send to Outlook</span>
+                        @if (Planner.PendingCount > 0)
+                        {
+                            <span class="badge" style="background: rgba(255,255,255,.22); color: #fff">@Planner.PendingCount</span>
+                        }
+                    }
+                </button>
+            }
+        }
+
+        <button class="btn btn-icon btn-ghost" @onclick="ToggleThemeAsync" title="@ThemeTooltip">
+            @ThemeGlyph
+        </button>
+    </header>
+
+    <main class="content">
+        @Body
+    </main>
+</div>
+
+<Toasts />
+
+@code {
+    private string ThemeGlyph => Settings.Current.Ui.Theme switch
+    {
+        ThemeMode.Dark => "☾",
+        ThemeMode.Light => "☀",
+        _ => "◐",
+    };
+
+    private string ThemeTooltip => $"Theme: {Settings.Current.Ui.Theme}. Click to change.";
+
+    private string SyncClass =>
+        State.AutoSyncFailed ? "failed" : Planner.PendingCount > 0 ? "pending" : "ok";
+
+    private string SyncTooltip =>
+        !State.CanUseOutlook ? "Sign in on the Settings page to reach your calendar"
+        : State.AutoSyncFailed ? "Something did not reach Outlook. Click to try again."
+        : Planner.PendingCount > 0 ? $"{Planner.PendingCount} change(s) about to go to Outlook. Click to send them now."
+        : "Every block matches your Outlook calendar.";
+
+    private string ModeTooltip => State.IsAdvanced
+        ? "Advanced: recording time, raising work items, editing and discussion are all available."
+        : "Basic: list work items and plan your time against them. Nothing is written back to Azure DevOps.";
+
+    /// <summary>
+    /// Leaving Basic mode standing on a page it no longer offers would show an empty shell,
+    /// so anything now hidden hands back to the plan.
+    /// </summary>
+    private void OnModeToggled(ChangeEventArgs e)
+    {
+        State.SetMode(e.Value is true ? AppMode.Advanced : AppMode.Basic);
+
+        if (!State.CanRecordTime && Nav.Uri.Contains("/time", StringComparison.OrdinalIgnoreCase))
+            Nav.NavigateTo("");
+    }
+
+    protected override void OnInitialized()
+    {
+        State.Changed += OnStateChanged;
+        Planner.Changed += OnStateChanged;
+        Toasts.Changed += OnStateChanged;
+        Settings.Changed += OnSettingsChanged;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        await ApplyThemeAsync();
+        await State.RefreshSignInAsync();
+
+        if (State.Settings.IsAdoConfigured)
+            await State.LoadWorkItemsAsync();
+        else
+            Nav.NavigateTo("settings");
+
+        if (State.ShowOutlook) await State.LoadEventsAsync();
+        State.ConfigurePolling();
+    }
+
+    private async Task ApplyThemeAsync()
+    {
+        var ui = Settings.Current.Ui;
+        await Js.InvokeVoidAsync("planner.applyTheme", ui.Theme.ToString(), ui.Accent, ui.CompactDensity);
+    }
+
+    private async Task ToggleThemeAsync()
+    {
+        var settings = Settings.Current;
+        settings.Ui.Theme = settings.Ui.Theme switch
+        {
+            ThemeMode.Dark => ThemeMode.Light,
+            ThemeMode.Light => ThemeMode.System,
+            _ => ThemeMode.Dark,
+        };
+        Settings.Save(settings);
+        await ApplyThemeAsync();
+    }
+
+    private void OnStateChanged() => InvokeAsync(StateHasChanged);
+
+    private void OnSettingsChanged() => InvokeAsync(async () =>
+    {
+        await ApplyThemeAsync();
+        State.ConfigurePolling();
+        StateHasChanged();
+    });
+
+    public void Dispose()
+    {
+        State.Changed -= OnStateChanged;
+        Planner.Changed -= OnStateChanged;
+        Toasts.Changed -= OnStateChanged;
+        Settings.Changed -= OnSettingsChanged;
+    }
+}

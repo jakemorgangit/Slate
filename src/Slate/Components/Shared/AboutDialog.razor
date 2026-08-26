@@ -1,0 +1,57 @@
+@using Slate.Services
+
+@* Who made this, which build it is, and where to find the rest. *@
+@if (Show)
+{
+    <div class="modal-scrim" @onclick="Close" @onkeydown="OnKeyDown" tabindex="-1">
+        <div class="modal narrow" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span class="brand-mark about-mark">◧</span>
+                <div class="grow">
+                    <h2>@AppInfo.Name</h2>
+                    <div class="sub">
+                        <span>Version @AppInfo.Version</span>
+                        <span>·</span>
+                        <span>Built @AppInfo.BuildDateLong</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close (Esc)" @onclick="Close">✕</button>
+            </div>
+
+            <div class="modal-body">
+                <p class="about-line">
+                    Azure DevOps work items on one side, your Outlook week on the other, and the
+                    time you actually spent recorded back against the work.
+                </p>
+
+                <div class="field-grid about-grid">
+                    <Cell Label="Author" Value="@AppInfo.Author" />
+                    <Cell Label="Organisation" Value="@AppInfo.Organisation" />
+                    <Cell Label="Version" Value="@AppInfo.Version" />
+                    <Cell Label="Build date" Value="@AppInfo.BuildDateLong" />
+                </div>
+
+                <p class="hint" style="margin-top: 14px">@AppInfo.Copyright</p>
+            </div>
+
+            <div class="modal-foot">
+                <span class="muted" style="font-size: 11.5px">
+                    Setup steps, shortcuts and troubleshooting live on the Help tab.
+                </span>
+                <span style="flex: 1"></span>
+                <button class="btn btn-primary" @onclick="Close">Close</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public EventCallback<bool> ShowChanged { get; set; }
+
+    private Task Close() => ShowChanged.InvokeAsync(false);
+
+    private Task OnKeyDown(KeyboardEventArgs e) =>
+        e.Key == "Escape" ? Close() : Task.CompletedTask;
+}

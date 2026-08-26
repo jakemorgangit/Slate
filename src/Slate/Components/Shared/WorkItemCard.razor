@@ -1,0 +1,125 @@
+@using System.Globalization
+@using Slate.Services
+
+@* Dragging is pointer-driven: HTML5 drag-and-drop does not survive WebView2 hosting. *@
+<div class="wi-card"
+     style="--wi-color: @Ui.ColorFor(Item.WorkItemType)"
+     data-wi-id="@Item.Id"
+     draggable="false"
+     tabindex="0"
+     title="@Tooltip"
+     @onpointerdown="OnPointerDown"
+     @onclick="OnClick"
+     @onkeydown="OnKeyDown"
+     @oncontextmenu="OnRightClick"
+     @oncontextmenu:preventDefault="true">
+
+    <div class="wi-actions">
+        <button class="btn btn-sm btn-ghost" title="Open in Azure DevOps"
+                @onclick="OpenExternal" @onclick:stopPropagation="true">↗</button>
+    </div>
+
+    @* The link and age pills live on the bottom row, clear of the action button that
+       appears at the top right on hover. *@
+    <div class="wi-top">
+        @if (Badge.Any)
+        {
+            <span class="prio-pill @(Badge.IsLocal ? "prio-mine" : "")"
+                  style="background: @Ui.PriorityColor(Badge.Level); color: @Ui.PriorityTextColor(Badge.Level)"
+                  title="@Ui.PriorityTooltip(Badge)">P@(Badge.Level)</span>
+        }
+        <span class="wi-id">#@Item.Id</span>
+        <span class="wi-type">@Item.WorkItemType</span>
+        <span class="topbar-spacer"></span>
+        @if (Recorded > 0)
+        {
+            <span class="wi-clock" title="@($"{Ui.Duration(Recorded)} recorded against this work item")"><ClockIcon Size="11" /></span>
+        }
+    </div>
+
+    <div class="wi-title">@Item.Title</div>
+
+    <div class="wi-meta">
+        <span>@Item.State</span>
+        @if (Allocated > 0)
+        {
+            <span>·</span>
+            <span style="color: var(--accent)">@Ui.Duration(Allocated) planned</span>
+        }
+        @if (Item.EstimateMinutes is int estimate)
+        {
+            <span>·</span>
+            <span>@Ui.Hours(estimate) left</span>
+        }
+        @foreach (var tag in Item.Tags.Take(2))
+        {
+            <span class="badge badge-muted">@tag</span>
+        }
+        <span class="wi-meta-gap"></span>
+        @if (Item.HasLinks)
+        {
+            <span class="wi-links" title="@LinkTooltip">⇄ @Item.Links.Count</span>
+        }
+        @if (Item.AgeDays is int age && Item.CreatedDate is { } created)
+        {
+            <span class="age-pill @Ui.AgeClass(age)" title="@Ui.AgeTooltip(created, age)">@Ui.AgeLabel(age)</span>
+        }
+    </div>
+
+    @if (Item.EstimateMinutes is int target and > 0)
+    {
+        var pct = Math.Min(100, Allocated * 100.0 / target);
+        <div class="wi-progress @(Allocated > target ? "over" : "")">
+            <i style="width: @pct.ToString("0.#", CultureInfo.InvariantCulture)%"></i>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public WorkItem Item { get; set; } = default!;
+    [Parameter] public int Allocated { get; set; }
+    [Parameter] public int Recorded { get; set; }
+    /// <summary>Your own triage priority. Zero falls back to the one Azure DevOps holds.</summary>
+    [Parameter] public int Priority { get; set; }
+
+    private Ui.PriorityBadge Badge => Ui.Badge(Priority, Item.Priority);
+
+    [Parameter] public EventCallback<WorkItem> OnSelect { get; set; }
+    [Parameter] public EventCallback<(WorkItem Item, PointerEventArgs Pointer)> OnDragStarted { get; set; }
+    [Parameter] public EventCallback<(WorkItem Item, MouseEventArgs Pointer)> OnContextMenu { get; set; }
+    [Parameter] public EventCallback<WorkItem> OnSchedule { get; set; }
+
+    private string LinkTooltip =>
+        string.Join(Environment.NewLine,
+            Item.Links.Select(l => $"{l.Kind}: #{l.WorkItemId} {Ui.Clip(l.Title, 50)}")
+                .Prepend("Linked work items - right-click to open one:"));
+
+    private string Tooltip
+    {
+        get
+        {
+            var parts = new List<string> { $"#{Item.Id} · {Item.WorkItemType} · {Item.State}", Item.Title };
+            if (!string.IsNullOrWhiteSpace(Item.ParentTitle)) parts.Add($"Parent: {Item.ParentTitle}");
+            if (!string.IsNullOrWhiteSpace(Item.IterationPath)) parts.Add(Item.IterationPath);
+            if (Recorded > 0) parts.Add($"{Ui.Duration(Recorded)} recorded");
+            if (Item.HasLinks) parts.Add($"{Item.Links.Count} linked work item(s)");
+            if (Badge.Any) parts.Add(Ui.PriorityTooltip(Badge));
+            parts.Add("Click for details · drag onto the calendar · right-click for more");
+            return string.Join(Environment.NewLine, parts);
+        }
+    }
+
+    private Task OnClick() => OnSelect.InvokeAsync(Item);
+
+    private Task OnRightClick(MouseEventArgs e) => OnContextMenu.InvokeAsync((Item, e));
+
+    private Task OnPointerDown(PointerEventArgs e) =>
+        e.Button == 0 ? OnDragStarted.InvokeAsync((Item, e)) : Task.CompletedTask;
+
+    private async Task OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key is "Enter" or " ") await OnSchedule.InvokeAsync(Item);
+    }
+
+    private void OpenExternal() => SystemShell.OpenUrl(Item.Url);
+}
