@@ -3,6 +3,9 @@
 A single-executable Windows desktop app that pulls your Azure DevOps work items, lets you block
 out time against them on a week grid, and pushes those blocks into your Outlook calendar.
 
+![The Plan tab: a week of work blocked out against Azure DevOps work items, with the backlog down
+the left](docs/screenshots/01-plan.png)
+
 - **.NET 10**, WPF shell hosting a Blazor Hybrid UI in WebView2
 - **Dark by default**, with light and system themes and five accent colours
 - **One `.exe`** — no installer, no runtime prerequisite, no files beside it
@@ -27,9 +30,15 @@ ships with Windows 11 and with Edge on Windows 10.
 
 The in-app **Help** tab covers all of the below, plus keyboard shortcuts and troubleshooting.
 
+![The Help tab, with the two setup steps side by side and a banner saying Outlook is not connected
+yet](docs/screenshots/05-help.png)
+
 To regenerate the application icon after changing the mark, run `build/makeicon.ps1`.
 
 On first launch the app opens on **Settings**, because it needs two things from you.
+
+![The Settings page: organization URL, sign-in method, personal access token and project, with a
+Test connection button](docs/screenshots/04-settings.png)
 
 ---
 
@@ -132,6 +141,9 @@ still unplanned, and each day header shows its total.
 Clicking a work item opens its full record — description, repro steps, acceptance criteria, every
 field and its links — in a scrollable modal, so you rarely need the browser.
 
+![A work item open in the modal: description, steps to reproduce, discussion box, linked children
+and the triage row](docs/screenshots/06-workitem.png)
+
 **Shortcuts:** <kbd>←</kbd>/<kbd>→</kbd> change week · <kbd>T</kbd> today · <kbd>R</kbd> reload work
 items · <kbd>Ctrl</kbd>+<kbd>S</kbd> send to Outlook · <kbd>Del</kbd> delete the selected block ·
 <kbd>Esc</kbd> deselect · <kbd>/</kbd> focus the filter.
@@ -191,6 +203,9 @@ in the table.
 ### The Time tab
 
 Every booking becomes an entry on the **Time** tab, for the week you are looking at.
+
+![The Time tab: a week summary grid of hours per work item per day, and the individual entries
+below it grouped by day](docs/screenshots/03-time.png)
 
 - A **week summary** grid reads like a timesheet: one row per work item, one column per day,
   a total per row, a **daily total** along the bottom and the week total in the corner.
@@ -312,6 +327,9 @@ name is a poor trade for an item that would have been created unassigned anyway.
 
 ## Sorting the table
 
+![The Work items tab: a sortable table of id, type, title, state, priority, age, estimate, planned
+and recorded time](docs/screenshots/02-work-items.png)
+
 Every column on the Work items tab sorts: id, type, title, state, priority, age, estimate, planned
 and recorded. Clicking the column already in use turns it around, and the little arrow in the
 header says which way it is pointing. A column you have not used yet starts in whichever direction
@@ -339,6 +357,13 @@ appearance.
 The personal access token is **never exported**: it is encrypted to your Windows account and would
 be useless elsewhere, and a config file is the sort of thing people email around. Importing keeps
 whatever token is already configured, and applies only the sections the file actually contains.
+
+## Appearance
+
+Dark by default. The button in the top right corner cycles dark, light and system, and Settings
+carries five accent colours and a compact density for smaller screens.
+
+![The same week in the light theme](docs/screenshots/07-light.png)
 
 ---
 
