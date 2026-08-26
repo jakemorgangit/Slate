@@ -24,7 +24,15 @@ public partial class App : Application
 #if DEBUG
         services.AddBlazorWebViewDeveloperTools();
 #endif
-        services.AddLogging(b => b.SetMinimumLevel(LogLevel.Warning));
+        // Without a provider here, an unhandled exception inside a Blazor component goes
+        // nowhere: the framework logs it, tears the root component down, and the WebView is
+        // left blank with the WPF shell still running happily. That reads as "the app
+        // crashed" while none of the handlers below ever fire, so route it to the crash log.
+        services.AddLogging(b =>
+        {
+            b.SetMinimumLevel(LogLevel.Warning);
+            b.AddProvider(new CrashLogLoggerProvider());
+        });
 
         // Storage + settings
         services.AddSingleton<SecretProtector>();
@@ -69,6 +77,32 @@ public partial class App : Application
     }
 }
 
+/// <summary>
+/// Sends warnings and errors from the framework - Blazor's component exceptions above all -
+/// to the same crash log the WPF handlers use.
+/// </summary>
+internal sealed class CrashLogLoggerProvider : ILoggerProvider
+{
+    public ILogger CreateLogger(string categoryName) => new CrashLogLogger(categoryName);
+
+    public void Dispose() { }
+
+    private sealed class CrashLogLogger(string category) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel level) => level >= LogLevel.Warning;
+
+        public void Log<TState>(LogLevel level, EventId id, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (!IsEnabled(level)) return;
+            CrashLog.WriteLine($"[{level}] {category}: {formatter(state, exception)}");
+            if (exception is not null) CrashLog.Write(exception);
+        }
+    }
+}
+
 internal static class CrashLog
 {
     public static string Path { get; } = System.IO.Path.Combine(AppPaths.DataDirectory, "crash.log");
@@ -76,10 +110,15 @@ internal static class CrashLog
     public static void Write(Exception? ex)
     {
         if (ex is null) return;
+        WriteLine(ex.ToString());
+    }
+
+    public static void WriteLine(string text)
+    {
         try
         {
             Directory.CreateDirectory(AppPaths.DataDirectory);
-            File.AppendAllText(Path, $"[{DateTimeOffset.Now:O}] {ex}{Environment.NewLine}{Environment.NewLine}");
+            File.AppendAllText(Path, $"[{DateTimeOffset.Now:O}] {text}{Environment.NewLine}{Environment.NewLine}");
         }
         catch
         {

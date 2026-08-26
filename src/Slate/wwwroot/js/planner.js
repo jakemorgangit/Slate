@@ -364,6 +364,19 @@ window.planner = (() => {
         if (scroller) scroller.scrollTop = Math.max(0, offsetPixels - 60);
     }
 
+    // ---------------------------------------------------------------- shell safety net
+
+    // The shell fills the window and html/body are overflow:hidden, so the document itself
+    // is never meant to scroll - every scrollable region is inside it. If something does
+    // scroll it anyway (a focused control the browser decides to bring into view is the
+    // usual way), the whole shell slides out of sight with no scrollbar left to bring it
+    // back, and the window just goes blank. Put it straight back.
+    window.addEventListener('scroll', () => {
+        const root = document.scrollingElement;
+        if (root && root.scrollTop !== 0) root.scrollTop = 0;
+        if (root && root.scrollLeft !== 0) root.scrollLeft = 0;
+    }, true);
+
     return {
         applyTheme,
         systemTheme,

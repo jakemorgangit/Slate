@@ -304,8 +304,17 @@ input, select, textarea, button { font: inherit; color: inherit; }
 .textarea.code { font-family: var(--mono); font-size: 12.5px; }
 .select { cursor: pointer; appearance: auto; }
 
-.switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; }
-.switch input { position: absolute; opacity: 0; pointer-events: none; }
+/*
+ * The real checkbox is hidden behind the drawn track, but it still takes focus when the
+ * label is clicked. It must be anchored to the label: without position:relative here its
+ * containing block is the viewport, so on a long page it lands below the fold, escapes
+ * the .content clip and stretches the document to its own bottom edge. Clicking the label
+ * then focuses it and the browser scrolls the document to bring it into view - which drags
+ * the whole app shell off screen, and since html/body are overflow:hidden there is no
+ * scrollbar left to get back. The window goes blank and the app looks like it has died.
+ */
+.switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; position: relative; }
+.switch input { position: absolute; top: 0; left: 0; opacity: 0; pointer-events: none; }
 .switch .track {
     width: 34px; height: 19px;
     border-radius: 999px;
