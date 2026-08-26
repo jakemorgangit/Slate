@@ -1367,6 +1367,24 @@ table.timesheet tfoot .sticky-col { background: var(--surface-2); }
     color: var(--text-3);
 }
 
+/* The note that went to the discussion with this booking, if there was one. */
+.ghost-entry .ghost-note {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    margin-top: 4px;
+    font-size: 11.5px;
+    font-style: italic;
+    color: var(--text-3);
+}
+.ghost-entry .ghost-note .quote-mark {
+    flex: none;
+    font-size: 15px;
+    line-height: 1;
+    color: var(--text-3);
+    opacity: 0.7;
+}
+
 .ghost-entry .ghost-hours {
     flex: none;
     display: flex;

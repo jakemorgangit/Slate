@@ -165,6 +165,13 @@
                                             <span class="badge badge-muted" title="The calendar block it came from has gone">Block deleted</span>
                                         }
                                     </div>
+                                    @if (!string.IsNullOrWhiteSpace(entry.Comment))
+                                    {
+                                        <div class="ghost-note" title="Posted to the discussion when this time was recorded">
+                                            <span class="quote-mark">“</span>
+                                            <span class="truncate">@entry.Comment</span>
+                                        </div>
+                                    }
                                 </div>
 
                                 <div class="ghost-hours">

@@ -123,7 +123,7 @@ The **Plan** tab is a week grid with your work items down the left.
 | Push to Outlook | Happens on its own a few seconds after you stop editing; the header says where it is up to |
 | See a work item | Click it anywhere — sidebar, calendar block, or table — for the full record in a scrollable modal |
 | More actions | Right-click a calendar block: record time, edit, duplicate, send, delete |
-| Record time | Right-click a block → **Record time…**, or the button in the inspector |
+| Record time | Right-click a block → **Record time…**, or the button in the inspector — with an optional note that posts to the discussion |
 | Undo recorded time | Right-click the same block → **Undo recorded time**, or Undo in the Time tab |
 | Set a priority | Right-click a work item or block → **Your triage** stays here, **Azure DevOps** writes back |
 | Raise new work | **New work item** on the Work items tab, or **＋** above the Plan sidebar |
@@ -200,6 +200,13 @@ silently overwritten.
 Blocks with time booked against them get a red clock, and so does the work item in the sidebar and
 in the table.
 
+The dialog also takes an optional **note**, which is posted to the work item's **discussion** in
+Azure DevOps — Plain or Markdown, the same picker the comment box uses, remembering whichever you
+used last. Leave it empty and nothing is posted. The hours are the point of the operation and are
+already written by the time the note goes out, so a discussion that refuses the note says so and
+leaves the booking standing rather than unwinding a good write over a failed extra. Undoing the
+entry later takes the hours back off the work item but does not retract the comment.
+
 ### The Time tab
 
 Every booking becomes an entry on the **Time** tab, for the week you are looking at.
@@ -210,7 +217,8 @@ below it grouped by day](docs/screenshots/03-time.png)
 - A **week summary** grid reads like a timesheet: one row per work item, one column per day,
   a total per row, a **daily total** along the bottom and the week total in the corner.
 - Below it, each entry appears as a greyed ghost of the calendar block it came from — the same
-  time range and length, drained of colour — grouped by day.
+  time range and length, drained of colour — grouped by day, with the note it was booked with
+  underneath if there was one.
 - **Undo** on any entry takes that exact booking back off the work item in Azure DevOps:
   Completed Work goes down, and Remaining Work back up if it was reduced. The entry only
   disappears locally once the write has actually succeeded.

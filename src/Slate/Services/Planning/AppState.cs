@@ -1109,18 +1109,28 @@ public sealed class AppState(
     /// <summary>
     /// Books time against the work item in Azure DevOps, then re-reads that item so the
     /// planner shows the new Completed and Remaining Work straight away.
+    ///
+    /// An optional note is posted to the work item's discussion afterwards. The hours are
+    /// the point of this operation and they are already written by then, so a discussion
+    /// that will not take the note says so and leaves the booking standing rather than
+    /// unwinding a good write over a failed extra.
     /// </summary>
-    public async Task<bool> RecordTimeAsync(Allocation allocation, double hours, bool reduceRemaining)
+    public async Task<bool> RecordTimeAsync(
+        Allocation allocation, double hours, bool reduceRemaining,
+        string note = "", TextFormat noteFormat = TextFormat.Markdown)
     {
         try
         {
             var result = await ado.RecordTimeAsync(allocation.WorkItemId, hours, reduceRemaining);
 
             planner.AddTimeEntry(allocation, hours, reduceRemaining,
-                result.AppliedCompleted, result.AppliedRemaining);
+                result.AppliedCompleted, result.AppliedRemaining, note);
+
+            var noted = await PostTimeNoteAsync(allocation, note, noteFormat);
 
             toasts.Success($"Recorded {hours:0.##}h on #{allocation.WorkItemId}",
-                $"Completed Work is now {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h.");
+                $"Completed Work is now {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h."
+                + (noted ? " Your note is on the discussion." : ""));
 
             RecordingFor = null;
             Changed?.Invoke();
@@ -1133,6 +1143,32 @@ public sealed class AppState(
         catch (Exception ex)
         {
             toasts.Error("Could not record that time", ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Adds the note that came with a time booking to the work item's discussion. Returns
+    /// whether anything was posted: an empty note is the normal case, not a failure.
+    ///
+    /// If the work item on show is the one being booked against, the new comment is folded
+    /// into the loaded discussion so the open modal does not have to be reopened to see it.
+    /// </summary>
+    private async Task<bool> PostTimeNoteAsync(Allocation allocation, string note, TextFormat format)
+    {
+        if (string.IsNullOrWhiteSpace(note)) return false;
+
+        try
+        {
+            var comment = await ado.AddCommentAsync(
+                allocation.WorkItemId, allocation.Project, Html.ToCommentHtml(note, format, Members));
+
+            if (DetailWorkItemId == allocation.WorkItemId) Comments = [.. Comments, comment];
+            return true;
+        }
+        catch (Exception ex)
+        {
+            toasts.Warning($"The time went on #{allocation.WorkItemId}, but the note did not", ex.Message);
             return false;
         }
     }

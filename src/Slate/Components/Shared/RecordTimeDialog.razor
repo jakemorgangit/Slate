@@ -51,6 +51,20 @@
                     <span class="label">Take the same off Remaining Work</span>
                 </label>
 
+                @* Optional: what the hours went on, posted to the work item's discussion. *@
+                <div class="field">
+                    <label for="time-note">Note <span class="muted">(optional)</span></label>
+                    <div class="row">
+                        <span class="hint">Posted to the discussion on Azure DevOps.</span>
+                        <span style="flex: 1"></span>
+                        <FormatPicker Value="NoteFormat" ValueChanged="OnNoteFormatChanged" />
+                    </div>
+                    <textarea id="time-note" class="textarea" rows="3"
+                              placeholder="What did the time go on?"
+                              value="@_note" @onchange="OnNoteChanged"></textarea>
+                    <span class="hint">Left empty, nothing is posted. @NoteHint</span>
+                </div>
+
                 @if (Current is { } item)
                 {
                     <div class="banner info">
@@ -99,8 +113,26 @@
 
     private double _hours = 1;
     private bool _reduceRemaining = true;
+    private string _note = "";
     private bool _saving;
     private Guid _openedFor;
+
+    /// <summary>
+    /// Shared with the discussion box in the work item window, so a note reads the way the
+    /// last comment did rather than surprising anyone with a different set of rules.
+    /// </summary>
+    private TextFormat NoteFormat
+    {
+        get => Settings.Current.Ui.CommentFormat;
+        set => Settings.Update(s => s.Ui.CommentFormat = value);
+    }
+
+    private string NoteHint => NoteFormat switch
+    {
+        TextFormat.Markdown => "Markdown: **bold**, `code`, - lists, [links](url) and tables.",
+        TextFormat.Html => "Passed through as markup. Scripts and event handlers are stripped.",
+        _ => "Exactly what you type; line breaks are kept.",
+    };
 
     private double BlockHours =>
         State.RecordingFor is { } a ? Math.Round(a.DurationMinutes / 60.0, 2) : 1;
@@ -121,6 +153,10 @@
         _openedFor = allocation.Id;
         _hours = Math.Max(0.25, BlockHours);
         _reduceRemaining = Settings.Current.Planning.ReduceRemainingOnRecord;
+
+        // Deliberately empty rather than seeded from the block's notes: those were written
+        // for the plan, and posting them to a discussion is not something anyone asked for.
+        _note = "";
         _saving = false;
     }
 
@@ -134,6 +170,10 @@
 
     private void OnReduceChanged(ChangeEventArgs e) =>
         _reduceRemaining = e.Value is true or "true" or "on";
+
+    private void OnNoteChanged(ChangeEventArgs e) => _note = e.Value?.ToString() ?? "";
+
+    private void OnNoteFormatChanged(TextFormat format) => NoteFormat = format;
 
     /// <summary>Hours as whole minutes, rounded the same way the entry itself is.</summary>
     private static int AsMinutes(double? hours) => (int)Math.Round((hours ?? 0) * 60);
@@ -165,7 +205,7 @@
                 Settings.Save(settings);
             }
 
-            if (await State.RecordTimeAsync(allocation, _hours, _reduceRemaining))
+            if (await State.RecordTimeAsync(allocation, _hours, _reduceRemaining, _note, NoteFormat))
                 _openedFor = Guid.Empty;
         }
         finally

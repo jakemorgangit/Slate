@@ -457,7 +457,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// <summary>Records that time was booked against the work item from this block.</summary>
     public TimeEntry AddTimeEntry(
         Allocation allocation, double hours, bool reducedRemaining,
-        double appliedCompleted = 0, double appliedRemaining = 0)
+        double appliedCompleted = 0, double appliedRemaining = 0, string comment = "")
     {
         var entry = new TimeEntry
         {
@@ -476,6 +476,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             AppliedRemaining = appliedRemaining,
             RecordedAt = DateTimeOffset.Now,
             Notes = allocation.Notes,
+            Comment = comment.Trim(),
         };
 
         store.TimeEntries.Add(entry);

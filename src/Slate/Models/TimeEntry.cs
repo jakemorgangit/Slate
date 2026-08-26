@@ -41,6 +41,14 @@ public sealed class TimeEntry
     public DateTimeOffset RecordedAt { get; set; }
     public string Notes { get; set; } = "";
 
+    /// <summary>
+    /// The note posted to the work item's discussion when this time was booked, as it was
+    /// typed. Kept so the entry can say what the hours went on. Undoing the entry does not
+    /// retract the comment - a discussion is a record of what was said at the time, and
+    /// quietly deleting from it would lose somebody else's reply along with it.
+    /// </summary>
+    public string Comment { get; set; } = "";
+
     public DateTime End => Start.AddMinutes(BlockMinutes);
 
     public int Minutes => (int)Math.Round(Hours * 60);
