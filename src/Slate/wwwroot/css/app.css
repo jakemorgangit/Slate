@@ -188,6 +188,45 @@ input, select, textarea, button { font: inherit; color: inherit; }
     background: var(--bg);
 }
 
+/* The update notice takes a row of its own above the header when it is showing. */
+.app-shell.has-notice { grid-template-rows: auto var(--header-h) 1fr; }
+
+.update-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 14px;
+    background: var(--warn-soft);
+    border-bottom: 1px solid var(--warn);
+    color: var(--text);
+    font-size: 12.5px;
+}
+.update-bar .glyph {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: var(--warn);
+    color: #1a1205;
+    font-size: 12px;
+    font-weight: 700;
+}
+.update-bar strong { font-weight: 620; }
+.update-bar a { color: var(--warn); font-weight: 560; white-space: nowrap; }
+.update-bar .dismiss {
+    flex: none;
+    border: 0;
+    background: none;
+    color: var(--text-3);
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: var(--r-sm);
+    font-size: 12px;
+}
+.update-bar .dismiss:hover { background: var(--surface-3); color: var(--text); }
+
 .topbar {
     display: flex;
     align-items: center;

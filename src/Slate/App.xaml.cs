@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Slate.Services;
 using Slate.Services.Auth;
 using Slate.Services.AzureDevOps;
 using Slate.Services.Graph;
@@ -49,6 +50,7 @@ public partial class App : Application
         services.AddSingleton<GraphCalendarClient>();
 
         // App state / orchestration
+        services.AddSingleton<UpdateChecker>();
         services.AddSingleton<AppState>();
         services.AddSingleton<PlannerService>();
         services.AddSingleton<ToastService>();

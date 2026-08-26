@@ -1,14 +1,34 @@
 @inherits LayoutComponentBase
 @implements IDisposable
 
+@using Slate.Services
+
 @inject AppState State
+@inject UpdateChecker Updates
 @inject SettingsStore Settings
 @inject PlannerService Planner
 @inject ToastService Toasts
 @inject IJSRuntime Js
 @inject NavigationManager Nav
 
-<div class="app-shell">
+<div class="app-shell @(Updates.Available is not null ? "has-notice" : "")">
+
+    @* Only present when GitHub has something newer than this build. *@
+    @if (Updates.Available is { } release)
+    {
+        <div class="update-bar">
+            <span class="glyph">↑</span>
+            <span>
+                <strong>Slate @release.Version</strong> is available — you are on @AppInfo.Version.
+            </span>
+            <a href="@release.Url" @onclick="OpenReleaseAsync" @onclick:preventDefault="true">
+                View the release ↗
+            </a>
+            <span class="topbar-spacer"></span>
+            <button class="dismiss" title="Dismiss until next launch" @onclick="Updates.Dismiss">✕</button>
+        </div>
+    }
+
     <header class="topbar">
         <div class="brand">
             <span class="brand-mark">◧</span>
@@ -168,6 +188,7 @@
         Planner.Changed += OnStateChanged;
         Toasts.Changed += OnStateChanged;
         Settings.Changed += OnSettingsChanged;
+        Updates.Changed += OnStateChanged;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -184,6 +205,16 @@
 
         if (State.ShowOutlook) await State.LoadEventsAsync();
         State.ConfigurePolling();
+
+        // Last, and not awaited: whether there is a newer build is the least urgent thing
+        // on screen, and a slow or unreachable GitHub must not hold up the first paint.
+        _ = Updates.CheckAsync();
+    }
+
+    private Task OpenReleaseAsync()
+    {
+        SystemShell.OpenUrl(Updates.Available?.Url);
+        return Task.CompletedTask;
     }
 
     private async Task ApplyThemeAsync()
@@ -220,5 +251,6 @@
         Planner.Changed -= OnStateChanged;
         Toasts.Changed -= OnStateChanged;
         Settings.Changed -= OnSettingsChanged;
+        Updates.Changed -= OnStateChanged;
     }
 }

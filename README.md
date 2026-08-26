@@ -356,6 +356,17 @@ quietly — no spinner, no interruption, and never while a manual refresh is run
 is polled on its own slower schedule. Anything raised or changed by someone else turns up on its
 own.
 
+## Keeping up to date
+
+On launch the app asks GitHub once whether there is a newer release. If there is, a yellow bar
+appears above the header — the new version number, the one you are on, and a link straight to that
+release's page for the download. Dismiss it and it stays gone until the next launch.
+
+The check is deliberately quiet and best-effort: it runs after the first paint so it can never hold
+the window up, and no network, a rate limit or a draft release all mean nothing is shown rather
+than an error. Nothing is downloaded or installed for you — upgrading is still a matter of swapping
+the `.exe`.
+
 ## Carrying your setup around
 
 **Export config…** and **Import config…** at the top of Settings write and read a plain JSON file
