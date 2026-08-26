@@ -51,6 +51,31 @@
                     <span class="label">Take the same off Remaining Work</span>
                 </label>
 
+                @* Optional: move the work item on at the same time as booking the hours. *@
+                @if (StateOptions.Count > 0)
+                {
+                    <div class="field">
+                        <label>Status <span class="muted">(optional)</span></label>
+                        <div class="state-choices">
+                            <button class="chip @(_newState is null ? "on" : "")"
+                                    title="Book the time without touching the work item's state"
+                                    @onclick="() => _newState = null">Leave as @Current?.State</button>
+                            @foreach (var option in StateOptions.Where(o => !string.Equals(o.Name, Current?.State, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                var picked = string.Equals(option.Name, _newState, StringComparison.OrdinalIgnoreCase);
+                                <button class="chip state-pill @(picked ? "on" : "")"
+                                        style="@Ui.StatePillStyle(option, picked)"
+                                        title="@($"Move this work item to {option.Name} when the time is recorded")"
+                                        @onclick="() => _newState = option.Name">
+                                    <span class="dot" style="background: @Ui.StateColour(option)"></span>
+                                    <span>@option.Name</span>
+                                </button>
+                            }
+                        </div>
+                        <span class="hint">Applied after the hours go on, and only if they do.</span>
+                    </div>
+                }
+
                 @* Optional: what the hours went on, posted to the work item's discussion. *@
                 <div class="field">
                     <label for="time-note">Note <span class="muted">(optional)</span></label>
@@ -114,8 +139,18 @@
     private double _hours = 1;
     private bool _reduceRemaining = true;
     private string _note = "";
+    private string? _newState;
     private bool _saving;
     private Guid _openedFor;
+
+    /// <summary>
+    /// The states this work item could move to. Empty until they arrive, or for good if the
+    /// project will not give them up - in which case the row simply is not offered.
+    /// </summary>
+    private IReadOnlyList<WorkItemStateOption> StateOptions =>
+        !State.CanEditWorkItems || Current is not { } item
+            ? []
+            : State.KnownStates(item.Project, item.WorkItemType);
 
     /// <summary>
     /// Shared with the discussion box in the work item window, so a note reads the way the
@@ -157,7 +192,12 @@
         // Deliberately empty rather than seeded from the block's notes: those were written
         // for the plan, and posting them to a discussion is not something anyone asked for.
         _note = "";
+        _newState = null;
         _saving = false;
+
+        // Ask for the states this type can take, so the row is ready by the time it is wanted.
+        if (State.CanEditWorkItems && Current is { } item)
+            _ = State.EnsureStatesAsync(item.Project, item.WorkItemType);
     }
 
     private void OnChanged() => InvokeAsync(() =>
@@ -205,8 +245,15 @@
                 Settings.Save(settings);
             }
 
-            if (await State.RecordTimeAsync(allocation, _hours, _reduceRemaining, _note, NoteFormat))
-                _openedFor = Guid.Empty;
+            if (!await State.RecordTimeAsync(allocation, _hours, _reduceRemaining, _note, NoteFormat))
+                return;
+
+            _openedFor = Guid.Empty;
+
+            // Only once the hours are actually on the work item: a state change is what the
+            // team reads as "this is done", and it should not run ahead of the booking.
+            if (_newState is { Length: > 0 } state)
+                await State.SetStateAsync(allocation.WorkItemId, state);
         }
         finally
         {

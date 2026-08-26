@@ -130,6 +130,36 @@ public static class Ui
             ? $"background: {PriorityColor(priority)}; color: {PriorityTextColor(priority)}"
             : $"background: transparent; color: {PriorityColor(priority)}; box-shadow: inset 0 0 0 1.5px {PriorityColor(priority)}";
 
+    /// <summary>
+    /// The colour a work item state should wear. Process templates hand back their own, as
+    /// six hex digits with no leading hash; where one is missing the state's category is a
+    /// good enough guide, since that is what Azure DevOps colours its own boards by.
+    /// </summary>
+    public static string StateColour(WorkItemStateOption state)
+    {
+        var raw = (state.Color ?? "").Trim().TrimStart('#');
+        if (raw.Length is 6 or 8 && raw.All(Uri.IsHexDigit)) return "#" + raw[..6];
+
+        return state.Category switch
+        {
+            "Proposed" => "#b0b8c4",
+            "InProgress" => "#2f7de1",
+            "Resolved" => "#c39b1c",
+            "Completed" => "#2fbf71",
+            "Removed" => "#8d8d8d",
+            _ => "var(--text-3)",
+        };
+    }
+
+    /// <summary>Filled for the state the item is in, outlined for the ones it could move to.</summary>
+    public static string StatePillStyle(WorkItemStateOption state, bool active)
+    {
+        var colour = StateColour(state);
+        return active
+            ? $"background: {colour}; color: #fff; border-color: {colour}"
+            : $"background: transparent; color: {colour}; border-color: {colour}";
+    }
+
     public static string PriorityLabel(int priority) => priority switch
     {
         1 => "P1 - critical",

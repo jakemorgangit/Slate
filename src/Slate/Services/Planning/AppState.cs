@@ -752,6 +752,104 @@ public sealed class AppState(
 
     private static string Describe(int priority) => priority is >= 1 and <= 4 ? $"P{priority}" : "unset";
 
+    // ---------------------------------------------------------------- work item state
+
+    /// <summary>
+    /// States by "project|type". A process template's states do not change while the app is
+    /// open, and the same handful of types come round again and again, so they are worth
+    /// keeping rather than re-fetching every time a menu opens.
+    /// </summary>
+    private readonly Dictionary<string, IReadOnlyList<WorkItemStateOption>> _statesByType =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly HashSet<string> _statesLoading = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The work item whose state is being written, so its picker can show it.</summary>
+    public int? SavingStateFor { get; private set; }
+
+    private static string StateKey(string project, string type) => $"{project}|{type}";
+
+    /// <summary>What is already known, for a picker that has to render before any fetch lands.</summary>
+    public IReadOnlyList<WorkItemStateOption> KnownStates(string project, string type) =>
+        _statesByType.TryGetValue(StateKey(project, type), out var states) ? states : [];
+
+    /// <summary>
+    /// Loads the states for a type if they are not already in hand. Failure is quiet: the
+    /// picker simply has nothing to offer, which is better than an error over a menu.
+    /// </summary>
+    public async Task EnsureStatesAsync(string project, string type)
+    {
+        if (string.IsNullOrWhiteSpace(type)) return;
+
+        var key = StateKey(project, type);
+        if (_statesByType.ContainsKey(key) || !_statesLoading.Add(key)) return;
+
+        try
+        {
+            var states = await ado.GetStatesAsync(project, type);
+            if (states.Count > 0)
+            {
+                _statesByType[key] = states;
+                Changed?.Invoke();
+            }
+        }
+        catch (Exception)
+        {
+            // Nothing to offer. The work item's own state is still shown as text.
+        }
+        finally
+        {
+            _statesLoading.Remove(key);
+        }
+    }
+
+    /// <summary>
+    /// Moves a work item to another state in Azure DevOps. Everyone sees this field, so the
+    /// blocks that quote it are brought back in step too - which marks them for re-sending,
+    /// since the state travels in the calendar event.
+    /// </summary>
+    public async Task<bool> SetStateAsync(int workItemId, string state)
+    {
+        if (!CanEditWorkItems || SavingStateFor is not null) return false;
+
+        var item = WorkItems.FirstOrDefault(i => i.Id == workItemId);
+        if (item is not null && string.Equals(item.State, state, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        SavingStateFor = workItemId;
+        Changed?.Invoke();
+
+        try
+        {
+            var updated = await ado.SetStateAsync(workItemId, state);
+
+            if (updated is not null)
+            {
+                var index = WorkItems.FindIndex(i => i.Id == workItemId);
+                if (index >= 0) WorkItems[index] = WorkItems[index] with { State = updated.State };
+                planner.RefreshSnapshots([index >= 0 ? WorkItems[index] : updated]);
+            }
+
+            toasts.Success($"#{workItemId} is now {state}",
+                "This is the work item's own state, so the rest of the team sees it too.");
+
+            Changed?.Invoke();
+
+            if (DetailWorkItemId == workItemId) await RefreshDetailQuietlyAsync();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            toasts.Error($"Could not move #{workItemId} to {state}", ex.Message);
+            return false;
+        }
+        finally
+        {
+            SavingStateFor = null;
+            Changed?.Invoke();
+        }
+    }
+
     /// <summary>Re-reads the open work item without disturbing the discussion below it.</summary>
     private async Task RefreshDetailQuietlyAsync()
     {

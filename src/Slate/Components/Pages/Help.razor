@@ -161,6 +161,11 @@
                         length of the block. Saving writes to Azure DevOps: <em>Completed Work</em> goes up and,
                         unless you turn it off, <em>Remaining Work</em> comes down by the same amount.</dd>
 
+                    <dt>Moving it on</dt>
+                    <dd>The dialog also offers the work item's <strong>status</strong>, so finishing
+                        something and saying so is one step. It leaves the state alone unless you pick
+                        one, and applies it after the hours land - and only if they do.</dd>
+
                     <dt>Saying what it was</dt>
                     <dd>The dialog has an optional <strong>Note</strong>. Anything you write there is posted to
                         the work item's <strong>discussion</strong>, in Plain or Markdown just like the comment
@@ -201,6 +206,19 @@
                 </div>
             </div>
             <div class="card-body">
+                <div class="field">
+                    <label>Status</label>
+                    <span class="hint">
+                        Open a work item and the states its type can take run along the bottom of the
+                        window. The one it is in is filled; pick another and it goes to Azure DevOps
+                        straight away. It is only offered there and when recording time - the state is
+                        what the team reads as "where is this up to", so it is not something to change
+                        in passing. Azure DevOps decides which moves are legal and fills in the Reason;
+                        one it refuses comes back as the error it gave. Blocks quoting that work item
+                        are marked for re-sending, since the state travels in the calendar event.
+                    </span>
+                </div>
+
                 <div class="field">
                     <label>Basic and Advanced</label>
                     <span class="hint">

@@ -376,6 +376,14 @@ input, select, textarea, button { font: inherit; color: inherit; }
 .switch input:checked + .track::after { transform: translateX(15px); background: #fff; }
 .switch .label { font-size: 12.5px; color: var(--text); }
 
+/* Work item state choices, wherever a work item can be acted on. */
+.state-choices { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.state-choices.compact { gap: 4px; }
+.state-pill { font-weight: 560; }
+.state-pill:disabled { cursor: default; opacity: 1; }
+.state-pill .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.state-choices.compact .state-pill { font-size: 11px; padding: 2px 7px; }
+
 .chip {
     display: inline-flex;
     align-items: center;

@@ -373,6 +373,17 @@
             </div>
 
             <div class="modal-foot wrap">
+                @if (State.CanEditWorkItems && State.DetailListEntry is { } listed)
+                {
+                    <div class="prio-group">
+                        <span class="prio-group-label" title="The work item's own state - the team sees it">
+                            Status
+                        </span>
+                        <StatePicker WorkItemId="listed.Id" Project="@listed.Project"
+                                     WorkItemType="@listed.WorkItemType" Current="@listed.State" />
+                    </div>
+                }
+
                 @* Two priorities: yours, which stays here, and the one on the work item itself. *@
                 <div class="prio-group">
                     <span class="prio-group-label" title="Never written back to Azure DevOps">Your triage</span>

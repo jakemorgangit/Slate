@@ -126,6 +126,7 @@ The **Plan** tab is a week grid with your work items down the left.
 | Record time | Right-click a block → **Record time…**, or the button in the inspector — with an optional note that posts to the discussion |
 | Undo recorded time | Right-click the same block → **Undo recorded time**, or Undo in the Time tab |
 | Set a priority | Right-click a work item or block → **Your triage** stays here, **Azure DevOps** writes back |
+| Change the status | Open the work item and pick a state, or set one while recording time |
 | Raise new work | **New work item** on the Work items tab, or **＋** above the Plan sidebar |
 | Rename one | Open it and click the pencil beside the title (items assigned to you) |
 | Mention a colleague | Type `@` in the comment box |
@@ -200,6 +201,10 @@ silently overwritten.
 Blocks with time booked against them get a red clock, and so does the work item in the sidebar and
 in the table.
 
+The dialog also offers the work item's **status**, so finishing a piece of work and saying so are
+one step rather than two. It defaults to leaving the state alone, and is applied after the hours
+land — and only if they do, so a refused transition never costs you the booking.
+
 The dialog also takes an optional **note**, which is posted to the work item's **discussion** in
 Azure DevOps — Plain or Markdown, the same picker the comment box uses, remembering whichever you
 used last. Leave it empty and nothing is posted. The hours are the point of the operation and are
@@ -238,6 +243,22 @@ Remaining Work seeded from the length of the block. The calendar block then poin
 task, so time can be recorded against it.
 
 The block stays put either way. Turn the offer off in Settings, or from the notice itself.
+
+## Changing the status
+
+Open a work item and the states its type can take sit along the bottom of the window, in the order
+its process template defines them — New, Active, Resolved, Closed and whatever else your process
+adds. The one it is in is filled; pick another and it is written to Azure DevOps straight away.
+
+Deliberately only there and in the record-time dialog. The state is what the rest of the team reads
+as "where is this up to", so it is not something to change in passing from a list or a right-click
+menu — it takes opening the work item, or booking time against it.
+
+Azure DevOps decides which transitions are legal and fills in the matching *Reason* itself. One it
+refuses comes back as the error it gave rather than being guessed at here.
+
+Because the state travels in the calendar event, changing it marks that work item's blocks as
+needing re-sending, and the next sync updates them in Outlook.
 
 ## Priority, two ways
 

@@ -910,6 +910,7 @@
     private int AdoPriority(int workItemId) =>
         State.WorkItems.FirstOrDefault(i => i.Id == workItemId)?.Priority ?? 0;
 
+
     /// <summary>Sets the in-app priority. Zero clears it. Never leaves this machine.</summary>
     private void SetPriority(int workItemId, int priority)
     {

@@ -61,6 +61,17 @@ public sealed record WorkItemLink(string Kind, int WorkItemId, string Title, str
     };
 }
 
+/// <summary>
+/// One state a work item type can be in, as its process template defines it. Category is
+/// Azure DevOps' own grouping - Proposed, InProgress, Resolved, Completed or Removed - and
+/// is what decides the colour when the process does not give one.
+/// </summary>
+public sealed record WorkItemStateOption(string Name, string Color, string Category)
+{
+    /// <summary>True for the states that mean the work is over.</summary>
+    public bool IsClosed => Category is "Completed" or "Removed";
+}
+
 /// <summary>A saved query from the Azure DevOps "Queries" hub.</summary>
 public sealed record AdoQuery(string Id, string Name, string Path, bool IsFolder);
 

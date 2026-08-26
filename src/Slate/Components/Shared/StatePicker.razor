@@ -1,0 +1,92 @@
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+
+@*
+    The states a work item can move to, as its process template defines them. Rendered
+    wherever a work item can be acted on, so the same set of choices turns up in the same
+    order whether it is reached from a menu, the table or the work item window.
+*@
+
+@if (_states.Count > 0)
+{
+    <div class="state-choices @(Compact ? "compact" : "")">
+        @foreach (var option in _states)
+        {
+            var current = string.Equals(option.Name, Current, StringComparison.OrdinalIgnoreCase);
+            <button class="chip state-pill @(current ? "on" : "")"
+                    style="@Ui.StatePillStyle(option, current)"
+                    disabled="@(Busy || current)"
+                    title="@(current ? $"Already {option.Name}" : $"Move this work item to {option.Name}")"
+                    @onclick="() => PickAsync(option)"
+                    @onclick:stopPropagation="true">
+                @if (Busy && string.Equals(option.Name, _pending, StringComparison.OrdinalIgnoreCase))
+                {
+                    <span class="spinner"></span>
+                }
+                else
+                {
+                    <span class="dot" style="background: @Ui.StateColour(option)"></span>
+                }
+                <span>@option.Name</span>
+            </button>
+        }
+    </div>
+}
+else if (!string.IsNullOrWhiteSpace(Current))
+{
+    @* Either the states have not arrived yet, or this project would not give them up. *@
+    <span class="muted" style="font-size: 11.5px">@Current</span>
+}
+
+@code {
+    [Parameter, EditorRequired] public int WorkItemId { get; set; }
+    [Parameter, EditorRequired] public string Project { get; set; } = "";
+    [Parameter, EditorRequired] public string WorkItemType { get; set; } = "";
+    [Parameter, EditorRequired] public string Current { get; set; } = "";
+
+    /// <summary>Tighter spacing, where there is less room than a page has.</summary>
+    [Parameter] public bool Compact { get; set; }
+
+    /// <summary>Raised after the state has actually been written.</summary>
+    [Parameter] public EventCallback<string> OnChanged { get; set; }
+
+    private IReadOnlyList<WorkItemStateOption> _states = [];
+    private string? _pending;
+
+    private bool Busy => State.SavingStateFor == WorkItemId;
+
+    protected override void OnInitialized() => State.Changed += OnStateChanged;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _states = State.KnownStates(Project, WorkItemType);
+        if (_states.Count == 0) await State.EnsureStatesAsync(Project, WorkItemType);
+    }
+
+    private void OnStateChanged() => InvokeAsync(() =>
+    {
+        var latest = State.KnownStates(Project, WorkItemType);
+        if (latest.Count != _states.Count) _states = latest;
+        StateHasChanged();
+    });
+
+    public void Dispose() => State.Changed -= OnStateChanged;
+
+    private async Task PickAsync(WorkItemStateOption option)
+    {
+        if (Busy || string.Equals(option.Name, Current, StringComparison.OrdinalIgnoreCase)) return;
+
+        _pending = option.Name;
+        try
+        {
+            if (await State.SetStateAsync(WorkItemId, option.Name))
+                await OnChanged.InvokeAsync(option.Name);
+        }
+        finally
+        {
+            _pending = null;
+        }
+    }
+}

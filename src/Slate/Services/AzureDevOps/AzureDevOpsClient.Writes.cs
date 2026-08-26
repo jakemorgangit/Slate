@@ -54,6 +54,53 @@ public sealed partial class AzureDevOpsClient
 
     public const string PriorityField = "Microsoft.VSTS.Common.Priority";
 
+    public const string StateField = "System.State";
+
+    // ---------------------------------------------------------------- state
+
+    /// <summary>
+    /// The states a work item type can be in, in the order its process template lists them -
+    /// which is the order a person expects to see them, rather than alphabetical.
+    /// </summary>
+    public async Task<List<WorkItemStateOption>> GetStatesAsync(
+        string project, string workItemType, CancellationToken ct = default)
+    {
+        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.Project : project;
+        if (string.IsNullOrWhiteSpace(scope) || string.IsNullOrWhiteSpace(workItemType)) return [];
+
+        using var doc = await SendAsync(HttpMethod.Get,
+            $"{OrgUrl}/{Uri.EscapeDataString(scope)}/_apis/wit/workitemtypes/" +
+            $"{Uri.EscapeDataString(workItemType)}/states?api-version={ApiVersion}",
+            null, ct);
+
+        return
+        [
+            .. ReadValueArray(doc.RootElement)
+                .Select(s => new WorkItemStateOption(
+                    Str(s, "name"), Str(s, "color"), Str(s, "category")))
+                .Where(s => s.Name.Length > 0),
+        ];
+    }
+
+    /// <summary>
+    /// Moves a work item to another state. Azure DevOps fills in the matching Reason itself,
+    /// and refuses a transition its process does not allow - which surfaces as the error it
+    /// gives rather than being guessed at here.
+    /// </summary>
+    public async Task<WorkItem?> SetStateAsync(int id, string state, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(state))
+            throw new AzureDevOpsException("Pick a state first.");
+
+        List<object> patch = [new { op = "add", path = "/fields/" + StateField, value = state }];
+
+        using var doc = await SendAsync(HttpMethod.Patch,
+            $"{OrgUrl}/_apis/wit/workitems/{id}?api-version={ApiVersion}",
+            patch, ct, "application/json-patch+json");
+
+        return Map(doc.RootElement);
+    }
+
     // ---------------------------------------------------------------- raising new work
 
     /// <summary>The work item types a project offers, so the new-item form is not guesswork.</summary>
