@@ -125,7 +125,7 @@
                     <span class="hint">Copy it from your browser's address bar when you are on any Azure DevOps page.</span>
                 </div>
 
-                <details class="tucked" open="@(!_draft.Entra.IsConfigured)">
+                <details class="tucked" open="@_registrationOpen">
                     <summary class="section-toggle">
                         <span class="chevron">&#8250;</span>
                         <h3>Microsoft app registration</h3>
@@ -342,10 +342,10 @@
                            value="@_draft.Calendar.Marker"
                            @onchange="e => Set(() => _draft.Calendar.Marker = Text(e))" />
                     <span class="hint">
-                        Added to the end of every subject this app writes, and how another machine
-                        knows which events are its to manage. Your plan file does not travel between
-                        machines but your calendar does, so a week planned on one turns up on the
-                        other and can be moved or deleted there. Keep it the same everywhere.
+                        Added to the end of every subject this app writes, so its blocks are easy to
+                        pick out in Outlook. It is a label, not the identity: what another machine
+                        recognises is stamped on the event itself, so blocks planned on one turn up
+                        on the other whatever this says.
                     </span>
                 </div>
 
@@ -693,15 +693,39 @@
     private const string SampleWiql =
         "SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me AND [System.State] = 'Active'";
 
+    /// <summary>
+    /// Whether the app registration section starts open. Captured once rather than bound:
+    /// now that every change saves, a live binding would fold the section shut the moment a
+    /// valid client id was typed - taking the tenant id box with it, mid-entry.
+    /// </summary>
+    private bool _registrationOpen;
+
     protected override void OnInitialized()
     {
         _draft = Store.CreateDraft();
+        _registrationOpen = !_draft.Entra.IsConfigured;
+
         State.Changed += OnChanged;
+
+        // The header's theme and mode switches write settings too, as does the overlay
+        // default that a connect triggers. Without this the page would hold a draft taken
+        // before they ran and quietly put the old value back on the next control touched.
+        Store.Changed += OnSettingsChangedElsewhere;
     }
 
     private void OnChanged() => InvokeAsync(StateHasChanged);
 
-    public void Dispose() => State.Changed -= OnChanged;
+    private void OnSettingsChangedElsewhere() => InvokeAsync(() =>
+    {
+        _draft = Store.CreateDraft();
+        StateHasChanged();
+    });
+
+    public void Dispose()
+    {
+        State.Changed -= OnChanged;
+        Store.Changed -= OnSettingsChangedElsewhere;
+    }
 
     // ---------------------------------------------------------------- draft plumbing
 
@@ -879,10 +903,7 @@
     private bool CanConnect =>
         _draft.Entra.IsConfigured && !string.IsNullOrWhiteSpace(_draft.Ado.OrganizationUrl);
 
-    private string ConnectionColour =>
-        State.SignIn.IsSignedIn && _adoOk ? "var(--ok)"
-        : State.SignIn.IsSignedIn ? "var(--warn)"
-        : "var(--warn)";
+    private string ConnectionColour => State.SignIn.IsSignedIn && _adoOk ? "var(--ok)" : "var(--warn)";
 
     /// <summary>
     /// The whole connection in one go: sign in, prove Azure DevOps answers, then fetch the
@@ -896,21 +917,41 @@
     {
         _busyConnect = true;
         _connectResult = null;
+
+        // Cleared before anything is asked, so a re-check after the configuration was pulled
+        // apart cannot still be showing the last good answer.
+        _adoOk = false;
+        _connectOk = false;
         StateHasChanged();
 
         try
         {
-            await Auth.SignInAsync();
-            await State.RefreshSignInAsync();
+            // Re-check is the only way left to re-test Azure DevOps, so it must not drag
+            // an already-signed-in user back through the account picker.
+            if (!State.SignIn.IsSignedIn)
+            {
+                await Auth.SignInAsync();
+                await State.RefreshSignInAsync();
+            }
 
+            // Someone who pressed "Sign in with Microsoft" without ever setting a token
+            // means Azure DevOps to use that sign-in, whatever an older config file says.
+            if (_draft.Ado.AuthMode == AdoAuthMode.Pat &&
+                string.IsNullOrWhiteSpace(_draft.Ado.PersonalAccessToken))
+            {
+                Set(() => _draft.Ado.AuthMode = AdoAuthMode.Entra);
+            }
+
+            var outlookOk = false;
             var outlook = "Outlook is connected.";
             try
             {
                 var profile = await Graph.GetProfileAsync();
                 outlook = $"Outlook is connected as {profile.Mail}.";
+                outlookOk = true;
                 await LoadCalendarsAsync();
             }
-            catch (GraphException ex)
+            catch (Exception ex) when (ex is GraphException or InteractiveSignInRequiredException)
             {
                 outlook = $"Signed in, but Outlook did not answer: {ex.Message}";
             }
@@ -932,7 +973,9 @@
                 }
             }
 
-            _connectOk = _adoOk;
+            // Both halves have to answer. Reporting success off Azure DevOps alone would put a
+            // green tick on a sign-in whose whole purpose - the calendar - had just failed.
+            _connectOk = _adoOk && outlookOk;
             _connectResult = $"{ado} {outlook}";
 
             await State.LoadEventsAsync();
@@ -958,6 +1001,12 @@
         await Auth.SignOutAsync();
         await State.RefreshSignInAsync();
         _calendars = [];
+
+        // The banner reported on a connection that has just been given up; leaving it there
+        // would have the card claiming Outlook is reachable moments after signing out of it.
+        _connectResult = null;
+        _connectOk = false;
+
         Toasts.Info("Signed out");
     }
 }

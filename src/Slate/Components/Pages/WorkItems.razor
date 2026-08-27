@@ -220,7 +220,7 @@
 <SpawnTaskDialog />
 <PriorityDialog />
 <ScheduleDialog />
-<NewWorkItemDialog OnCreated="Created" OnSchedule="Schedule" />
+<NewWorkItemDialog OnCreated="Created" OnSchedule="BookNextFree" />
 
 @code {
     private IReadOnlyList<WorkItem> _rows = [];
@@ -272,4 +272,7 @@
     }
 
     private void Schedule(WorkItem item) => State.BeginSchedule(item);
+
+    /// <summary>The new work item form's tickbox promises a booking, not a dialog.</summary>
+    private Task BookNextFree(WorkItem item) => State.ScheduleIntoNextFree(item);
 }

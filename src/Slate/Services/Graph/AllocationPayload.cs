@@ -17,8 +17,11 @@ namespace Slate.Services.Graph;
 /// </summary>
 public sealed class AllocationPayload
 {
-    private const int MaxTitle = 160;
-    private const int MaxNotes = 240;
+    // Generous enough that clipping is a rarity rather than routine. When it does happen
+    // the payload says so, and the adopting machine then knows never to write its shortened
+    // copy back over the full text still sitting on the event.
+    private const int MaxTitle = 250;
+    private const int MaxNotes = 2000;
 
     private static readonly JsonSerializerOptions Json = new()
     {
@@ -38,7 +41,13 @@ public sealed class AllocationPayload
     [JsonPropertyName("u")] public string? U { get; set; }
     [JsonPropertyName("n")] public string? N { get; set; }
 
-    public static string Write(Allocation allocation) =>
+    /// <summary>Set when the title or notes had to be clipped to fit.</summary>
+    [JsonPropertyName("c")] public bool C { get; set; }
+
+    /// <summary>Minutes already recorded against this block, so no one books them twice.</summary>
+    [JsonPropertyName("r")] public int R { get; set; }
+
+    public static string Write(Allocation allocation, int recordedMinutes = 0) =>
         JsonSerializer.Serialize(new AllocationPayload
         {
             A = allocation.Id.ToString(),
@@ -49,6 +58,10 @@ public sealed class AllocationPayload
             P = Empty(allocation.Project),
             U = Empty(allocation.WorkItemUrl),
             N = Clip(allocation.Notes, MaxNotes),
+            C = allocation.TextIsPartial
+                || (allocation.WorkItemTitle?.Length ?? 0) > MaxTitle
+                || (allocation.Notes?.Length ?? 0) > MaxNotes,
+            R = Math.Max(0, recordedMinutes),
         }, Json);
 
     /// <summary>
@@ -81,6 +94,8 @@ public sealed class AllocationPayload
             Project = read.P ?? "",
             WorkItemUrl = read.U ?? "",
             Notes = read.N ?? "",
+            TextIsPartial = read.C,
+            RecordedElsewhereMinutes = read.R,
             Start = DateTime.SpecifyKind(start, DateTimeKind.Unspecified),
             DurationMinutes = minutes,
             OutlookEventId = eventId,

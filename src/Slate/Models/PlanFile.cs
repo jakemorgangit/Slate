@@ -16,4 +16,12 @@ public sealed class PlanFile
     /// otherwise strand those events on the calendar with nothing left pointing at them.
     /// </summary>
     public List<string> PendingDeletes { get; set; } = [];
+
+    /// <summary>
+    /// Outlook event ids this plan has deliberately let go of - unlinked, or deleted with the
+    /// calendar entry left in place. Their events still carry the stamp that says a block once
+    /// lived there, so without this they would simply be picked up again on the next refresh
+    /// and the thing the user just got rid of would walk straight back onto the grid.
+    /// </summary>
+    public List<string> Disowned { get; set; } = [];
 }

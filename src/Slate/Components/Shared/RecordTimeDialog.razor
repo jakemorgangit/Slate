@@ -4,6 +4,7 @@
 
 @inject AppState State
 @inject SettingsStore Settings
+@inject PlannerService Plan
 
 @if (State.RecordingFor is { } allocation)
 {
@@ -104,6 +105,20 @@
                             After saving: <strong>@Ui.Hours(AsMinutes((item.CompletedWork ?? 0) + _hours))</strong> completed@(_reduceRemaining
                                 ? $", {Ui.Hours(AsMinutes(Math.Max(0, (item.RemainingWork ?? 0) - _hours)))} remaining"
                                 : "").
+                        </div>
+                    </div>
+                }
+
+                @* Time booked from this block on another machine. The plan file does not
+                   travel, so without saying so the hours look unrecorded and get booked twice. *@
+                @if (allocation.RecordedElsewhereMinutes > 0 && Plan.RecordedMinutesForBlock(allocation.Id) == 0)
+                {
+                    <div class="banner">
+                        <span>!</span>
+                        <div class="grow">
+                            <strong>@Ui.Duration(allocation.RecordedElsewhereMinutes)</strong> was already
+                            recorded against this block on another machine. Recording again adds to
+                            Completed Work on top of it.
                         </div>
                     </div>
                 }

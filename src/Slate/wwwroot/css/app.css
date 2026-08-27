@@ -1236,7 +1236,9 @@ table.data tbody tr:last-child td { border-bottom: none; }
 details[open] > .section-toggle .chevron { transform: rotate(90deg); }
 .section-toggle:hover .chevron { color: var(--text); }
 
-.modal-section > h3 {
+/* The heading sits inside a <summary> once a section folds, so it is a grandchild there. */
+.modal-section > h3,
+.modal-section > .section-toggle > h3 {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
@@ -1666,18 +1668,12 @@ table.data th.sorted { color: var(--text); }
 .prio-pill.prio-mine { box-shadow: 0 0 0 1.5px var(--surface), 0 0 0 3px currentColor; }
 .prio-pill.prio-mine.sm { box-shadow: 0 0 0 1px var(--surface), 0 0 0 2px currentColor; }
 
-.prio-group {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
 .prio-group-label {
     font-size: 10.5px;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-3);
 }
-.modal-foot.wrap { flex-wrap: wrap; row-gap: 10px; }
 
 /* A row each for the two priorities and the actions, so nothing has to share a line. */
 .modal-foot.stacked { flex-direction: column; align-items: stretch; gap: 9px; }

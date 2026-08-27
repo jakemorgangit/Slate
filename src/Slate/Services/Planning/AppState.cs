@@ -331,7 +331,12 @@ public sealed class AppState(
     {
         AdoptOverlayDefault();
 
-        if (!Settings.Planning.ShowExistingEvents || !Settings.IsCalendarConfigured)
+        // Fetched whenever the calendar can be reached, not only when the overlay is on.
+        // "Show what is already in my Outlook calendar" is about what is drawn; picking up
+        // blocks planned elsewhere, honouring "never plan over existing events" and pulling
+        // moves back are not, and hiding them behind a display toggle meant a decluttered
+        // grid silently switched all three off.
+        if (!Settings.IsCalendarConfigured)
         {
             ExistingEvents = [];
             Changed?.Invoke();
@@ -355,21 +360,19 @@ public sealed class AppState(
 
             ExistingEvents = events;
 
-            // Before reconciling: a block planned on another machine is not "missing from
-            // the plan", it is one this copy has not met yet. Picking it up first means the
-            // reconciler sees a complete week and leaves it alone.
-            if (Settings.Planning.TwoWaySync)
+            // Adoption is not two-way sync: it is this plan meeting its own blocks for the
+            // first time, and a machine that has never seen them has nothing to reconcile
+            // against. It runs whichever way that setting is turned.
+            var adopted = planner.AdoptOrphanEvents(events);
+            if (adopted > 0)
             {
-                var adopted = planner.AdoptOrphanEvents(events);
-                if (adopted > 0)
-                {
-                    toasts.Info(
-                        adopted == 1 ? "Picked up 1 block from your calendar" : $"Picked up {adopted} blocks from your calendar",
-                        "Planned on another machine. You can move or delete them here as usual.");
-                }
-
-                ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
+                toasts.Info(
+                    adopted == 1 ? "Picked up 1 block from your calendar" : $"Picked up {adopted} blocks from your calendar",
+                    "Planned on another machine. You can move or delete them here as usual.");
             }
+
+            if (Settings.Planning.TwoWaySync)
+                ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
         }
         catch (OperationCanceledException)
         {
@@ -393,10 +396,12 @@ public sealed class AppState(
 
     /// <summary>Events for a day that were not created by this app - the "already busy" overlay.</summary>
     public IEnumerable<ExistingEvent> BusyOn(DateTime day) =>
-        ExistingEvents.Where(e => !e.IsFromThisApp
-                                  && !e.IsAllDay
-                                  && e.ShowAs is not "free"
-                                  && e.Start.Date <= day.Date && e.End > day.Date);
+        !Settings.Planning.ShowExistingEvents
+            ? []
+            : ExistingEvents.Where(e => !e.IsFromThisApp
+                                        && !e.IsAllDay
+                                        && e.ShowAs is not "free"
+                                        && e.Start.Date <= day.Date && e.End > day.Date);
 
     /// <summary>
     /// The first time the calendar is actually reachable, show what is in it. Runs once and
@@ -415,6 +420,69 @@ public sealed class AppState(
     /// <summary>True when something already in the calendar covers any of this span.</summary>
     public bool IsBusy(DateTime start, DateTime end) =>
         ExistingEvents.Any(e => e.BlocksTime && e.Start < end && start < e.End);
+
+    /// <summary>The same test against a set of events that was fetched for some other window.</summary>
+    private static bool IsBusy(IReadOnlyList<ExistingEvent> events, DateTime start, DateTime end) =>
+        events.Any(e => e.BlocksTime && e.Start < end && start < e.End);
+
+    /// <summary>
+    /// Calendar entries covering a span, fetching them when it reaches outside the week that
+    /// is loaded.
+    ///
+    /// Without this the overlap rule was only ever true for the week on screen: booking into
+    /// next month consulted a list that could not contain next month and so found it free.
+    /// A failure here returns nothing rather than throwing - the caller then behaves exactly
+    /// as it did before there was a check at all.
+    /// </summary>
+    private async Task<IReadOnlyList<ExistingEvent>> EventsCovering(DateTime start, DateTime end)
+    {
+        if (!Settings.IsCalendarConfigured) return [];
+
+        var loadedStart = WeekStart;
+        var loadedEnd = WeekStart.AddDays(7);
+        if (start >= loadedStart && end <= loadedEnd) return ExistingEvents;
+
+        try
+        {
+            return await graph.GetEventsAsync(start.Date, end.Date.AddDays(1));
+        }
+        catch (Exception)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Why a block placed here would never be drawn, or null when it would be.
+    ///
+    /// A block outside the days or hours the grid covers still counts towards the plan and
+    /// still goes to Outlook, but there is no cell to draw it in - so it cannot be selected,
+    /// moved or deleted. Better to say why and let the person widen the view than to accept
+    /// work that then vanishes.
+    /// </summary>
+    public string? WhyNotVisible(DateTime start, DateTime end)
+    {
+        var p = Settings.Planning;
+
+        if (p.WorkingDays.Count > 0 && !p.WorkingDays.Contains(start.DayOfWeek))
+            return $"{start:dddd} is not one of your working days.";
+
+        var open = TimeSpan.FromHours(p.GridStartHour);
+        var close = TimeSpan.FromHours(p.GridEndHour);
+
+        if (start.TimeOfDay < open || end.TimeOfDay > close && end.Date == start.Date)
+        {
+            return p.ShowFullDay
+                ? $"The grid only runs to {p.GridEndHour:00}:00."
+                : $"Your working day runs {p.GridStartHour:00}:00 to {p.GridEndHour:00}:00. " +
+                  "Turn on \"Show the full 24 hours\" in Settings to plan outside it.";
+        }
+
+        // A block that runs past midnight has no second day to spill into on the grid.
+        if (end.Date > start.Date) return "A block cannot run past the end of the day.";
+
+        return null;
+    }
 
     /// <summary>True when the overlap rule should stop work being planned here at all.</summary>
     public bool BlocksPlacement(DateTime start, DateTime end) =>
@@ -555,9 +623,13 @@ public sealed class AppState(
     /// Books the item into the first gap that fits, scanning forward from now across working
     /// days. Returns null when nothing free turns up inside the search window.
     /// </summary>
-    public Allocation? ScheduleNextFree(WorkItem item, int searchDays = 14)
+    /// <param name="minutes">
+    /// How long the block should be. Null falls back to whatever is left on the estimate,
+    /// which is what the callers with nowhere to ask the question want.
+    /// </param>
+    public async Task<Allocation?> ScheduleNextFree(WorkItem item, int? minutes = null, int searchDays = 14)
     {
-        var duration = planner.SuggestedDuration(item);
+        var duration = minutes is > 0 ? minutes.Value : planner.SuggestedDuration(item);
         var p = Settings.Planning;
 
         // The booking window, not the grid: someone who keeps the first hour of the day for
@@ -568,6 +640,11 @@ public sealed class AppState(
         var windowMinutes = (dayEnd - dayStart).TotalMinutes;
 
         if (duration > windowMinutes) return null;
+
+        // The scan runs a fortnight ahead but ExistingEvents only ever holds the week on
+        // screen, so the whole stretch is fetched up front - otherwise "the first gap that
+        // fits, skipping anything already in your calendar" was only true for seven days.
+        var busy = await EventsCovering(DateTime.Today, DateTime.Today.AddDays(searchDays));
 
         for (var d = 0; d < searchDays; d++)
         {
@@ -584,7 +661,7 @@ public sealed class AppState(
 
                 // The busy check here is IsBusy, not HasConflict: "next free" means free,
                 // and HasConflict is gated on the unrelated "warn me" preference.
-                if (IsBusy(start, end)) continue;
+                if (IsBusy(busy, start, end)) continue;
 
                 return planner.Add(item, start, duration);
             }
@@ -615,9 +692,9 @@ public sealed class AppState(
     /// Books the next free gap. Reports for itself rather than leaving each caller to say the
     /// same thing three different ways.
     /// </summary>
-    public bool ScheduleIntoNextFree(WorkItem item)
+    public async Task<bool> ScheduleIntoNextFree(WorkItem item, int? minutes = null)
     {
-        var allocation = ScheduleNextFree(item);
+        var allocation = await ScheduleNextFree(item, minutes);
 
         if (allocation is null)
         {
@@ -634,14 +711,26 @@ public sealed class AppState(
     /// Books a chosen time. The time was asked for explicitly, so an overlap with another
     /// block is allowed - but something already in the calendar is still refused when the
     /// setting says never to plan over one, which is the whole point of that setting.
+    ///
+    /// The checks run on where the block will actually land, not on what was typed: Add
+    /// snaps to the grid and will not go below one slot, so testing the raw values would
+    /// clear a time the block does not end up occupying.
     /// </summary>
-    public bool ScheduleAt(WorkItem item, DateTime start, int minutes)
+    public async Task<bool> ScheduleAt(WorkItem item, DateTime start, int minutes)
     {
         if (minutes <= 0) return false;
 
-        var end = start.AddMinutes(minutes);
+        var placed = planner.Snap(start);
+        var end = placed.AddMinutes(Math.Max(Settings.Planning.SlotMinutes, minutes));
 
-        if (Settings.Planning.PreventOverlap && IsBusy(start, end))
+        if (WhyNotVisible(placed, end) is { } reason)
+        {
+            toasts.Warning("That time is not on the grid", reason);
+            return false;
+        }
+
+        if (Settings.Planning.PreventOverlap &&
+            IsBusy(await EventsCovering(placed, end), placed, end))
         {
             toasts.Warning("Something is already in the calendar then",
                 "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
@@ -662,6 +751,14 @@ public sealed class AppState(
         toasts.Success($"{verb} #{item.Id}",
             $"{Ui.RelativeDay(allocation.Start)} at {allocation.Start:HH:mm} for " +
             $"{Ui.Duration(allocation.DurationMinutes)}.");
+
+        // Same courtesy the grid extends when a block is dragged onto something: overlapping
+        // is allowed here, but it should never be a surprise.
+        if (HasConflict(allocation.Start, allocation.End))
+        {
+            toasts.Warning("Overlaps something in Outlook",
+                $"{Ui.RelativeDay(allocation.Start)} {Ui.TimeRange(allocation.Start, allocation.End)} already has an event.");
+        }
 
         Changed?.Invoke();
     }

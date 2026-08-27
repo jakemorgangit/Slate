@@ -288,27 +288,27 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
     }
 
     /// <summary>Creates the calendar event for an allocation and returns the new event id.</summary>
-    public async Task<string> CreateEventAsync(Allocation allocation, CancellationToken ct = default)
+    public async Task<string> CreateEventAsync(Allocation allocation, int recordedMinutes = 0, CancellationToken ct = default)
     {
         var calendar = settings.Current.Calendar.CalendarId;
         var scope = string.IsNullOrWhiteSpace(calendar)
             ? "/me/events"
             : $"/me/calendars/{Uri.EscapeDataString(calendar)}/events";
 
-        using var doc = await SendAsync(HttpMethod.Post, BaseUrl + scope, BuildEventBody(allocation, includeIdentity: true), ct)
+        using var doc = await SendAsync(HttpMethod.Post, BaseUrl + scope, BuildEventBody(allocation, includeIdentity: true, recordedMinutes), ct)
                         ?? throw new GraphException("Outlook did not return the created event.");
 
         return doc.RootElement.GetProperty("id").GetString()
                ?? throw new GraphException("Outlook returned an event without an id.");
     }
 
-    public async Task UpdateEventAsync(Allocation allocation, CancellationToken ct = default)
+    public async Task UpdateEventAsync(Allocation allocation, int recordedMinutes = 0, CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(allocation.OutlookEventId))
             throw new GraphException("This allocation has no linked Outlook event.");
 
         var url = $"{BaseUrl}/me/events/{Uri.EscapeDataString(allocation.OutlookEventId)}";
-        (await SendAsync(HttpMethod.Patch, url, BuildEventBody(allocation, includeIdentity: false), ct))?.Dispose();
+        (await SendAsync(HttpMethod.Patch, url, BuildEventBody(allocation, includeIdentity: false, recordedMinutes), ct))?.Dispose();
     }
 
     /// <summary>Deletes the linked event. A 404 is treated as success - it is already gone.</summary>
@@ -339,22 +339,28 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
         }
     }
 
-    private object BuildEventBody(Allocation allocation, bool includeIdentity)
+    private object BuildEventBody(Allocation allocation, bool includeIdentity, int recordedMinutes = 0)
     {
         var cal = settings.Current.Calendar;
-        var subject = RenderSubject(cal.SubjectTemplate, allocation, cal.Marker);
 
         var body = new Dictionary<string, object?>
         {
-            ["subject"] = subject,
             ["start"] = new { dateTime = WallClock(allocation.Start), timeZone = LocalTimeZoneId },
             ["end"] = new { dateTime = WallClock(allocation.End), timeZone = LocalTimeZoneId },
             ["showAs"] = cal.ShowAs,
             ["isReminderOn"] = cal.ReminderEnabled,
             ["reminderMinutesBeforeStart"] = Math.Max(0, cal.ReminderMinutes),
             ["sensitivity"] = cal.IsPrivate ? "private" : "normal",
-            ["body"] = new { contentType = "html", content = BuildBodyHtml(allocation) },
         };
+
+        // A block rebuilt from a clipped payload knows its title and notes are shorter than
+        // what is on the event. Graph only touches the fields it is given, so leaving these
+        // two out means moving such a block never truncates the text still sitting there.
+        if (!allocation.TextIsPartial)
+        {
+            body["subject"] = RenderSubject(cal.SubjectTemplate, allocation, cal.Marker);
+            body["body"] = new { contentType = "html", content = BuildBodyHtml(allocation) };
+        }
 
         if (!string.IsNullOrWhiteSpace(cal.Category))
             body["categories"] = new[] { cal.Category };
@@ -365,9 +371,9 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
             ? new[]
             {
                 new { id = AllocationPropertyId, value = allocation.Id.ToString() },
-                new { id = PayloadPropertyId, value = AllocationPayload.Write(allocation) },
+                new { id = PayloadPropertyId, value = AllocationPayload.Write(allocation, recordedMinutes) },
             }
-            : [new { id = PayloadPropertyId, value = AllocationPayload.Write(allocation) }];
+            : [new { id = PayloadPropertyId, value = AllocationPayload.Write(allocation, recordedMinutes) }];
 
         return body;
     }

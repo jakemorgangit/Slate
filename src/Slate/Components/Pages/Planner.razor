@@ -434,7 +434,7 @@
             <span class="glyph">☰</span> View work item
         </button>
         <button @onclick="() => ScheduleFromMenu(item.Item)">
-            <span class="glyph">＋</span> Schedule next free slot
+            <span class="glyph">＋</span> Schedule…
         </button>
 
 
@@ -499,7 +499,7 @@
 <ScheduleDialog />
 <SpawnTaskDialog />
 <PriorityDialog />
-<NewWorkItemDialog OnSchedule="ScheduleNextFree" />
+<NewWorkItemDialog OnSchedule="BookNextFree" />
 
 @code {
     private DotNetObjectReference<Planner>? _self;
@@ -735,6 +735,13 @@
     /// <summary>Opens the schedule dialog: next free gap, or a time of your choosing.</summary>
     private void ScheduleNextFree(WorkItem item) => State.BeginSchedule(item);
 
+    /// <summary>
+    /// Books straight away, for the "book the next free slot for it" tick on the new work
+    /// item form. That box promises a booking, so it must not hand back a dialog that can
+    /// be dismissed with nothing booked.
+    /// </summary>
+    private Task BookNextFree(WorkItem item) => State.ScheduleIntoNextFree(item);
+
     private void WarnIfConflict(Allocation allocation)
     {
         if (!State.HasConflict(allocation.Start, allocation.End)) return;
@@ -848,6 +855,7 @@
                 CloseMenu();
                 State.CloseWorkItem();
                 State.CancelRecordTime();
+                State.CancelSchedule();
                 State.SelectAllocation(null);
                 _inspectorOpen = false;
                 break;

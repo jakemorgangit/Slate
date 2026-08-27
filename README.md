@@ -276,12 +276,17 @@ the work item's estimate.
 ## Working across two machines
 
 Your plan file stays on the machine that wrote it. Your calendar does not, so the calendar is where
-a block's identity lives: every event Slate writes carries a **marker** in its subject (`-Slate-` by
-default, configurable in Settings) and enough of the block stamped onto the event itself.
+a block's identity lives: every event Slate writes carries enough of the block stamped onto the
+event itself for any copy of the app to rebuild it. Events also get a **marker** in their subject
+(`-Slate-` by default, configurable in Settings), which is a label for your own eyes in Outlook —
+recognition does not depend on it, so the two machines need not agree on what it says.
 
-Open Slate on another machine signed in to the same calendar and it picks those blocks up — they
-appear on the grid and can be moved, resized, re-synced or deleted there like any other. Keep the
-marker the same on both machines.
+Open Slate on another machine signed in to the same calendar, with **two-way sync** on, and it
+picks those blocks up — they appear on the grid and can be moved, resized, re-synced or deleted
+there like any other. Blocks are picked up a week at a time, as you navigate to them.
+
+Unlinking a block, or deleting one while *Delete the Outlook event too* is off, leaves the event on
+the calendar but tells this machine it has finished with it, so it is not picked straight back up.
 
 ## Changing the status
 

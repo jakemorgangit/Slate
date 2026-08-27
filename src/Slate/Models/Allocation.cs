@@ -40,6 +40,20 @@ public sealed class Allocation
     /// to migrate old plan files; <see cref="TimeEntry"/> is the source of truth now.
     /// </summary>
     public int RecordedMinutes { get; set; }
+
+    /// <summary>
+    /// True when this block was rebuilt from an event whose payload had to clip the title or
+    /// notes. The full text is still on the event, so this copy must never write its
+    /// shortened version back over it.
+    /// </summary>
+    public bool TextIsPartial { get; set; }
+
+    /// <summary>
+    /// Time already booked against this block somewhere else, carried on the event. Recording
+    /// lives in the plan file, which does not travel, so without this a second machine shows
+    /// nothing recorded and invites the same hours being logged to Azure DevOps twice.
+    /// </summary>
+    public int RecordedElsewhereMinutes { get; set; }
     public DateTimeOffset? LastRecordedAt { get; set; }
 
     [JsonIgnore]
@@ -66,6 +80,11 @@ public sealed class Allocation
     /// </summary>
     public string Fingerprint() =>
         string.Join('|',
+            // Bumped when the shape of what gets written to the event changes, so blocks
+            // that are already Synced re-send once and pick the new shape up. Without it a
+            // plan made before portable blocks existed would never carry the payload that
+            // makes them portable, and nothing in the app could make it.
+            EventShape,
             WorkItemId,
             WorkItemTitle,
             WorkItemType,
@@ -75,6 +94,9 @@ public sealed class Allocation
             Start.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture),
             DurationMinutes,
             Notes);
+
+    /// <summary>Version of the event payload this app writes. See <see cref="Fingerprint"/>.</summary>
+    private const string EventShape = "v2";
 
     public bool Overlaps(DateTime start, DateTime end) => Start < end && start < End;
 

@@ -14,7 +14,7 @@
 
 @if (State.SchedulingFor is { } item)
 {
-    <div class="modal-scrim" @onclick="Cancel">
+    <div class="modal-scrim" @onclick="Cancel" @onkeydown="OnKeyDown" tabindex="-1">
         <div class="modal narrow" @onclick:stopPropagation="true">
 
             <div class="modal-head">
@@ -121,16 +121,26 @@
         _openedFor = item.Id;
         _pickTime = false;
         _minutes = Math.Max(5, Planner.SuggestedDuration(item));
+        SeedPickers();
+    }
 
+    /// <summary>Puts the date and time fields on the next slot the booking window allows.</summary>
+    private void SeedPickers()
+    {
         var suggested = NextSlotBoundary();
         _date = suggested.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         _time = suggested.ToString("HH:mm", CultureInfo.InvariantCulture);
     }
 
+    /// <summary>
+    /// Every change anywhere in the app comes through here, but this component draws nothing
+    /// unless it is open, so a closed dialog that was closed before has nothing to redraw.
+    /// </summary>
     private void OnChanged() => InvokeAsync(() =>
     {
+        var wasOpen = _openedFor >= 0;
         Prime();
-        StateHasChanged();
+        if (wasOpen || State.SchedulingFor is not null) StateHasChanged();
     });
 
     public void Dispose() => State.Changed -= OnChanged;
@@ -155,13 +165,14 @@
     {
         _pickTime = true;
 
-        // Seed from now rather than whatever was last typed, so the fields are never stale.
-        if (_date.Length == 0 || _time.Length == 0)
-        {
-            var suggested = NextSlotBoundary();
-            _date = suggested.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-            _time = suggested.ToString("HH:mm", CultureInfo.InvariantCulture);
-        }
+        // Opening the dialog already seeded both fields, so there is only ever something to
+        // fill in if one of them has been cleared by hand.
+        if (_date.Length == 0 || _time.Length == 0) SeedPickers();
+    }
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Cancel();
     }
 
     private void Cancel()
@@ -170,13 +181,13 @@
         State.CancelSchedule();
     }
 
-    private void Confirm()
+    private async Task Confirm()
     {
         if (State.SchedulingFor is not { } item) return;
 
         if (!_pickTime)
         {
-            if (State.ScheduleIntoNextFree(item)) _openedFor = -1;
+            if (await State.ScheduleIntoNextFree(item, _minutes)) _openedFor = -1;
             return;
         }
 
@@ -188,7 +199,7 @@
             return;
         }
 
-        if (State.ScheduleAt(item, start, _minutes)) _openedFor = -1;
+        if (await State.ScheduleAt(item, start, _minutes)) _openedFor = -1;
     }
 
     /// <summary>

@@ -57,7 +57,11 @@ public sealed class AppSettings
         Ado.ExcludedStates ??= [];
 
         if (string.IsNullOrWhiteSpace(Calendar.SubjectTemplate)) Calendar.SubjectTemplate = "#{id} {title}";
+        // Bounded like everything else here: it is appended to a subject that has its own
+        // 250-character ceiling, and a marker long enough to eat the whole line would leave
+        // the subject as nothing but a truncated tag.
         if (string.IsNullOrWhiteSpace(Calendar.Marker)) Calendar.Marker = "-Slate-";
+        else if (Calendar.Marker.Length > 40) Calendar.Marker = Calendar.Marker[..40];
         Calendar.ReminderMinutes = Math.Clamp(Calendar.ReminderMinutes, 0, 40320);
         Calendar.ShowAs = Array.Find(ShowAsValues,
             v => string.Equals(v, Calendar.ShowAs, StringComparison.OrdinalIgnoreCase)) ?? "busy";
@@ -99,7 +103,12 @@ public sealed class AdoSettings
     /// <summary>e.g. https://dev.azure.com/contoso</summary>
     public string OrganizationUrl { get; set; } = "";
     public string Project { get; set; } = "";
-    public AdoAuthMode AuthMode { get; set; } = AdoAuthMode.Pat;
+    /// <summary>
+    /// Microsoft sign-in by default: the Connect card leads with it and a new install that
+    /// followed that card would otherwise never count as configured, because a token it was
+    /// never asked for would still be missing.
+    /// </summary>
+    public AdoAuthMode AuthMode { get; set; } = AdoAuthMode.Entra;
 
     /// <summary>Stored on disk encrypted with DPAPI; only ever plaintext in memory.</summary>
     public string PersonalAccessToken { get; set; } = "";

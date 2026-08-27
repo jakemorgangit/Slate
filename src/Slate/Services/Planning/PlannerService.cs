@@ -104,10 +104,13 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null) return;
 
-        if (allocation.OutlookEventId is { Length: > 0 } eventId &&
-            settings.Current.Calendar.DeleteEventWithAllocation)
+        if (allocation.OutlookEventId is { Length: > 0 } eventId)
         {
-            PendingDeletes.Add(eventId);
+            // Either the event goes too, or it stays and has to be remembered as one this
+            // plan has finished with - otherwise the stamp it still carries would have the
+            // next refresh adopt it straight back.
+            if (settings.Current.Calendar.DeleteEventWithAllocation) PendingDeletes.Add(eventId);
+            else Disown(eventId);
         }
 
         store.All.Remove(allocation);
@@ -120,8 +123,18 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null) return;
 
+        // Unlinking is the whole point here, so the event has to be remembered as let go of.
+        if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(eventId);
+
         store.All.Remove(allocation);
         Persist();
+    }
+
+    /// <summary>Remembers an event this plan has finished with, so adoption leaves it alone.</summary>
+    private void Disown(string eventId)
+    {
+        if (!store.Disowned.Contains(eventId, StringComparer.Ordinal))
+            store.Disowned.Add(eventId);
     }
 
     public Allocation? Duplicate(Guid id, DateTime newStart)
@@ -255,7 +268,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
                 {
                     if (allocation.OutlookEventId is null)
                     {
-                        allocation.OutlookEventId = await graph.CreateEventAsync(allocation, ct);
+                        allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
                         created++;
                     }
                     else if (!await graph.EventExistsAsync(allocation.OutlookEventId, ct))
@@ -266,7 +279,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
                     }
                     else
                     {
-                        await graph.UpdateEventAsync(allocation, ct);
+                        await graph.UpdateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
                         updated++;
                     }
 
@@ -300,9 +313,9 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         try
         {
             if (allocation.OutlookEventId is null || !await graph.EventExistsAsync(allocation.OutlookEventId, ct))
-                allocation.OutlookEventId = await graph.CreateEventAsync(allocation, ct);
+                allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
             else
-                await graph.UpdateEventAsync(allocation, ct);
+                await graph.UpdateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
 
             allocation.MissingInOutlook = false;
 
@@ -361,7 +374,8 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// resizing it or deleting it - from anywhere.
     ///
     /// Only events still carrying our stamp are considered, and only when nothing in the
-    /// plan already claims them. Returns how many were taken on.
+    /// plan already claims them and nothing here has already let them go. Returns how many
+    /// were taken on.
     /// </summary>
     public int AdoptOrphanEvents(IReadOnlyList<ExistingEvent> events)
     {
@@ -371,11 +385,20 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             .Select(a => a.OutlookEventId!)
             .ToHashSet(StringComparer.Ordinal);
 
-        var adopted = 0;
+        // Both are lists on disk; lifted out of the loop because every event tests against them.
+        var pending = store.PendingDeletes.ToHashSet(StringComparer.Ordinal);
+        var disowned = store.Disowned.ToHashSet(StringComparer.Ordinal);
+
+        var adopted = new List<Allocation>();
 
         foreach (var e in events)
         {
             if (e.Payload is null || e.IsAllDay) continue;
+
+            // An event deleted here but not yet sent, or one deliberately unlinked, would
+            // otherwise walk straight back in on the next refresh.
+            if (pending.Contains(e.Id) || disowned.Contains(e.Id)) continue;
+
             if (e.AllocationId is Guid id && known.Contains(id)) continue;
             if (claimed.Contains(e.Id)) continue;
 
@@ -383,17 +406,18 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             var rebuilt = Graph.AllocationPayload.Read(e.Payload, e.Id, e.Start, minutes);
             if (rebuilt is null || known.Contains(rebuilt.Id)) continue;
 
-            // An event deleted here but not yet sent would otherwise walk straight back in.
-            if (store.PendingDeletes.Contains(e.Id, StringComparer.Ordinal)) continue;
-
-            store.All.Add(rebuilt);
+            adopted.Add(rebuilt);
             known.Add(rebuilt.Id);
             claimed.Add(e.Id);
-            adopted++;
         }
 
-        if (adopted > 0) Persist();
-        return adopted;
+        if (adopted.Count == 0) return 0;
+
+        // Swapped in rather than added in place: this runs from the calendar poll, off the
+        // UI thread, while the grid may be enumerating the same list.
+        store.Append(adopted);
+        Persist();
+        return adopted.Count;
     }
 
     /// <summary>
@@ -490,6 +514,11 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     {
         var allocation = Find(id);
         if (allocation is null || !allocation.MissingInOutlook) return;
+
+        // The event is believed gone, but "believed" is doing work there: it was judged
+        // missing from one week's worth of calendar. If it turns up again, it is still one
+        // this plan has finished with.
+        if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(eventId);
 
         store.All.Remove(allocation);
         Persist();

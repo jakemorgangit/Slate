@@ -25,6 +25,31 @@ public sealed class PlanStore
 
     public List<string> PendingDeletes => Cached.PendingDeletes;
 
+    /// <summary>Event ids the plan has deliberately let go of, so they are not picked up again.</summary>
+    public List<string> Disowned => Cached.Disowned;
+
+    /// <summary>
+    /// Appends allocations by swapping in a new list rather than mutating the live one.
+    ///
+    /// Adoption is the one path that adds blocks off the UI thread - it runs from the
+    /// calendar poll's timer callback - while the grid is enumerating the same list to
+    /// render. Adding in place there throws "Collection was modified"; replacing the
+    /// reference leaves any enumeration already under way looking at an intact list.
+    /// </summary>
+    public void Append(IReadOnlyList<Allocation> additions)
+    {
+        if (additions.Count == 0) return;
+
+        lock (_gate)
+        {
+            var current = Cached;
+            var grown = new List<Allocation>(current.Allocations.Count + additions.Count);
+            grown.AddRange(current.Allocations);
+            grown.AddRange(additions);
+            current.Allocations = grown;
+        }
+    }
+
     private PlanFile Cached
     {
         get
@@ -99,6 +124,7 @@ public sealed class PlanStore
                 TimeEntries = [.. current.TimeEntries],
                 Priorities = new Dictionary<int, int>(current.Priorities),
                 PendingDeletes = [.. current.PendingDeletes],
+                Disowned = [.. current.Disowned],
             };
 
             // Serializing inside the lock as well, so two threads cannot both be writing the

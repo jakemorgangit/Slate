@@ -76,7 +76,11 @@ public sealed class MsalAuthService(SettingsStore settings, TokenCacheStore cach
         try
         {
             var app = GetApp();
+            // Consent for Azure DevOps is asked for here too, so "one sign-in" means one:
+            // without it the first Azure DevOps call opens a second browser window of its own
+            // in the middle of connecting.
             var result = await app.AcquireTokenInteractive(GraphScopes)
+                .WithExtraScopesToConsent(AdoScopes)
                 .WithPrompt(Prompt.SelectAccount)
                 .ExecuteAsync(ct);
 

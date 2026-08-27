@@ -32,14 +32,15 @@
             <div class="card-body">
                 <div class="grid-2">
                     <div>
-                        <h3 style="margin-bottom: 7px">1 · Azure DevOps</h3>
+                        <h3 style="margin-bottom: 7px">1 · Connect</h3>
                         <ol class="steps">
-                            <li>Put your organization URL in Settings, for example
+                            <li>Put your organization URL in the <strong>Connect</strong> card, for example
                                 <code>https://dev.azure.com/contoso</code>.</li>
-                            <li>Either paste a <strong>personal access token</strong>
-                                (<em>User settings → Personal access tokens → New Token</em>) with the
-                                <strong>Work Items (Read &amp; Write)</strong> scope, or switch to
-                                <strong>Microsoft sign-in</strong>.</li>
+                            <li>Add the app registration's client ID from step 2, then press
+                                <strong>Sign in with Microsoft</strong> — one sign-in covers both
+                                Azure DevOps and Outlook.</li>
+                            <li>No app registration? Open <em>Use a personal access token instead</em> and
+                                paste a token with the <strong>Work Items (Read &amp; Write)</strong> scope.</li>
                             <li>Pick a project, then choose which items to show: assigned to me,
                                 a saved query, or your own WIQL.</li>
                         </ol>
@@ -59,7 +60,11 @@
                             <li>API permissions → Microsoft Graph → Delegated →
                                 <code>User.Read</code> and <code>Calendars.ReadWrite</code>.</li>
                             <li>Authentication → <strong>Allow public client flows: Yes</strong>.</li>
-                            <li>Press <strong>Sign in with Microsoft</strong> and pick your calendar.</li>
+                            <li>Only for Microsoft sign-in to Azure DevOps: API permissions →
+                                <strong>APIs my organization uses</strong> → <strong>Azure DevOps</strong> →
+                                <code>user_impersonation</code>.</li>
+                            <li>Back in Settings, press <strong>Sign in with Microsoft</strong> and pick
+                                your calendar.</li>
                         </ol>
                         <button class="btn btn-sm" style="margin-top: 9px"
                                 @onclick="@(() => SystemShell.OpenUrl("https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"))">
@@ -110,8 +115,9 @@
                         original where it is and drop a copy.</dd>
 
                     <dt>Let it choose</dt>
-                    <dd>Press <span class="kbd">Enter</span> on a work item card, or hit <strong>Schedule</strong>
-                        on the Work items tab, and it books the first gap that fits.</dd>
+                    <dd>Press <span class="kbd">Enter</span> on a work item card, or hit <strong>Schedule…</strong>
+                        on the Work items tab. Take the first gap that fits inside the hours work can be
+                        booked into, or pick a date and time yourself.</dd>
 
                     <dt>Your existing calendar</dt>
                     <dd>Everything already in Outlook that week is drawn behind the plan in grey. Work is not
@@ -395,9 +401,10 @@
                         app and re-opening usually clears it; a reboot always does.</dd>
 
                     <dt>Azure DevOps says 401 or 403</dt>
-                    <dd>The token has expired or lacks scope. Recording time needs
-                        <strong>Work Items (Read &amp; Write)</strong>. Re-paste the token in Settings and press
-                        <strong>Test connection</strong>.</dd>
+                    <dd>The sign-in has expired or lacks scope. Recording time needs
+                        <strong>Work Items (Read &amp; Write)</strong> on a token, or the
+                        <code>user_impersonation</code> permission on the app registration. Fix it in
+                        Settings and press <strong>Re-check</strong> on the Connect card.</dd>
 
                     <dt>Graph refuses the calendar</dt>
                     <dd>The app registration needs <code>Calendars.ReadWrite</code> as a <em>delegated</em>
@@ -473,7 +480,7 @@
         (["Del"], "Delete the selected block"),
         (["Esc"], "Close a menu or window, or cancel a drag in progress"),
         (["/"], "Jump to the work item filter"),
-        (["Enter"], "On a work item card: book the next free slot"),
+        (["Enter"], "On a work item card: open the schedule dialog"),
         (["Ctrl", "drag"], "Copy a block instead of moving it"),
     ];
 
