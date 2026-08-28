@@ -71,7 +71,8 @@ with Windows DPAPI under your user account, so nobody else on the machine can re
 
 Optionally choose a **project**; leaving it blank queries across everything you can see.
 
-Then choose which work items appear: *assigned to me* (with finished states filtered out), a
+Then choose which work items appear: *assigned to me* (with finished states filtered out), *an
+area of the project*, a
 **saved query** from your Queries hub, or your own **WIQL**.
 
 ### 3. Outlook, via an Entra ID app registration
@@ -254,6 +255,16 @@ Remaining Work seeded from the length of the block. The calendar block then poin
 task, so time can be recorded against it.
 
 The block stays put either way. Turn the offer off in Settings, or from the notice itself.
+
+## Working from an area, not just your own list
+
+**An area of the project** lists work from an area path rather than from your own assignments.
+Everything beneath the area you pick counts, so choosing a top-level area takes in all of its
+sub-areas; leave it empty for the whole project.
+
+**Only work items assigned to me** sits underneath it, on by default. Turn it off to see everything
+the team has in that area — useful for picking up someone else's work, or planning around it. The
+same *hide these states* filter applies either way, so finished work stays out of the list.
 
 ## Your hours
 

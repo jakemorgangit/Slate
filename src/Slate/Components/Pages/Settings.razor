@@ -252,6 +252,8 @@
                     <div class="row wrap">
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.AssignedToMe ? "on" : "")"
                                 @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.AssignedToMe)">Assigned to me</button>
+                        <button class="chip @(_draft.Ado.Scope == WorkItemScope.AreaPath ? "on" : "")"
+                                @onclick="ChooseAreaScopeAsync">An area of the project</button>
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.SavedQuery ? "on" : "")"
                                 @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.SavedQuery)">A saved query</button>
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.CustomWiql ? "on" : "")"
@@ -259,7 +261,33 @@
                     </div>
                 </div>
 
-                @if (_draft.Ado.Scope == WorkItemScope.AssignedToMe)
+                @if (_draft.Ado.Scope == WorkItemScope.AreaPath)
+                {
+                    <div class="field">
+                        <label for="scope-area">Area path</label>
+                        <AreaPathPicker Id="scope-area"
+                                        Value="@_draft.Ado.AreaPath"
+                                        ValueChanged="OnAreaPathChanged"
+                                        Root="State.AreaTree"
+                                        Note="@AreaNote" />
+                        <span class="hint">
+                            Everything beneath the area you pick counts too, so a top-level area takes
+                            in all of its sub-areas. Leave it empty for the whole project.
+                        </span>
+                    </div>
+
+                    <label class="switch">
+                        <input type="checkbox" checked="@_draft.Ado.OnlyMine"
+                               @onchange="e => Set(() => _draft.Ado.OnlyMine = Bool(e))" />
+                        <span class="track"></span>
+                        <span class="label">Only work items assigned to me</span>
+                    </label>
+                    <span class="hint">
+                        Turn this off to see everything the team has in that area, not just your own.
+                    </span>
+                }
+
+                @if (_draft.Ado.Scope is WorkItemScope.AssignedToMe or WorkItemScope.AreaPath)
                 {
                     <div class="field">
                         <label>Hide these states</label>
@@ -273,7 +301,7 @@
                         <span class="hint">Work already finished does not need any more of your time.</span>
                     </div>
                 }
-                else if (_draft.Ado.Scope == WorkItemScope.SavedQuery)
+                @if (_draft.Ado.Scope == WorkItemScope.SavedQuery)
                 {
                     <div class="field">
                         <label for="query">Saved query</label>
@@ -759,6 +787,24 @@
 
     private static int Int(ChangeEventArgs e, int fallback, int min, int max) =>
         int.TryParse(e.Value?.ToString(), out var parsed) ? Math.Clamp(parsed, min, max) : fallback;
+
+    /// <summary>
+    /// Switches to the area scope and fetches the tree behind the picker. Loading it here
+    /// rather than on page load keeps a request off everyone who never opens this.
+    /// </summary>
+    private async Task ChooseAreaScopeAsync()
+    {
+        Set(() => _draft.Ado.Scope = WorkItemScope.AreaPath);
+        await State.EnsureAreaTreeAsync();
+    }
+
+    private void OnAreaPathChanged(string path) => Set(() => _draft.Ado.AreaPath = path);
+
+    /// <summary>Told to the picker when the tree could not be read, so it explains itself.</summary>
+    private string AreaNote =>
+        State.AreaTree is not null ? ""
+        : string.IsNullOrWhiteSpace(_draft.Ado.Project) ? "Pick a project first to browse its areas."
+        : "The area list could not be read. Type the path in by hand.";
 
     private void ToggleExcludedState(string state)
     {

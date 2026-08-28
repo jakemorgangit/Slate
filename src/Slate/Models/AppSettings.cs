@@ -4,7 +4,7 @@ namespace Slate.Models;
 
 public enum AdoAuthMode { Pat, Entra }
 public enum ThemeMode { Dark, Light, System }
-public enum WorkItemScope { AssignedToMe, SavedQuery, CustomWiql }
+public enum WorkItemScope { AssignedToMe, AreaPath, SavedQuery, CustomWiql }
 
 /// <summary>How text typed into the app is turned into the HTML Azure DevOps stores.</summary>
 public enum TextFormat { PlainText, Markdown, Html }
@@ -116,6 +116,18 @@ public sealed class AdoSettings
     public WorkItemScope Scope { get; set; } = WorkItemScope.AssignedToMe;
     public string SavedQueryId { get; set; } = "";
     public string CustomWiql { get; set; } = "";
+
+    /// <summary>
+    /// The area path to list work from, for <see cref="WorkItemScope.AreaPath"/>. Everything
+    /// beneath it counts too, so picking a top-level area takes in all of its sub-areas.
+    /// </summary>
+    public string AreaPath { get; set; } = "";
+
+    /// <summary>
+    /// Narrow an area to just your own work. On by default, because your own list is what
+    /// most people want most days; turning it off shows everything the team has in that area.
+    /// </summary>
+    public bool OnlyMine { get; set; } = true;
 
     /// <summary>States excluded from the board because they need no more of your time.</summary>
     public List<string> ExcludedStates { get; set; } = ["Closed", "Done", "Removed", "Resolved"];

@@ -1063,6 +1063,29 @@ public sealed class AppState(
     public AreaNode? AreaTree { get; private set; }
 
     /// <summary>
+    /// Loads the project's area tree if it is not already in hand, for the pickers that need
+    /// it outside the new work item form. Quiet on failure: the picker falls back to a plain
+    /// text box, which is better than an error over a settings page.
+    /// </summary>
+    public async Task EnsureAreaTreeAsync()
+    {
+        if (AreaTree is not null) return;
+
+        var project = Settings.Ado.Project;
+        if (string.IsNullOrWhiteSpace(project) || !Settings.IsAdoConfigured) return;
+
+        try
+        {
+            AreaTree = await ado.GetAreaTreeAsync(project);
+            Changed?.Invoke();
+        }
+        catch (Exception)
+        {
+            AreaTree = null;
+        }
+    }
+
+    /// <summary>
     /// Opens the new work item form. The project and type lists are fetched in the
     /// background, so the form is usable the moment it appears rather than after a round trip.
     /// </summary>

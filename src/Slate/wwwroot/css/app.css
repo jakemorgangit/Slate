@@ -1482,6 +1482,18 @@ table.timesheet tfoot .sticky-col { background: var(--surface-2); }
     opacity: 0.7;
 }
 
+/* The middle column is the one that gives: without this the title and the note size
+   the row and push the hours and Undo out of line with the rows above and below. */
+.ghost-entry .grow { flex: 1; min-width: 0; }
+
+.ghost-entry .ghost-actions {
+    margin-left: auto;
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
 .ghost-entry .ghost-hours {
     flex: none;
     display: flex;

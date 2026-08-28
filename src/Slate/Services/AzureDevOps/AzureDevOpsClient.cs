@@ -221,26 +221,40 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         {
             WorkItemScope.SavedQuery => await RunSavedQueryAsync(ado.SavedQueryId, ct),
             WorkItemScope.CustomWiql => await RunWiqlAsync(ado.CustomWiql, ct),
-            _ => await RunWiqlAsync(BuildAssignedToMeWiql(ado), ct),
+            _ => await RunWiqlAsync(BuildScopeWiql(ado), ct),
         };
 
         return ids.Count == 0 ? [] : await GetWorkItemsByIdAsync(ids, ct);
     }
 
-    public static string BuildAssignedToMeWiql(AdoSettings ado)
+    /// <summary>
+    /// The query behind the two scopes this app writes itself: your own work, and an area of
+    /// the project. An area takes everything beneath it, so a top-level pick includes its
+    /// sub-areas, and "only mine" narrows that to your own without changing the area.
+    /// </summary>
+    public static string BuildScopeWiql(AdoSettings ado)
     {
-        var quote = "'";
-        var excluded = "";
-        if (ado.ExcludedStates.Count > 0)
-        {
-            var list = string.Join(", ", ado.ExcludedStates
-                .Select(s => quote + s.Replace(quote, quote + quote) + quote));
-            excluded = $" AND [System.State] NOT IN ({list})";
-        }
+        var clauses = new List<string>();
 
-        return "SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me" + excluded +
-               " ORDER BY [System.ChangedDate] DESC";
+        if (ado.Scope == WorkItemScope.AreaPath && !string.IsNullOrWhiteSpace(ado.AreaPath))
+            clauses.Add($"[System.AreaPath] UNDER {Quote(ado.AreaPath)}");
+
+        // Assignment is the whole of the "assigned to me" scope, and optional on an area.
+        if (ado.Scope != WorkItemScope.AreaPath || ado.OnlyMine)
+            clauses.Add("[System.AssignedTo] = @Me");
+
+        if (ado.ExcludedStates.Count > 0)
+            clauses.Add($"[System.State] NOT IN ({string.Join(", ", ado.ExcludedStates.Select(Quote))})");
+
+        // An area with nothing else set would otherwise produce a bare WHERE.
+        var where = clauses.Count == 0 ? "" : " WHERE " + string.Join(" AND ", clauses);
+
+        return "SELECT [System.Id] FROM WorkItems" + where + " ORDER BY [System.ChangedDate] DESC";
     }
+
+    /// <summary>A WIQL string literal, with embedded quotes doubled as that dialect expects.</summary>
+    private static string Quote(string value) => "'" + value.Replace("'", "''") + "'";
+
 
     private async Task<List<int>> RunWiqlAsync(string wiql, CancellationToken ct)
     {

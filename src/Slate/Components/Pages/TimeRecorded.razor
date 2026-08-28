@@ -167,27 +167,32 @@
                                     </div>
                                     @if (!string.IsNullOrWhiteSpace(entry.Comment))
                                     {
-                                        <div class="ghost-note" title="Posted to the discussion when this time was recorded">
+                                        @* Held to a readable length; the whole of it is on hover. *@
+                                        <div class="ghost-note" title="@entry.Comment">
                                             <span class="quote-mark">“</span>
-                                            <span class="truncate">@entry.Comment</span>
+                                            <span class="truncate">@Ui.Clip(entry.Comment, NoteLimit)</span>
                                         </div>
                                     }
                                 </div>
 
-                                <div class="ghost-hours">
-                                    <ClockIcon Size="12" />
-                                    <span>@Ui.DecimalHours(entry.Minutes)h</span>
-                                </div>
+                                @* Pinned to the right edge, so the hours and Undo line up down
+                                   the column however long the title or the note happens to be. *@
+                                <div class="ghost-actions">
+                                    <div class="ghost-hours">
+                                        <ClockIcon Size="12" />
+                                        <span>@Ui.DecimalHours(entry.Minutes)h</span>
+                                    </div>
 
-                                <button class="btn btn-sm btn-danger" title="Take this time back off the work item"
-                                        disabled="@(_undoing == entry.Id)"
-                                        @onclick="() => UndoAsync(entry)">
-                                    @if (_undoing == entry.Id)
-                                    {
-                                        <span class="spinner"></span>
-                                    }
-                                    <span>Undo</span>
-                                </button>
+                                    <button class="btn btn-sm btn-danger" title="Take this time back off the work item"
+                                            disabled="@(_undoing == entry.Id)"
+                                            @onclick="() => UndoAsync(entry)">
+                                        @if (_undoing == entry.Id)
+                                        {
+                                            <span class="spinner"></span>
+                                        }
+                                        <span>Undo</span>
+                                    </button>
+                                </div>
                             </div>
                         }
                     </div>
@@ -205,6 +210,9 @@
     private List<DateTime> _days = [];
     private List<Row> _rows = [];
     private Guid? _undoing;
+
+    /// <summary>How much of a note the row shows before the rest is left to the tooltip.</summary>
+    private const int NoteLimit = 110;
 
     /// <summary>One work item's week: its per-day totals.</summary>
     private sealed record Row(int WorkItemId, string Title, string WorkItemType, Dictionary<DateTime, int> ByDay)
