@@ -267,6 +267,15 @@ Left alone, that is exactly the *assigned to me* list it has always been, which 
 changes nothing. Set an area to plan around a team's work; turn the toggle off to see everything in
 that area rather than only your own.
 
+The area is chosen from the project's own tree, one dropdown per level: the project root, then the
+level below it, and so on as deep as the tree goes. Leaving a level unset means *everything beneath
+the level above* — so picking `DevOps` and stopping there takes in `DevOps\DBA` and every other team
+under it. Only narrow further if you want the narrower list.
+
+**Only mine** is also a one-click filter where you are reading the list — beside *Hide fully planned*
+on the Work items tab, and as a chip at the top of the plan's sidebar. It is the same setting in all
+three places, so flipping it anywhere flips it everywhere and re-runs the query.
+
 With no area *and* no assignment filter you are asking for the whole project. Azure DevOps returns
 the first 500 matches, so the list can be cut short without saying so — Settings warns when that
 combination is selected.

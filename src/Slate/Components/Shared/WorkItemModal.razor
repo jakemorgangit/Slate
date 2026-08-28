@@ -65,6 +65,14 @@
                                 <span>·</span>
                                 <span>@d.AssignedTo</span>
                             }
+                            @if (!string.IsNullOrWhiteSpace(d.AreaPath))
+                            {
+                                @* Which part of the project this sits under - the thing the area
+                                   filter works on, so worth showing where the item is read. *@
+                                <span class="badge badge-muted mono" title="@($"Area path: {d.AreaPath}")">
+                                    @d.AreaPath
+                                </span>
+                            }
                             @foreach (var tag in d.Tags)
                             {
                                 <span class="badge badge-muted">@tag</span>
@@ -90,6 +98,17 @@
             </div>
 
             <div class="modal-body">
+                @if (State.Detail is { AssignedTo: var who } && string.IsNullOrWhiteSpace(who))
+                {
+                    @* Nobody owns this yet, which decides whether it belongs on your week at all. *@
+                    <div class="banner warn">
+                        <span>!</span>
+                        <div class="grow">
+                            <strong>Unassigned.</strong> Nobody is down to do this yet.
+                        </div>
+                    </div>
+                }
+
                 @if (State.IsLoadingDetail)
                 {
                     <div class="row"><span class="spinner"></span> <span class="muted">Loading the work item…</span></div>

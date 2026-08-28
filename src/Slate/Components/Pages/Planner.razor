@@ -42,9 +42,19 @@
                 }
             </div>
 
-            @if (State.AvailableTypes.Count > 1)
-            {
-                <div class="filter-row">
+            <div class="filter-row">
+                @* Re-runs the query rather than filtering the list: with it on, other
+                   people's work was never fetched in the first place. *@
+                <button class="chip @(State.Settings.Ado.OnlyMine ? "on" : "")"
+                        title="@(State.Settings.Ado.OnlyMine
+                            ? "Showing only work assigned to you - click to include everyone's"
+                            : "Showing everyone's work in this area - click to narrow to your own")"
+                        @onclick="() => State.SetOnlyMineAsync(!State.Settings.Ado.OnlyMine)">
+                    Only mine
+                </button>
+
+                @if (State.AvailableTypes.Count > 1)
+                {
                     @foreach (var type in State.AvailableTypes)
                     {
                         <button class="chip @(State.TypeFilter.Contains(type) ? "on" : "")"
@@ -53,8 +63,8 @@
                             @type
                         </button>
                     }
-                </div>
-            }
+                }
+            </div>
         </div>
 
         <div class="sidebar-list">

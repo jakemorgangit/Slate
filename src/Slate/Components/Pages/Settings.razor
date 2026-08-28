@@ -266,11 +266,35 @@
                 {
                     <div class="field">
                         <label for="scope-area">Area</label>
-                        <AreaPathPicker Id="scope-area"
-                                        Value="@_draft.Ado.AreaPath"
-                                        ValueChanged="OnAreaPathChanged"
-                                        Root="State.AreaTree"
-                                        Note="@AreaNote" />
+                        @if (State.IsLoadingAreaTree)
+                        {
+                            <span class="hint"><span class="spinner"></span> Reading the area tree…</span>
+                        }
+                        else
+                        {
+                            <AreaPathPicker Id="scope-area"
+                                            Value="@_draft.Ado.AreaPath"
+                                            ValueChanged="OnAreaPathChanged"
+                                            Root="State.AreaTree"
+                                            Note="@AreaNote" />
+                        }
+                        @if (State.AreaTree is null && !State.IsLoadingAreaTree)
+                        {
+                            @* A typed path has to be project-qualified to match anything, so
+                               getting the tree back matters more than accepting free text. *@
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">
+                                    <div>The area list could not be read, so this is a plain box.</div>
+                                    @if (State.AreaTreeError is { } why)
+                                    {
+                                        <div class="muted" style="font-size: 11.5px">@why</div>
+                                    }
+                                    <button class="btn btn-sm" style="margin-top: 8px"
+                                            @onclick="() => State.EnsureAreaTreeAsync(force: true)">Try again</button>
+                                </div>
+                            </div>
+                        }
                         <span class="hint">
                             Everything beneath the area counts, so a top-level area takes in all of
                             its sub-areas. Leave it empty for the whole project.
@@ -824,8 +848,7 @@
     /// <summary>Told to the picker when the tree could not be read, so it explains itself.</summary>
     private string AreaNote =>
         State.AreaTree is not null ? ""
-        : string.IsNullOrWhiteSpace(_draft.Ado.Project) ? "Pick a project first to browse its areas."
-        : "The area list could not be read. Type the path in by hand.";
+        : "Start with the project name, then each level, separated by backslashes.";
 
     private void ToggleExcludedState(string state)
     {

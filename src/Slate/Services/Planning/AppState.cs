@@ -1063,25 +1063,76 @@ public sealed class AppState(
     public AreaNode? AreaTree { get; private set; }
 
     /// <summary>
-    /// Loads the project's area tree if it is not already in hand, for the pickers that need
-    /// it outside the new work item form. Quiet on failure: the picker falls back to a plain
-    /// text box, which is better than an error over a settings page.
+    /// Flips the "only my work items" filter and re-runs the query.
+    ///
+    /// It has to be a refetch rather than a filter over what is loaded: with it on, other
+    /// people's items were never asked for, so there is nothing local to reveal - and asking
+    /// for everyone's up front would run into the 500-row cap, which would then hide some of
+    /// your own behind other people's.
     /// </summary>
-    public async Task EnsureAreaTreeAsync()
+    public async Task SetOnlyMineAsync(bool onlyMine)
     {
-        if (AreaTree is not null) return;
+        if (Settings.Ado.OnlyMine == onlyMine) return;
 
+        var draft = settingsStore.CreateDraft();
+        draft.Ado.OnlyMine = onlyMine;
+        settingsStore.Save(draft);
+
+        Changed?.Invoke();
+        await LoadWorkItemsAsync();
+    }
+
+    /// <summary>Why the area tree could not be read, for a picker that has to explain itself.</summary>
+    public string? AreaTreeError { get; private set; }
+
+    public bool IsLoadingAreaTree { get; private set; }
+
+    /// <summary>The project the tree in hand belongs to, so switching project reloads it.</summary>
+    private string _areaTreeProject = "";
+
+    /// <summary>
+    /// Loads the project's area tree for the pickers that need it.
+    ///
+    /// Reloads when the project changes and retries after a failure, neither of which the
+    /// first version did - so a tree that failed to arrive once stayed missing for the rest
+    /// of the session and the picker silently became a text box. Typing a path by hand is a
+    /// poor substitute: an area has to be project-qualified to match anything, and nothing
+    /// on screen says so.
+    /// </summary>
+    public async Task EnsureAreaTreeAsync(bool force = false)
+    {
         var project = Settings.Ado.Project;
-        if (string.IsNullOrWhiteSpace(project) || !Settings.IsAdoConfigured) return;
+        if (string.IsNullOrWhiteSpace(project) || !Settings.IsAdoConfigured)
+        {
+            AreaTreeError = string.IsNullOrWhiteSpace(project)
+                ? "Pick a project first to browse its areas."
+                : "Connect to Azure DevOps first to browse areas.";
+            return;
+        }
+
+        if (!force && AreaTree is not null && _areaTreeProject == project) return;
+        if (IsLoadingAreaTree) return;
+
+        IsLoadingAreaTree = true;
+        AreaTreeError = null;
+        Changed?.Invoke();
 
         try
         {
             AreaTree = await ado.GetAreaTreeAsync(project);
-            Changed?.Invoke();
+            _areaTreeProject = project;
+            AreaTreeError = AreaTree is null ? "Azure DevOps returned no areas for this project." : null;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             AreaTree = null;
+            _areaTreeProject = "";
+            AreaTreeError = ex.Message;
+        }
+        finally
+        {
+            IsLoadingAreaTree = false;
+            Changed?.Invoke();
         }
     }
 

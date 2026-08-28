@@ -28,6 +28,14 @@
             <input class="input" placeholder="Filter…" value="@State.Search" @oninput="OnSearch" />
         </div>
 
+        @* The same setting the Settings page holds, put where the list is actually read. *@
+        <label class="switch" title="Off shows everything in the chosen area, not just your own">
+            <input type="checkbox" checked="@State.Settings.Ado.OnlyMine"
+                   @onchange="e => State.SetOnlyMineAsync(e.Value is true)" />
+            <span class="track"></span>
+            <span class="label">Only mine</span>
+        </label>
+
         <label class="switch">
             <input type="checkbox" checked="@State.HideFullyAllocated" @onchange="OnHideToggled" />
             <span class="track"></span>
