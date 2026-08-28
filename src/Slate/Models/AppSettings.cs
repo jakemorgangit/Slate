@@ -4,7 +4,12 @@ namespace Slate.Models;
 
 public enum AdoAuthMode { Pat, Entra }
 public enum ThemeMode { Dark, Light, System }
-public enum WorkItemScope { AssignedToMe, AreaPath, SavedQuery, CustomWiql }
+/// <summary>
+/// Where the work item list comes from. <see cref="AssignedToMe"/> is the one Slate builds
+/// itself, from an optional area and an optional assignment filter; the member keeps its
+/// original name because it is what already sits in everybody's settings file.
+/// </summary>
+public enum WorkItemScope { AssignedToMe, SavedQuery, CustomWiql }
 
 /// <summary>How text typed into the app is turned into the HTML Azure DevOps stores.</summary>
 public enum TextFormat { PlainText, Markdown, Html }
@@ -118,14 +123,15 @@ public sealed class AdoSettings
     public string CustomWiql { get; set; } = "";
 
     /// <summary>
-    /// The area path to list work from, for <see cref="WorkItemScope.AreaPath"/>. Everything
-    /// beneath it counts too, so picking a top-level area takes in all of its sub-areas.
+    /// The area to list work from. Everything beneath it counts, so a top-level area takes in
+    /// all of its sub-areas; empty means the whole project.
     /// </summary>
     public string AreaPath { get; set; } = "";
 
     /// <summary>
-    /// Narrow an area to just your own work. On by default, because your own list is what
-    /// most people want most days; turning it off shows everything the team has in that area.
+    /// Narrow the list to your own work. On by default - together with an empty area path
+    /// that is exactly the "assigned to me" list this used to be, which is why an existing
+    /// settings file needs no migrating.
     /// </summary>
     public bool OnlyMine { get; set; } = true;
 

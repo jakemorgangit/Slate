@@ -71,8 +71,7 @@ with Windows DPAPI under your user account, so nobody else on the machine can re
 
 Optionally choose a **project**; leaving it blank queries across everything you can see.
 
-Then choose which work items appear: *assigned to me* (with finished states filtered out), *an
-area of the project*, a
+Then choose which work items appear: **area and assignment** (with finished states filtered out), a
 **saved query** from your Queries hub, or your own **WIQL**.
 
 ### 3. Outlook, via an Entra ID app registration
@@ -256,15 +255,27 @@ task, so time can be recorded against it.
 
 The block stays put either way. Turn the offer off in Settings, or from the notice itself.
 
-## Working from an area, not just your own list
+## Which work items
 
-**An area of the project** lists work from an area path rather than from your own assignments.
-Everything beneath the area you pick counts, so choosing a top-level area takes in all of its
-sub-areas; leave it empty for the whole project.
+The default source, **Area and assignment**, is two independent choices rather than one list:
 
-**Only work items assigned to me** sits underneath it, on by default. Turn it off to see everything
-the team has in that area — useful for picking up someone else's work, or planning around it. The
-same *hide these states* filter applies either way, so finished work stays out of the list.
+- **Area** — where the work lives. Everything beneath the area counts, so a top-level area takes in
+  all of its sub-areas. Leave it empty for the whole project.
+- **Only work items assigned to me** — whose it is. On by default.
+
+Left alone, that is exactly the *assigned to me* list it has always been, which is why upgrading
+changes nothing. Set an area to plan around a team's work; turn the toggle off to see everything in
+that area rather than only your own.
+
+With no area *and* no assignment filter you are asking for the whole project. Azure DevOps returns
+the first 500 matches, so the list can be cut short without saying so — Settings warns when that
+combination is selected.
+
+**A saved query** and **Custom WIQL** are deliberately left alone by both controls. A saved query is
+run by id, so there is no query text to amend, and narrowing either one afterwards would mean
+filtering an already-capped result set: it would look authoritative while quietly missing anything
+past the cap. To limit a saved query to your own work, edit or clone it in Azure DevOps, where the
+definition belongs.
 
 ## Your hours
 

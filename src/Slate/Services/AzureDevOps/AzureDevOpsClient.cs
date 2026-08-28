@@ -228,19 +228,21 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     }
 
     /// <summary>
-    /// The query behind the two scopes this app writes itself: your own work, and an area of
-    /// the project. An area takes everything beneath it, so a top-level pick includes its
-    /// sub-areas, and "only mine" narrows that to your own without changing the area.
+    /// The query Slate builds for itself, from two independent choices: which area the work
+    /// lives in, and whether to narrow it to your own. An area takes everything beneath it,
+    /// so a top-level pick includes its sub-areas; no area at all means the whole project.
+    ///
+    /// The saved query and custom WIQL scopes never come through here - those belong to
+    /// whoever wrote them, and Slate does not rewrite them.
     /// </summary>
     public static string BuildScopeWiql(AdoSettings ado)
     {
         var clauses = new List<string>();
 
-        if (ado.Scope == WorkItemScope.AreaPath && !string.IsNullOrWhiteSpace(ado.AreaPath))
+        if (!string.IsNullOrWhiteSpace(ado.AreaPath))
             clauses.Add($"[System.AreaPath] UNDER {Quote(ado.AreaPath)}");
 
-        // Assignment is the whole of the "assigned to me" scope, and optional on an area.
-        if (ado.Scope != WorkItemScope.AreaPath || ado.OnlyMine)
+        if (ado.OnlyMine)
             clauses.Add("[System.AssignedTo] = @Me");
 
         if (ado.ExcludedStates.Count > 0)

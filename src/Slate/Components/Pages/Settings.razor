@@ -251,9 +251,7 @@
                     <label>Source</label>
                     <div class="row wrap">
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.AssignedToMe ? "on" : "")"
-                                @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.AssignedToMe)">Assigned to me</button>
-                        <button class="chip @(_draft.Ado.Scope == WorkItemScope.AreaPath ? "on" : "")"
-                                @onclick="ChooseAreaScopeAsync">An area of the project</button>
+                                @onclick="ChooseBuiltScopeAsync">Area and assignment</button>
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.SavedQuery ? "on" : "")"
                                 @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.SavedQuery)">A saved query</button>
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.CustomWiql ? "on" : "")"
@@ -261,18 +259,21 @@
                     </div>
                 </div>
 
-                @if (_draft.Ado.Scope == WorkItemScope.AreaPath)
+                @* Two independent choices - where the work lives, and whose it is - rather
+                   than two overlapping sources. Left alone they are the "assigned to me"
+                   list this has always produced. *@
+                @if (_draft.Ado.Scope == WorkItemScope.AssignedToMe)
                 {
                     <div class="field">
-                        <label for="scope-area">Area path</label>
+                        <label for="scope-area">Area</label>
                         <AreaPathPicker Id="scope-area"
                                         Value="@_draft.Ado.AreaPath"
                                         ValueChanged="OnAreaPathChanged"
                                         Root="State.AreaTree"
                                         Note="@AreaNote" />
                         <span class="hint">
-                            Everything beneath the area you pick counts too, so a top-level area takes
-                            in all of its sub-areas. Leave it empty for the whole project.
+                            Everything beneath the area counts, so a top-level area takes in all of
+                            its sub-areas. Leave it empty for the whole project.
                         </span>
                     </div>
 
@@ -283,12 +284,21 @@
                         <span class="label">Only work items assigned to me</span>
                     </label>
                     <span class="hint">
-                        Turn this off to see everything the team has in that area, not just your own.
+                        Turn this off to see everything in that area, not just your own.
                     </span>
-                }
 
-                @if (_draft.Ado.Scope is WorkItemScope.AssignedToMe or WorkItemScope.AreaPath)
-                {
+                    @if (!_draft.Ado.OnlyMine && string.IsNullOrWhiteSpace(_draft.Ado.AreaPath))
+                    {
+                        <div class="banner warn">
+                            <span>!</span>
+                            <div class="grow">
+                                With no area and no assignment filter this asks for every work item in
+                                the project. Azure DevOps returns the first 500, so the list may be cut
+                                short without saying so - narrow it by area, or hide more states below.
+                            </div>
+                        </div>
+                    }
+
                     <div class="field">
                         <label>Hide these states</label>
                         <div class="row wrap">
@@ -301,6 +311,7 @@
                         <span class="hint">Work already finished does not need any more of your time.</span>
                     </div>
                 }
+
                 @if (_draft.Ado.Scope == WorkItemScope.SavedQuery)
                 {
                     <div class="field">
@@ -741,6 +752,16 @@
         Store.Changed += OnSettingsChangedElsewhere;
     }
 
+    /// <summary>
+    /// Fetches the area tree once the page is up, so the picker is a picker rather than a
+    /// text box for anyone who arrives already on the scope that uses it.
+    /// </summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        if (_draft.Ado.Scope == WorkItemScope.AssignedToMe) await State.EnsureAreaTreeAsync();
+    }
+
     private void OnChanged() => InvokeAsync(StateHasChanged);
 
     private void OnSettingsChangedElsewhere() => InvokeAsync(() =>
@@ -789,12 +810,12 @@
         int.TryParse(e.Value?.ToString(), out var parsed) ? Math.Clamp(parsed, min, max) : fallback;
 
     /// <summary>
-    /// Switches to the area scope and fetches the tree behind the picker. Loading it here
-    /// rather than on page load keeps a request off everyone who never opens this.
+    /// Switches to the scope Slate builds and fetches the tree behind the area picker. Doing
+    /// it here rather than on page load keeps a request off everyone who never opens this.
     /// </summary>
-    private async Task ChooseAreaScopeAsync()
+    private async Task ChooseBuiltScopeAsync()
     {
-        Set(() => _draft.Ado.Scope = WorkItemScope.AreaPath);
+        Set(() => _draft.Ado.Scope = WorkItemScope.AssignedToMe);
         await State.EnsureAreaTreeAsync();
     }
 
