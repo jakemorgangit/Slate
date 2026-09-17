@@ -192,12 +192,13 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
         var url = $"{BaseUrl}{scope}" +
                   $"?startDateTime={Instant(localStart)}" +
                   $"&endDateTime={Instant(localEnd)}" +
-                  "&$select=id,subject,start,end,showAs,isAllDay,lastModifiedDateTime" +
+                  "&$select=id,subject,start,end,showAs,isAllDay,isOrganizer,lastModifiedDateTime" +
                   "&$orderby=start/dateTime&$top=250" +
                   $"&$expand=singleValueExtendedProperties($filter=id eq '{Uri.EscapeDataString(AllocationPropertyId)}'" +
                   $" or id eq '{Uri.EscapeDataString(PayloadPropertyId)}')";
 
         var events = new List<ExistingEvent>();
+        var cal = settings.Current.Calendar;
 
         // Paging is followed rather than truncated: an event missing from a short page reads
         // to the reconciler as one deleted in Outlook, which would flag good blocks as lost.
@@ -213,20 +214,30 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
 
                 var allocationId = ReadAllocationId(e);
                 var payload = ReadNamedProperty(e, PayloadPropertyId);
+                var subject = e.TryGetProperty("subject", out var s) ? s.GetString() ?? "(no subject)" : "(no subject)";
+
+                // The marker counts on its own: an event can arrive without its stamp, and one
+                // whose subject says it is Slate's and names a work item is managed as Slate's.
+                // Only on events of our own, though - a subject is anyone's to write, and a
+                // meeting somebody else organised is not ours to move whatever it is called.
+                var ours = !e.TryGetProperty("isOrganizer", out var org)
+                           || org.ValueKind != JsonValueKind.False;
+                var marked = ours ? MarkedSubject.Read(subject, cal.SubjectTemplate, cal.Marker) : null;
 
                 events.Add(new ExistingEvent(
                     e.GetProperty("id").GetString()!,
-                    e.TryGetProperty("subject", out var s) ? s.GetString() ?? "(no subject)" : "(no subject)",
+                    subject,
                     start,
                     end,
                     e.TryGetProperty("showAs", out var sa) ? sa.GetString() ?? "busy" : "busy",
                     e.TryGetProperty("isAllDay", out var ad) && ad.GetBoolean(),
-                    allocationId is not null || payload is not null,
+                    allocationId is not null || payload is not null || marked is not null,
                     allocationId,
                     payload,
                     e.TryGetProperty("lastModifiedDateTime", out var lm) &&
                     DateTimeOffset.TryParse(lm.GetString(), CultureInfo.InvariantCulture,
-                        DateTimeStyles.RoundtripKind, out var modified) ? modified : null));
+                        DateTimeStyles.RoundtripKind, out var modified) ? modified : null,
+                    marked));
             }
 
             url = doc.RootElement.TryGetProperty("@odata.nextLink", out var next)

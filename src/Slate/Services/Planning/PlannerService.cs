@@ -393,7 +393,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
         foreach (var e in events)
         {
-            if (e.Payload is null || e.IsAllDay) continue;
+            if ((e.Payload is null && e.Marked is null) || e.IsAllDay) continue;
 
             // An event deleted here but not yet sent, or one deliberately unlinked, would
             // otherwise walk straight back in on the next refresh.
@@ -403,7 +403,16 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             if (claimed.Contains(e.Id)) continue;
 
             var minutes = (int)Math.Round((e.End - e.Start).TotalMinutes);
+            // The stamp is the fuller record when it came through; the subject is the fallback,
+            // for an event that says it is Slate's without the stamp to say what it was.
             var rebuilt = Graph.AllocationPayload.Read(e.Payload, e.Id, e.Start, minutes);
+            if (rebuilt is null && minutes > 0 && e.Marked?.ToAllocation(e.Id, e.Start, minutes) is { } fromSubject)
+            {
+                // Keeps the stamped id when that much came through, so two-way sync still
+                // matches the block to its event instead of calling it missing.
+                if (e.AllocationId is Guid stampedId) fromSubject.Id = stampedId;
+                rebuilt = fromSubject;
+            }
             if (rebuilt is null || known.Contains(rebuilt.Id)) continue;
 
             adopted.Add(rebuilt);
