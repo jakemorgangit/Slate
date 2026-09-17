@@ -192,7 +192,7 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
         var url = $"{BaseUrl}{scope}" +
                   $"?startDateTime={Instant(localStart)}" +
                   $"&endDateTime={Instant(localEnd)}" +
-                  "&$select=id,subject,start,end,showAs,isAllDay,lastModifiedDateTime" +
+                  "&$select=id,subject,start,end,showAs,isAllDay,isOrganizer,lastModifiedDateTime" +
                   "&$orderby=start/dateTime&$top=250" +
                   $"&$expand=singleValueExtendedProperties($filter=id eq '{Uri.EscapeDataString(AllocationPropertyId)}'" +
                   $" or id eq '{Uri.EscapeDataString(PayloadPropertyId)}')";
@@ -218,7 +218,11 @@ public sealed class GraphCalendarClient(SettingsStore settings, MsalAuthService 
 
                 // The marker counts on its own: an event can arrive without its stamp, and one
                 // whose subject says it is Slate's and names a work item is managed as Slate's.
-                var marked = MarkedSubject.Read(subject, cal.SubjectTemplate, cal.Marker);
+                // Only on events of our own, though - a subject is anyone's to write, and a
+                // meeting somebody else organised is not ours to move whatever it is called.
+                var ours = !e.TryGetProperty("isOrganizer", out var org)
+                           || org.ValueKind != JsonValueKind.False;
+                var marked = ours ? MarkedSubject.Read(subject, cal.SubjectTemplate, cal.Marker) : null;
 
                 events.Add(new ExistingEvent(
                     e.GetProperty("id").GetString()!,

@@ -311,7 +311,9 @@ a block's identity lives: every event Slate writes carries enough of the block s
 event itself for any copy of the app to rebuild it. Events also get a **marker** in their subject
 (`-Slate-` by default, configurable in Settings), and the marker counts on its own: any event whose
 subject carries it — this machine's marker or the default `-Slate-` — along with a work item number
-(`#123`) is treated as Slate's, even if the stamp does not come through with it.
+(`#123`) is treated as Slate's, even if the stamp does not come through with it. That goes for
+events you organised only; a meeting someone else sent you stays in the background whatever its
+subject says.
 
 A block picked up from its subject alone knows the work item and the time, and fills in the rest
 when the work item loads from Azure DevOps. Moving or resizing it updates the event's time, but it
