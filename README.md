@@ -309,8 +309,13 @@ the work item's estimate.
 Your plan file stays on the machine that wrote it. Your calendar does not, so the calendar is where
 a block's identity lives: every event Slate writes carries enough of the block stamped onto the
 event itself for any copy of the app to rebuild it. Events also get a **marker** in their subject
-(`-Slate-` by default, configurable in Settings), which is a label for your own eyes in Outlook —
-recognition does not depend on it, so the two machines need not agree on what it says.
+(`-Slate-` by default, configurable in Settings), and the marker counts on its own: any event whose
+subject carries it — this machine's marker or the default `-Slate-` — along with a work item number
+(`#123`) is treated as Slate's, even if the stamp does not come through with it.
+
+A block picked up from its subject alone knows the work item and the time, and fills in the rest
+when the work item loads from Azure DevOps. Moving or resizing it updates the event's time, but it
+never rewrites the event's subject or notes, since the full text is only on the event.
 
 Open Slate on another machine signed in to the same calendar, with **two-way sync** on, and it
 picks those blocks up — they appear on the grid and can be moved, resized, re-synced or deleted

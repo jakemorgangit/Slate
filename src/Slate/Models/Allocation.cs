@@ -114,7 +114,8 @@ public sealed record ExistingEvent(
     bool IsFromThisApp,
     Guid? AllocationId,
     string? Payload,
-    DateTimeOffset? LastModified)
+    DateTimeOffset? LastModified,
+    Services.Graph.MarkedSubject? Marked = null)
 {
     /// <summary>True when this event should block planning on top of it.</summary>
     public bool BlocksTime => !IsFromThisApp && !IsAllDay && ShowAs is not "free";

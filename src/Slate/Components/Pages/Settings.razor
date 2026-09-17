@@ -405,10 +405,10 @@
                            value="@_draft.Calendar.Marker"
                            @onchange="e => Set(() => _draft.Calendar.Marker = Text(e))" />
                     <span class="hint">
-                        Added to the end of every subject this app writes, so its blocks are easy to
-                        pick out in Outlook. It is a label, not the identity: what another machine
-                        recognises is stamped on the event itself, so blocks planned on one turn up
-                        on the other whatever this says.
+                        Added to the end of every subject this app writes. Any event whose subject
+                        carries it (or the default <code>-Slate-</code>) and a work item number is
+                        treated as Slate's, so blocks planned on one machine can be moved, resized
+                        and deleted from another.
                     </span>
                 </div>
 
