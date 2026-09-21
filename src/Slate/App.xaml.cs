@@ -1,6 +1,6 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Windows;
-using System.Windows.Interop;
-using System.Windows.Media;
 using System.Windows.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -20,12 +20,7 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
-        // WPF's own drawing is done in software. Everything on screen comes from the WebView2,
-        // which has its own window and its own GPU process, so the shell only ever paints a
-        // background - but on the GPU its render thread dies with UCEERR_RENDERTHREADFAILURE
-        // whenever the display driver resets (sleep and resume, docking, a monitor coming or
-        // going, Remote Desktop), and that takes the app down with it.
-        RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
+        _restartedAfterRenderFailure = e.Args.Contains(RestartedFlag);
 
         base.OnStartup(e);
 
@@ -79,12 +74,78 @@ public partial class App : Application
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         CrashLog.Write(e.Exception);
+
+        if (IsRenderThreadFailure(e.Exception) && TryRestartAfterRenderFailure())
+        {
+            e.Handled = true;
+            return;
+        }
+
         MessageBox.Show(
             $"Something went wrong:\n\n{e.Exception.Message}\n\nDetails were written to:\n{CrashLog.Path}",
             "Slate",
             MessageBoxButton.OK,
             MessageBoxImage.Error);
         e.Handled = true;
+    }
+
+    // ---------------------------------------------------------------- render thread failure
+
+    /// <summary>
+    /// UCEERR_RENDERTHREADFAILURE. WPF's render thread has lost the graphics device - the
+    /// display driver reset under it on sleep and resume, docking, a monitor coming or going,
+    /// or Remote Desktop - and the window it was drawing does not come back from that.
+    /// </summary>
+    private const int RenderThreadFailure = unchecked((int)0x88980406);
+
+    /// <summary>Passed to the copy started in our place, so it knows not to do the same.</summary>
+    private const string RestartedFlag = "--restarted-after-render-failure";
+
+    /// <summary>
+    /// A copy that was itself started by a restart and fails again this soon is failing for
+    /// some other reason than a one-off reset, and restarting it again would only loop.
+    /// </summary>
+    private static readonly TimeSpan RestartGrace = TimeSpan.FromMinutes(2);
+
+    private readonly DateTime _startedAt = DateTime.UtcNow;
+    private bool _restartedAfterRenderFailure;
+    private bool _restarting;
+
+    private static bool IsRenderThreadFailure(Exception? ex)
+    {
+        for (; ex is not null; ex = ex.InnerException)
+            if (ex is COMException { HResult: RenderThreadFailure }) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Replaces this copy with a fresh one rather than leaving a dead window behind an error
+    /// box. Nothing is lost: settings and the plan are written to disk as they change, and
+    /// unsent calendar edits are part of the plan. False when a restart is not safe to try.
+    /// </summary>
+    private bool TryRestartAfterRenderFailure()
+    {
+        // The failure is raised for each window message that touches the lost device, so
+        // several can arrive before the shutdown below takes effect.
+        if (_restarting) return true;
+
+        if (_restartedAfterRenderFailure && DateTime.UtcNow - _startedAt < RestartGrace) return false;
+        if (Environment.ProcessPath is not { Length: > 0 } exe || !File.Exists(exe)) return false;
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(exe, RestartedFlag) { UseShellExecute = false });
+        }
+        catch (Exception ex)
+        {
+            CrashLog.Write(ex);
+            return false;
+        }
+
+        _restarting = true;
+        CrashLog.WriteLine("Restarted after the display driver reset under the window.");
+        Shutdown();
+        return true;
     }
 }
 
