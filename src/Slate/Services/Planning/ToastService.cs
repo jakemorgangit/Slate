@@ -24,19 +24,21 @@ public sealed class ToastService
     public void Info(string title, string? detail = null) => Push(ToastLevel.Info, title, detail);
     public void Success(string title, string? detail = null) => Push(ToastLevel.Success, title, detail);
     public void Warning(string title, string? detail = null) => Push(ToastLevel.Warning, title, detail);
-    public void Error(string title, string? detail = null) => Push(ToastLevel.Error, title, detail);
+    /// <summary>Returns the toast's id, so whatever raised it can take it back once the problem clears.</summary>
+    public Guid Error(string title, string? detail = null) => Push(ToastLevel.Error, title, detail);
 
-    private void Push(ToastLevel level, string title, string? detail)
+    private Guid Push(ToastLevel level, string title, string? detail)
     {
         var toast = new Toast(Guid.NewGuid(), level, title, detail);
         lock (_gate) _toasts.Add(toast);
         Changed?.Invoke();
 
         // Errors stay until dismissed; everything else clears itself.
-        if (level == ToastLevel.Error) return;
+        if (level == ToastLevel.Error) return toast.Id;
 
         _ = Task.Delay(TimeSpan.FromSeconds(level == ToastLevel.Warning ? 8 : 4))
             .ContinueWith(_ => Dismiss(toast.Id), TaskScheduler.Default);
+        return toast.Id;
     }
 
     public void Dismiss(Guid id)

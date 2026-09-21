@@ -17,6 +17,13 @@ public sealed class AzureDevOpsException(string message, Exception? inner = null
     /// Callers branch on this rather than on the wording of the message.
     /// </summary>
     public HttpStatusCode? Status { get; init; }
+
+    /// <summary>
+    /// The request never got a real answer - the network, TLS, a proxy or VPN not up yet, a
+    /// timeout, or the service saying it is busy - so the same call may well work shortly.
+    /// Nothing is wrong with the credential or the configuration.
+    /// </summary>
+    public bool IsTransient { get; init; }
 }
 
 /// <summary>
@@ -64,14 +71,28 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
 
     // ---------------------------------------------------------------- transport
 
-    private async Task<HttpRequestMessage> BuildRequestAsync(HttpMethod method, string url, CancellationToken ct)
+    private async Task<HttpRequestMessage> BuildRequestAsync(
+        HttpMethod method, string url, CancellationToken ct, bool freshToken = false)
     {
         var request = new HttpRequestMessage(method, url);
         var ado = settings.Current.Ado;
 
         if (ado.AuthMode == AdoAuthMode.Entra)
         {
-            var token = await auth.GetAdoTokenAsync(ct);
+            string token;
+            try
+            {
+                token = await auth.GetAdoTokenAsync(ct, forceRefresh: freshToken);
+            }
+            catch (Exception ex) when (MsalAuthService.IsNetworkFailure(ex))
+            {
+                // Renewing the token needs the network too; not reaching it says nothing
+                // about whether the saved sign-in is still good.
+                request.Dispose();
+                throw new AzureDevOpsException($"Could not reach Microsoft to renew the sign-in. {ex.Message}", ex)
+                { IsTransient = true };
+            }
+
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         }
         else
@@ -90,31 +111,60 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     private async Task<JsonDocument> SendAsync(
         HttpMethod method, string url, object? body, CancellationToken ct, string? contentType = null)
     {
-        using var request = await BuildRequestAsync(method, url, ct);
-        if (body is not null)
-        {
-            request.Content = JsonContent.Create(body, options: Json);
-            if (contentType is not null)
-                request.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType) { CharSet = "utf-8" };
-        }
+        // A 401 on a signed-in account usually means the cached token went stale while the
+        // machine slept. One silent renewal is tried before calling the credential bad.
+        var canRenew = settings.Current.Ado.AuthMode == AdoAuthMode.Entra;
 
-        HttpResponseMessage response;
-        try
+        for (var renewed = false; ; renewed = true)
         {
-            response = await Http.SendAsync(request, ct);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new AzureDevOpsException($"Could not reach {OrgUrl}. {ex.Message}", ex);
-        }
+            using var request = await BuildRequestAsync(method, url, ct, freshToken: renewed);
+            if (body is not null)
+            {
+                request.Content = JsonContent.Create(body, options: Json);
+                if (contentType is not null)
+                    request.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType) { CharSet = "utf-8" };
+            }
 
+            HttpResponseMessage response;
+            try
+            {
+                response = await Http.SendAsync(request, ct);
+            }
+            catch (HttpRequestException ex)
+            {
+                throw new AzureDevOpsException($"Could not reach {OrgUrl}. {ex.Message}", ex) { IsTransient = true };
+            }
+            catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+            {
+                // HttpClient's own timeout, not the caller cancelling.
+                throw new AzureDevOpsException($"Timed out reaching {OrgUrl}.", ex) { IsTransient = true };
+            }
+
+            if (response.StatusCode == HttpStatusCode.Unauthorized && canRenew && !renewed)
+            {
+                response.Dispose();
+                continue;
+            }
+
+            return await ReadAsync(response, ct);
+        }
+    }
+
+    private static readonly HashSet<HttpStatusCode> BusyStatuses =
+    [
+        HttpStatusCode.RequestTimeout, HttpStatusCode.TooManyRequests, HttpStatusCode.InternalServerError,
+        HttpStatusCode.BadGateway, HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout,
+    ];
+
+    private static async Task<JsonDocument> ReadAsync(HttpResponseMessage response, CancellationToken ct)
+    {
         using (response)
         {
             var payload = await response.Content.ReadAsStringAsync(ct);
 
             if (!response.IsSuccessStatusCode)
                 throw new AzureDevOpsException(DescribeFailure(response, payload))
-                { Status = response.StatusCode };
+                { Status = response.StatusCode, IsTransient = BusyStatuses.Contains(response.StatusCode) };
 
             // A sign-in redirect comes back as 200 plus HTML, which means the credential was rejected.
             if (payload.StartsWith('<'))

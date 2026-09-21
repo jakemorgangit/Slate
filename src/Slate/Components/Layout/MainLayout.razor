@@ -198,13 +198,17 @@
         await ApplyThemeAsync();
         await State.RefreshSignInAsync();
 
+        // Not awaited yet: at launch this may spend a while quietly retrying a network that
+        // is still coming up, and the calendar should not have to wait for it.
+        var workItems = Task.CompletedTask;
         if (State.Settings.IsAdoConfigured)
-            await State.LoadWorkItemsAsync();
+            workItems = State.LoadWorkItemsAsync(atStartup: true);
         else
             Nav.NavigateTo("settings");
 
         if (State.ShowOutlook) await State.LoadEventsAsync();
         State.ConfigurePolling();
+        await workItems;
 
         // Last, and not awaited: whether there is a newer build is the least urgent thing
         // on screen, and a slow or unreachable GitHub must not hold up the first paint.
