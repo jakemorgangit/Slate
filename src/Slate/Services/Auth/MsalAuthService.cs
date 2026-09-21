@@ -121,9 +121,26 @@ public sealed class MsalAuthService(SettingsStore settings, TokenCacheStore cach
 
     public Task<string> GetGraphTokenAsync(CancellationToken ct = default) => GetTokenAsync(GraphScopes, ct);
 
-    public Task<string> GetAdoTokenAsync(CancellationToken ct = default) => GetTokenAsync(AdoScopes, ct);
+    /// <summary>
+    /// A token for Azure DevOps. <paramref name="forceRefresh"/> skips the cached access
+    /// token and renews it from the refresh token, still silently - for when the service has
+    /// just refused the cached one.
+    /// </summary>
+    public Task<string> GetAdoTokenAsync(CancellationToken ct = default, bool forceRefresh = false) =>
+        GetTokenAsync(AdoScopes, ct, forceRefresh);
 
-    private async Task<string> GetTokenAsync(string[] scopes, CancellationToken ct)
+    /// <summary>
+    /// True when getting a token failed for want of a network rather than because the
+    /// sign-in is no good - Microsoft's endpoint unreachable, timing out or busy.
+    /// </summary>
+    public static bool IsNetworkFailure(Exception ex) => ex switch
+    {
+        HttpRequestException => true,
+        MsalException msal => msal.IsRetryable || msal.InnerException is HttpRequestException or TaskCanceledException,
+        _ => false,
+    };
+
+    private async Task<string> GetTokenAsync(string[] scopes, CancellationToken ct, bool forceRefresh = false)
     {
         await _gate.WaitAsync(ct);
         try
@@ -134,7 +151,9 @@ public sealed class MsalAuthService(SettingsStore settings, TokenCacheStore cach
 
             try
             {
-                var silent = await app.AcquireTokenSilent(scopes, account).ExecuteAsync(ct);
+                var silent = await app.AcquireTokenSilent(scopes, account)
+                    .WithForceRefresh(forceRefresh)
+                    .ExecuteAsync(ct);
                 return silent.AccessToken;
             }
             catch (MsalUiRequiredException)

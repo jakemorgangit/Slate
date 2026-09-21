@@ -169,7 +169,23 @@ public sealed class AppState(
         || item.IterationPath.Contains(term, StringComparison.OrdinalIgnoreCase)
         || item.Tags.Any(t => t.Contains(term, StringComparison.OrdinalIgnoreCase));
 
-    public async Task LoadWorkItemsAsync(bool showToast = false)
+    /// <summary>
+    /// How long to wait before each retry of a load that failed for want of a connection.
+    /// At launch the network, VPN or proxy is often still coming up - after a reboot, on
+    /// waking, or on opening a new release - and a saved sign-in deserves the benefit of the
+    /// doubt: about a minute of quiet retrying, looking like an ordinary load, before an
+    /// error is shown. A load someone asked for gets a couple of quick tries instead.
+    /// </summary>
+    private static readonly TimeSpan[] PatientRetries =
+        [TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5),
+         TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(25)];
+
+    private static readonly TimeSpan[] QuickRetries = [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3)];
+
+    /// <summary>The "could not load" toast still on screen, cleared once a load gets through.</summary>
+    private Guid? _workItemErrorToast;
+
+    public async Task LoadWorkItemsAsync(bool showToast = false, bool atStartup = false)
     {
         if (!Settings.IsAdoConfigured)
         {
@@ -189,14 +205,32 @@ public sealed class AppState(
         try
         {
             DropStaleCaches();
-            await EnsureIdentityAsync(cts.Token);
 
-            var items = await ado.GetWorkItemsAsync(cts.Token);
+            var retries = atStartup ? PatientRetries : QuickRetries;
+            List<WorkItem> items;
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    items = await ado.GetWorkItemsAsync(cts.Token);
+                    break;
+                }
+                catch (AzureDevOpsException ex) when (ex.IsTransient && attempt < retries.Length)
+                {
+                    await Task.Delay(retries[attempt], cts.Token);
+                }
+            }
+
             if (cts.IsCancellationRequested) return;
+
+            // After the list rather than before it: this failing is swallowed, so if it ran
+            // first on a network that is not up yet, nobody would ever be told who we are.
+            await EnsureIdentityAsync(cts.Token);
 
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
             planner.RefreshSnapshots(items);
+            ClearWorkItemErrorToast();
 
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
@@ -208,7 +242,8 @@ public sealed class AppState(
         catch (Exception ex)
         {
             WorkItemError = ex.Message;
-            toasts.Error("Could not load work items", ex.Message);
+            ClearWorkItemErrorToast();
+            _workItemErrorToast = toasts.Error("Could not load work items", ex.Message);
         }
         finally
         {
@@ -257,17 +292,26 @@ public sealed class AppState(
         {
             DropStaleCaches();
             var items = await ado.GetWorkItemsAsync(CancellationToken.None);
+            await EnsureIdentityAsync(CancellationToken.None);
 
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
             WorkItemError = null;
             planner.RefreshSnapshots(items);
+            ClearWorkItemErrorToast();
             Changed?.Invoke();
         }
         catch (Exception)
         {
             // A background poll must stay silent; the manual Refresh reports failures.
         }
+    }
+
+    /// <summary>Takes back a "could not load" toast once the problem behind it has gone away.</summary>
+    private void ClearWorkItemErrorToast()
+    {
+        if (_workItemErrorToast is Guid id) toasts.Dismiss(id);
+        _workItemErrorToast = null;
     }
 
     // ---------------------------------------------------------------- week
