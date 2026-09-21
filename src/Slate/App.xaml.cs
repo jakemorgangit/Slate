@@ -1,4 +1,6 @@
 using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -18,6 +20,13 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // WPF's own drawing is done in software. Everything on screen comes from the WebView2,
+        // which has its own window and its own GPU process, so the shell only ever paints a
+        // background - but on the GPU its render thread dies with UCEERR_RENDERTHREADFAILURE
+        // whenever the display driver resets (sleep and resume, docking, a monitor coming or
+        // going, Remote Desktop), and that takes the app down with it.
+        RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
+
         base.OnStartup(e);
 
         var services = new ServiceCollection();
