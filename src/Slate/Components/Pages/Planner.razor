@@ -74,9 +74,15 @@
                     <span>✕</span>
                     <div class="grow">
                         <div>@error</div>
-                        <button class="btn btn-sm" style="margin-top: 8px" @onclick="@(() => Nav.NavigateTo("settings"))">
-                            Open settings
-                        </button>
+                        <div style="display: flex; gap: 8px; margin-top: 8px">
+                            <button class="btn btn-sm btn-primary" disabled="@State.IsLoadingWorkItems"
+                                    @onclick="() => State.LoadWorkItemsAsync(showToast: true)">
+                                Re-check
+                            </button>
+                            <button class="btn btn-sm" @onclick="@(() => Nav.NavigateTo("settings"))">
+                                Open settings
+                            </button>
+                        </div>
                     </div>
                 </div>
             }
