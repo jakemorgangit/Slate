@@ -164,10 +164,7 @@
     private void OnStopAskingChanged(ChangeEventArgs e)
     {
         _stopAsking = e.Value is true or "true" or "on";
-
-        var settings = Settings.Current;
-        settings.Planning.OfferTaskForUntrackable = !_stopAsking;
-        Settings.Save(settings);
+        Settings.Update(s => s.Planning.OfferTaskForUntrackable = !_stopAsking);
     }
 
     private void ShowForm() => _showForm = true;
@@ -181,12 +178,8 @@
     private async Task CreateAsync()
     {
         // Remember the type so the next spawn starts from the same place.
-        var settings = Settings.Current;
-        if (settings.Planning.SpawnedTaskType != TypeName)
-        {
-            settings.Planning.SpawnedTaskType = TypeName;
-            Settings.Save(settings);
-        }
+        if (Settings.Current.Planning.SpawnedTaskType != TypeName)
+            Settings.Update(s => s.Planning.SpawnedTaskType = TypeName);
 
         if (await State.SpawnTaskAsync(_title, _description, TypeName, _hours))
             _primedFor = Guid.Empty;

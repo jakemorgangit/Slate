@@ -367,12 +367,8 @@
 
         try
         {
-            var settings = Settings.Current;
-            if (settings.Planning.ReduceRemainingOnRecord != _reduceRemaining)
-            {
-                settings.Planning.ReduceRemainingOnRecord = _reduceRemaining;
-                Settings.Save(settings);
-            }
+            if (Settings.Current.Planning.ReduceRemainingOnRecord != _reduceRemaining)
+                Settings.Update(s => s.Planning.ReduceRemainingOnRecord = _reduceRemaining);
 
             var okCount = 0;
             var okMinutes = 0;

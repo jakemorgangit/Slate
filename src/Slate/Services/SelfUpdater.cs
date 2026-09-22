@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Windows;
+using Slate.Services.Storage;
 
 namespace Slate.Services;
 
@@ -22,10 +23,13 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
 /// aside to "&lt;name&gt;.old", the download takes its name, and the new copy is started from
 /// the original path - which keeps shortcuts and pins working.
 ///
-/// Every step that can fail before the old copy exits is undone if it does, so the original
-/// path always holds a working Slate. Settings and the plan live in the data folder and are
-/// written as they change, and before any file moves the old copy finishes whatever it was
-/// sending and then writes nothing more, so restarting loses nothing.
+/// Every step that can fail before the old copy exits is undone if it does - including the old
+/// copy being ended from outside, by Windows signing out, while the new one is still starting -
+/// so the original path always holds a working Slate. Settings and the plan live in the data
+/// folder and are written as they change. Before any file moves the old copy finishes whatever
+/// it was writing and refuses anything new, and from the moment it starts the new copy it
+/// writes nothing into the data folder at all unless the update is undone, so restarting
+/// neither loses a change nor writes one over the new copy's.
 /// </summary>
 public sealed class SelfUpdater
 {
@@ -125,7 +129,8 @@ public sealed class SelfUpdater
     /// Downloads, verifies and swaps in <paramref name="release"/>, starts it, and shuts this
     /// copy down once the new one is up. Throws <see cref="SelfUpdateException"/> with
     /// something to tell the user when it cannot, having put everything back as it was, or
-    /// <see cref="OperationCanceledException"/> after <see cref="Cancel"/>.
+    /// <see cref="OperationCanceledException"/> after <see cref="Cancel"/> - or once
+    /// <see cref="SettleBeforeExit"/> has put everything back because this copy is ending.
     /// </summary>
     /// <param name="beforeSwap">
     /// Runs once the download has checked out and before any file moves: brings the rest of
@@ -166,10 +171,14 @@ public sealed class SelfUpdater
 
             if (beforeSwap is not null && !await beforeSwap().ConfigureAwait(false))
                 throw new SelfUpdateException(
-                    "Slate was still sending changes to Azure DevOps or Outlook, and restarting now would have cut them off.");
+                    "Slate was still in the middle of saving a change or signing in, and restarting now would have cut it off.");
 
-            await Task.Run(() => Swap(exe, download, old)).ConfigureAwait(false);
-            await StartAndHandOverAsync(exe, download, old, release.Version).ConfigureAwait(false);
+            // Both on a pool thread, whichever thread got this far: they block while holding
+            // the handover lock, and the window's own thread has to stay free to answer
+            // Windows - which, when signing out, waits on that same lock (SettleBeforeExit).
+            var handover = new Handover(exe, download, old, release.Version);
+            await Task.Run(() => SwapIn(handover)).ConfigureAwait(false);
+            await Task.Run(() => StartAndWaitForNewCopyAsync(handover)).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -193,6 +202,14 @@ public sealed class SelfUpdater
             // and a source with no timer holds nothing that needs releasing.
             _cancel = null;
         }
+
+        // Out here, past the catch above: with the new copy up, nothing that happens from
+        // now on may put the old one back or let this copy write again.
+        CrashLog.WriteLine($"Updating from {AppInfo.Version} to {release.Version}; handing over to the new copy.");
+
+        // Queued rather than waited for: the window's thread may already be on its way out -
+        // Windows signing out is one way to arrive here - and there is nothing to wait for.
+        _ = Application.Current?.Dispatcher.InvokeAsync(() => Application.Current?.Shutdown());
     }
 
     public void Cancel()
@@ -362,6 +379,52 @@ public sealed class SelfUpdater
     // ---------------------------------------------------------------- swap
 
     /// <summary>
+    /// An update whose files have been swapped but which has not yet either handed over to the
+    /// new copy or been put back. Held under <see cref="HandoverLock"/> from the moment the
+    /// .exe changes until one of those happens, so whichever gets there first - the new copy
+    /// saying it is up, the wait for it giving up, or this copy being ended from outside - is
+    /// the only one that acts on it.
+    /// </summary>
+    private sealed class Handover(string exe, string download, string old, string version)
+    {
+        public string Exe { get; } = exe;
+        public string Download { get; } = download;
+        public string Old { get; } = old;
+        public string Version { get; } = version;
+
+        /// <summary>The new copy, once it has been started.</summary>
+        public Process? Child { get; set; }
+
+        /// <summary>What the new copy sets once its window is up.</summary>
+        public EventWaitHandle? Ready { get; set; }
+
+        public HandoverOutcome Outcome { get; set; }
+
+        /// <summary>Why it was put back from outside the wait, when it was.</summary>
+        public string? Interruption { get; set; }
+    }
+
+    private enum HandoverOutcome { Pending, HandedOver, RolledBack }
+
+    /// <summary>Guards <see cref="_unconfirmed"/> and every step that swaps, starts or puts back.</summary>
+    private static readonly Lock HandoverLock = new();
+
+    private static Handover? _unconfirmed;
+
+    /// <summary>
+    /// Swaps the files and registers the handover in one hold of the lock, so there is no
+    /// instant at which the new .exe is in place with nothing on record to put the old one back.
+    /// </summary>
+    private static void SwapIn(Handover handover)
+    {
+        lock (HandoverLock)
+        {
+            Swap(handover.Exe, handover.Download, handover.Old);
+            _unconfirmed = handover;
+        }
+    }
+
+    /// <summary>
     /// Running .exe to .old, download to the .exe's name. If the second rename fails the
     /// first is undone straight away, before any retry, so the original path is only ever
     /// empty for the moment between two renames - never while waiting out whatever is
@@ -503,71 +566,181 @@ public sealed class SelfUpdater
     // ---------------------------------------------------------------- restart
 
     /// <summary>
-    /// Starts the new copy and waits for it to say its window is up before leaving. If it
-    /// cannot start, or exits first - a slim build whose runtime is missing does exactly
-    /// that - the old copy is put back and keeps running.
+    /// Starts the new copy and waits for it to say its window is up. If it cannot start, exits
+    /// first - a slim build whose runtime is missing does exactly that - or never gets as far
+    /// as its window, it is stopped and the old copy is put back and keeps running.
+    ///
+    /// Every look at how the new copy is doing, and whatever is done about it, happens under
+    /// <see cref="HandoverLock"/>, so it can never cross with <see cref="SettleBeforeExit"/>
+    /// deciding the same thing on the window's thread.
     /// </summary>
-    private async Task StartAndHandOverAsync(string exe, string download, string old, string version)
+    private static async Task StartAndWaitForNewCopyAsync(Handover handover)
     {
         var token = Guid.NewGuid();
         using var ready = new EventWaitHandle(false, EventResetMode.ManualReset, ReadyEventName(token));
 
-        Process? process;
-        try
+        Process process;
+        lock (HandoverLock)
         {
-            var start = new ProcessStartInfo(exe) { UseShellExecute = false };
-            start.ArgumentList.Add(UpdatedFromFlag);
-            start.ArgumentList.Add(AppInfo.Version);
-            start.ArgumentList.Add(ReadyFlag);
-            start.ArgumentList.Add(token.ToString("N"));
-            process = Process.Start(start);
-        }
-        catch (Exception ex)
-        {
-            Restore(exe, old, download);
-            throw new SelfUpdateException("The new version could not be started, so Slate put the old one back.", ex);
-        }
+            // Windows may have begun signing out while the files were being swapped, in which
+            // case they are back where they were and there is nothing left to start.
+            if (handover.Outcome != HandoverOutcome.Pending) throw Interrupted(handover);
 
-        using (process)
-        {
-            var deadline = DateTime.UtcNow + StartupGrace;
-            while (!ready.WaitOne(0))
+            // From here until this copy exits or takes back over, the data folder is the new
+            // copy's: it reads the plan and the settings as it starts, and anything written
+            // here afterwards would never reach it, or would land on top of its own.
+            DataFolder.Freeze();
+
+            try
             {
-                if (process is null || process.HasExited)
-                {
-                    var code = process?.ExitCode;
-                    await Task.Run(() => Restore(exe, old, download));
-                    throw new SelfUpdateException(
-                        $"Slate {version} closed as soon as it started{(code is { } c ? $" (exit code {c})" : "")}, so Slate put the old version back.");
-                }
-
-                if (DateTime.UtcNow > deadline)
-                {
-                    // Alive but never got as far as its window: stuck on a dialog of its own,
-                    // such as a slim build asking for a .NET runtime this machine lacks. It is
-                    // the copy this one just started, so it is safe to stop.
-                    try
-                    {
-                        process.Kill(entireProcessTree: true);
-                        await Task.Run(() => process.WaitForExit(10_000));
-                    }
-                    catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
-                    {
-                        CrashLog.WriteLine($"Could not stop Slate {version} after it failed to start: {ex}");
-                    }
-
-                    await Task.Run(() => Restore(exe, old, download));
-                    throw new SelfUpdateException(
-                        $"Slate {version} did not finish starting within {StartupGrace.TotalSeconds:0} seconds, so Slate put the old version back.");
-                }
-
-                await Task.Delay(250);
+                var start = new ProcessStartInfo(handover.Exe) { UseShellExecute = false };
+                start.ArgumentList.Add(UpdatedFromFlag);
+                start.ArgumentList.Add(AppInfo.Version);
+                start.ArgumentList.Add(ReadyFlag);
+                start.ArgumentList.Add(token.ToString("N"));
+                process = Process.Start(start) ?? throw new InvalidOperationException("Windows did not start it.");
+                handover.Child = process;
+                handover.Ready = ready;
+            }
+            catch (Exception ex)
+            {
+                RollBack(handover);
+                throw new SelfUpdateException("The new version could not be started, so Slate put the old one back.", ex);
             }
         }
 
-        CrashLog.WriteLine($"Updating from {AppInfo.Version} to {version}; handing over to the new copy.");
-        Application.Current?.Dispatcher.Invoke(() => Application.Current.Shutdown());
+        // Disposed only after the finally below has settled the handover, so nothing else can
+        // be looking at the process by then: SettleBeforeExit only acts on one still pending.
+        using var owned = process;
+        try
+        {
+            var deadline = DateTime.UtcNow + StartupGrace;
+            while (true)
+            {
+                lock (HandoverLock)
+                {
+                    switch (handover.Outcome)
+                    {
+                        case HandoverOutcome.HandedOver: return;
+                        case HandoverOutcome.RolledBack: throw Interrupted(handover);
+                    }
+
+                    if (ready.WaitOne(0))
+                    {
+                        HandOver(handover);
+                        return;
+                    }
+
+                    if (process.HasExited)
+                    {
+                        var code = process.ExitCode;
+                        RollBack(handover);
+                        throw new SelfUpdateException(
+                            $"Slate {handover.Version} closed as soon as it started (exit code {code}), so Slate put the old version back.");
+                    }
+
+                    if (DateTime.UtcNow > deadline)
+                    {
+                        // Alive but never got as far as its window: stuck on a dialog of its
+                        // own, such as a slim build asking for a .NET runtime this machine
+                        // lacks. RollBack stops it - it is the copy this one just started.
+                        RollBack(handover);
+                        throw new SelfUpdateException(
+                            $"Slate {handover.Version} did not finish starting within {StartupGrace.TotalSeconds:0} seconds, so Slate put the old version back.");
+                    }
+                }
+
+                await Task.Delay(250).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            // Leaving the wait any other way - an exception nobody expected - is a failed start
+            // like the rest, and must not leave the new copy in place with nothing watching it.
+            lock (HandoverLock)
+            {
+                if (handover.Outcome == HandoverOutcome.Pending) RollBack(handover);
+            }
+        }
     }
+
+    /// <summary>
+    /// Settles an update that is still waiting on its new copy before this copy ends by some
+    /// other road than the handover's own: Windows signing out or shutting down, the app being
+    /// shut down, or a crash. Every one of them ends the process whatever the window says -
+    /// signing out calls Shutdown, which ignores a refused close - and ending with the new
+    /// .exe in Slate's place and the old one only as .old leaves nothing to put it back if the
+    /// new one never starts. So before returning, the new copy is stopped and the old one put
+    /// back, unless it has already said it is up, in which case the update simply stands.
+    /// </summary>
+    public static void SettleBeforeExit(string why)
+    {
+        lock (HandoverLock)
+        {
+            if (_unconfirmed is not { } handover) return;
+
+            if (handover.Ready?.WaitOne(0) == true)
+            {
+                CrashLog.WriteLine($"{why} as Slate {handover.Version} finished starting, so the update stands.");
+                HandOver(handover);
+                return;
+            }
+
+            CrashLog.WriteLine($"{why} before Slate {handover.Version} had started, so the update was undone.");
+            handover.Interruption = why;
+            RollBack(handover);
+        }
+    }
+
+    /// <summary>The new copy is up: the update stands. Only called under <see cref="HandoverLock"/>.</summary>
+    private static void HandOver(Handover handover)
+    {
+        handover.Outcome = HandoverOutcome.HandedOver;
+        _unconfirmed = null;
+    }
+
+    /// <summary>
+    /// Stops the new copy if it was started and is still running, puts the old .exe back, and
+    /// lets this copy write to the data folder again - in that order, since until the new copy
+    /// is gone the folder is still its. Only called under <see cref="HandoverLock"/>.
+    /// </summary>
+    private static void RollBack(Handover handover)
+    {
+        try
+        {
+            if (handover.Child is { HasExited: false } child)
+            {
+                child.Kill(entireProcessTree: true);
+                if (!child.WaitForExit(10_000))
+                    CrashLog.WriteLine($"Slate {handover.Version} was still exiting 10 seconds after being stopped.");
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            CrashLog.WriteLine($"Could not stop Slate {handover.Version} after it failed to start: {ex}");
+        }
+
+        try
+        {
+            Restore(handover.Exe, handover.Old, handover.Download);
+        }
+        finally
+        {
+            handover.Outcome = HandoverOutcome.RolledBack;
+            _unconfirmed = null;
+
+            // Even if the new copy could not be confirmed gone: a folder left frozen would
+            // quietly keep every change made from here on off the disk.
+            DataFolder.Thaw();
+        }
+    }
+
+    /// <summary>
+    /// A cancellation rather than a failure: this copy is on its way out, and the failure path
+    /// would open the release page in a browser while Windows is signing out.
+    /// </summary>
+    private static OperationCanceledException Interrupted(Handover handover) =>
+        new($"{handover.Interruption ?? "Slate was closing"} before Slate {handover.Version} had started, so Slate put the old version back.");
 
     private static string ReadyEventName(Guid token) => $@"Local\Slate.UpdateReady.{token:N}";
 

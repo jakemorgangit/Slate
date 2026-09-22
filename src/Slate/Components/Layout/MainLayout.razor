@@ -183,8 +183,8 @@
                 <span class="boot-spinner"></span>
                 <h2 id="handover-title">Installing Slate @Updates.Available?.Version</h2>
                 <p class="muted">
-                    Anything already on its way to Azure DevOps or Outlook finishes first.
-                    Slate will restart by itself.
+                    Anything already on its way to Azure DevOps, Outlook or your plan finishes
+                    first. Slate will restart by itself.
                 </p>
             </div>
         </div>
@@ -324,14 +324,14 @@
 
     private async Task ToggleThemeAsync()
     {
-        var settings = Settings.Current;
-        settings.Ui.Theme = settings.Ui.Theme switch
+        // Update rather than editing the live settings and saving them: while an update takes
+        // over the save is refused, and Update refuses before anything has changed.
+        Settings.Update(settings => settings.Ui.Theme = settings.Ui.Theme switch
         {
             ThemeMode.Dark => ThemeMode.Light,
             ThemeMode.Light => ThemeMode.System,
             _ => ThemeMode.Dark,
-        };
-        Settings.Save(settings);
+        });
         await ApplyThemeAsync();
     }
 
@@ -339,6 +339,7 @@
 
     private void OnSettingsChanged() => InvokeAsync(async () =>
     {
+        State.CheckConnection();
         await ApplyThemeAsync();
         State.ConfigurePolling();
         StateHasChanged();

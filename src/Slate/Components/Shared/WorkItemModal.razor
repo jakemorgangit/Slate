@@ -760,11 +760,14 @@
         if (await State.SaveDescriptionAsync(html)) _editingDescription = false;
     }
 
-    /// <summary>In-app only: this is never written back to Azure DevOps.</summary>
+    /// <summary>
+    /// In-app only: this is never written back to Azure DevOps. It is still written to the
+    /// plan, so it is counted like any other edit and refused while an update takes over.
+    /// </summary>
     private void SetLocalPriority(int priority)
     {
         if (State.DetailWorkItemId is not int id) return;
-        State.Planner.SetLocalPriority(id, priority);
+        State.TryEdit(() => State.Planner.SetLocalPriority(id, priority));
     }
 
     private void OpenInAdo()

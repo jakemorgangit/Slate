@@ -494,18 +494,23 @@ than an error.
 **Install and restart** downloads the same flavour you are running (standalone or slim) into the
 folder the `.exe` lives in, with progress in the bar and a Cancel button; the app stays usable
 meanwhile. The download is only used if its SHA-256 matches the checksum GitHub published for the
-file, and only if it came from this repository's releases over HTTPS. Anything already on its way
-to Azure DevOps or Outlook is then allowed to finish, and from there until the restart the app
-holds still: nothing more can be changed, and the window will not close. The running `.exe` is
-renamed to `<name>.old`, the new one takes its name — so shortcuts and pins keep working — and the
-new version starts; the old one closes once the new window is up, and the `.old` file is removed.
+file, and only if it came from this repository's releases over HTTPS. Anything already under way —
+time being recorded, a sync to Outlook, a change to a work item, an edit to the plan or the
+settings, a sign-in — is then allowed to finish, and from there until the restart the app holds
+still: nothing more can be changed, and the window will not close. The running `.exe` is renamed
+to `<name>.old`, the new one takes its name — so shortcuts and pins keep working — and the new
+version starts. From that moment the old copy writes nothing more to the data folder, so the two
+never write over each other; it closes once the new window is up, and the `.old` file is removed.
 Settings and the plan live in the data folder, so nothing is lost across the restart.
 
-If anything gets in the way — something is still being sent after 30 seconds, the folder cannot be
-written to, the file is locked, the checksum does not match, or the new version fails to start —
-the old `.exe` is put back where it was, the app keeps running, and the release page opens so you
-can download it by hand. A build made with plain `dotnet build` does not know which flavour it is,
-so it only ever offers the link.
+If anything gets in the way — something is still under way after 30 seconds, the folder cannot be
+written to, the file is locked, the checksum does not match, or the new version closes or has not
+shown its window within 90 seconds — the new version is stopped, the old `.exe` is put back where
+it was, the app carries on exactly as before, and the release page opens so you can download it by
+hand. If you sign out or shut down while the new version is still starting, it is stopped and the
+old `.exe` put back before Windows is allowed to carry on, so the old version is the one that opens
+next time. A build made with plain `dotnet build` does not know which flavour it is, so it only
+ever offers the link.
 
 ## Carrying your setup around
 

@@ -41,6 +41,7 @@ public partial class App : Application
         });
 
         // Storage + settings
+        services.AddSingleton<WriteGate>();
         services.AddSingleton<SecretProtector>();
         services.AddSingleton<SettingsStore>();
         services.AddSingleton<PlanStore>();
@@ -66,12 +67,40 @@ public partial class App : Application
 
         DispatcherUnhandledException += OnDispatcherUnhandledException;
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
             CrashLog.Write(args.ExceptionObject as Exception);
+            SelfUpdater.SettleBeforeExit("Slate crashed");
+        };
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => SelfUpdater.SettleBeforeExit("Slate was exiting");
         TaskScheduler.UnobservedTaskException += (_, args) =>
         {
             CrashLog.Write(args.Exception);
             args.SetObserved();
         };
+    }
+
+    // ---------------------------------------------------------------- ending mid-update
+
+    /// <summary>
+    /// Signing out or shutting down ends this copy whatever the window says: WPF shuts down
+    /// straight after this returns, ignoring a refused close, and Windows may end the process
+    /// the moment it has answered. An update still waiting on its new copy is settled here and
+    /// now, before answering, rather than on the way out when there may be no time left.
+    /// </summary>
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        SelfUpdater.SettleBeforeExit($"Windows began {(e.ReasonSessionEnding == ReasonSessionEnding.Shutdown ? "shutting down" : "signing out")}");
+        base.OnSessionEnding(e);
+    }
+
+    /// <summary>
+    /// Any other shutdown that reaches this copy while an update waits on its new one - the
+    /// handover's own comes after it has settled, and so finds nothing to do.
+    /// </summary>
+    protected override void OnExit(ExitEventArgs e)
+    {
+        SelfUpdater.SettleBeforeExit("Slate was shut down");
+        base.OnExit(e);
     }
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)

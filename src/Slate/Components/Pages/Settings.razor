@@ -778,12 +778,17 @@
 
     /// <summary>
     /// Fetches the area tree once the page is up, so the picker is a picker rather than a
-    /// text box for anyone who arrives already on the scope that uses it.
+    /// text box for anyone who arrives already on the scope that uses it - and again whenever
+    /// a change of connection made here has dropped the old one's tree. That leaves no tree and
+    /// no error, which is not the same as a tree that could not be read, and should not be
+    /// reported as one.
     /// </summary>
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (!firstRender) return;
-        if (_draft.Ado.Scope == WorkItemScope.AssignedToMe) await State.EnsureAreaTreeAsync();
+        if (_draft.Ado.Scope != WorkItemScope.AssignedToMe) return;
+
+        if (firstRender || State.AreaTree is null && State.AreaTreeError is null && !State.IsLoadingAreaTree)
+            await State.EnsureAreaTreeAsync();
     }
 
     private void OnChanged() => InvokeAsync(StateHasChanged);
@@ -1020,7 +1025,15 @@
             // an already-signed-in user back through the account picker.
             if (!State.SignIn.IsSignedIn)
             {
-                await Auth.SignInAsync();
+                // Counted like any other write, since it writes the sign-in cache: an update
+                // waits for it rather than restarting with the sign-in half done and lost.
+                if (!await State.TryWriteAsync(() => Auth.SignInAsync()))
+                {
+                    _connectResult = AppState.RestartingForUpdate;
+                    Toasts.Error("Could not sign in", AppState.RestartingForUpdate);
+                    return;
+                }
+
                 await State.RefreshSignInAsync();
             }
 
@@ -1088,7 +1101,13 @@
 
     private async Task SignOutAsync()
     {
-        await Auth.SignOutAsync();
+        // Counted for the same reason as signing in: it clears the sign-in cache.
+        if (!await State.TryWriteAsync(Auth.SignOutAsync))
+        {
+            Toasts.Error("Could not sign out", AppState.RestartingForUpdate);
+            return;
+        }
+
         await State.RefreshSignInAsync();
         _calendars = [];
 
