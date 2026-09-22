@@ -1,0 +1,366 @@
+@using System.Globalization
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Settings
+@inject PlannerService Plan
+@inject ToastService Toasts
+
+@* Records a whole day's blocks in one pass instead of one "Record time…" dialog per block.
+   Every row still goes through AppState.RecordTimeSilentAsync - the exact write, time entry
+   and note handling the single-block dialog uses - so the only thing this adds is the list,
+   the per-row hours and the batching around it. *@
+@if (State.RecordDayFor is { } day)
+{
+    <div class="modal-scrim" @onclick="Cancel">
+        <div class="modal record-day-modal" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span style="color: var(--danger); margin-top: 3px"><ClockIcon Size="18" /></span>
+                <div class="grow">
+                    <h2>Record @Ui.RelativeDay(day).ToLowerInvariant()</h2>
+                    <div class="sub">
+                        <span>@day.ToString("dddd d MMMM")</span>
+                        <span>·</span>
+                        <span>@_rows.Count block@(_rows.Count == 1 ? "" : "s")</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close" @onclick="Cancel">✕</button>
+            </div>
+
+            <div class="modal-body">
+                @if (_rows.Count == 0)
+                {
+                    <div class="empty-state" style="padding: 24px 12px">
+                        <span class="glyph"><ClockIcon Size="28" /></span>
+                        <p>Nothing is on the calendar for this day.</p>
+                    </div>
+                }
+                else
+                {
+                    <div class="table-wrap">
+                        <table class="data record-day-table">
+                            @* Fixed layout, with the columns sized here rather than left to
+                               content: an unconstrained title or a wide status message would
+                               otherwise be free to push the table - and this modal - wider
+                               than the dialog is meant to be. *@
+                            <colgroup>
+                                <col style="width: 30px" />
+                                <col />
+                                <col style="width: 110px" />
+                                <col style="width: 76px" />
+                                <col style="width: 92px" />
+                                <col style="width: 120px" />
+                            </colgroup>
+                            <thead>
+                                <tr>
+                                    <th class="no-sort"></th>
+                                    <th class="no-sort">Work item</th>
+                                    <th class="no-sort">When</th>
+                                    <th class="no-sort cell-num">Recorded</th>
+                                    <th class="no-sort cell-num">Hours</th>
+                                    <th class="no-sort">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var row in _rows)
+                                {
+                                    var disabled = !row.TracksTime || row.Status == RowStatus.Recorded || _saving;
+                                    <tr @key="row.AllocationId" class="@(row.Status == RowStatus.Failed ? "row-failed" : "")">
+                                        <td>
+                                            <input type="checkbox" checked="@row.Selected" disabled="@disabled"
+                                                   title="@(row.TracksTime ? "" : "This work item type does not track time")"
+                                                   @onchange="e => OnRowSelected(row, e)" />
+                                        </td>
+                                        <td>
+                                            <button class="link-cell" title="Open this work item"
+                                                    @onclick="() => State.ShowWorkItemAsync(row.WorkItemId)">
+                                                <span class="dot" style="background: @Ui.ColorFor(row.WorkItemType)"></span>
+                                                <span class="mono muted">#@row.WorkItemId</span>
+                                                <span class="truncate">@row.WorkItemTitle</span>
+                                            </button>
+                                        </td>
+                                        <td class="cell-num" style="text-align: left">
+                                            @Ui.TimeRange(row.Start, row.End)
+                                            <div class="muted" style="font-size: 11px">@Ui.Duration(row.DurationMinutes)</div>
+                                        </td>
+                                        <td class="cell-num">
+                                            @(row.RecordedMinutes > 0 ? Ui.Duration(row.RecordedMinutes) : "—")
+                                        </td>
+                                        <td class="cell-num">
+                                            <input class="input" type="number" step="0.25" min="0" max="24"
+                                                   style="width: 100%; text-align: right"
+                                                   value="@row.Hours.ToString("0.##", CultureInfo.InvariantCulture)"
+                                                   disabled="@disabled"
+                                                   @onchange="e => OnRowHoursChanged(row, e)" />
+                                        </td>
+                                        <td>
+                                            @switch (row.Status)
+                                            {
+                                                case RowStatus.Recording:
+                                                    <span class="spinner"></span>
+                                                    break;
+                                                case RowStatus.Recorded:
+                                                    <span class="muted">Recorded</span>
+                                                    break;
+                                                case RowStatus.Failed:
+                                                    <span style="color: var(--danger); font-size: 11.5px" title="@row.Error">Failed - retry?</span>
+                                                    break;
+                                                default:
+                                                    @if (!row.TracksTime)
+                                                    {
+                                                        <span class="muted" style="font-size: 11.5px">Doesn't track time</span>
+                                                    }
+                                                    break;
+                                            }
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <label class="switch">
+                        <input type="checkbox" checked="@_reduceRemaining" @onchange="OnReduceChanged" />
+                        <span class="track"></span>
+                        <span class="label">Take the same off Remaining Work</span>
+                    </label>
+
+                    <div class="field">
+                        <label for="day-note">Note <span class="muted">(optional, shared by every block below)</span></label>
+                        <div class="row">
+                            <span class="hint">Posted to each work item's discussion.</span>
+                            <span style="flex: 1"></span>
+                            <FormatPicker Value="NoteFormat" ValueChanged="OnNoteFormatChanged" />
+                        </div>
+                        <textarea id="day-note" class="textarea" rows="2"
+                                  placeholder="What did today go on?"
+                                  value="@_note" @onchange="OnNoteChanged"></textarea>
+                        <span class="hint">Left empty, nothing is posted. @NoteHint</span>
+                    </div>
+                }
+            </div>
+
+            <div class="modal-foot">
+                <span class="muted" style="font-size: 11.5px">
+                    @(SelectedCount > 0 ? $"{Ui.Hours(SelectedMinutes)} across {SelectedCount} block(s)." : "Nothing selected.")
+                </span>
+                <span style="flex: 1"></span>
+                <button class="btn" @onclick="Cancel">@(_rows.Any(r => r.Status == RowStatus.Recorded) ? "Done" : "Cancel")</button>
+                <button class="btn btn-primary" disabled="@(_saving || SelectedCount == 0)" @onclick="SaveAsync">
+                    @if (_saving)
+                    {
+                        <span class="spinner on-accent"></span>
+                        <span>Recording…</span>
+                    }
+                    else
+                    {
+                        <span>Record @Ui.Hours(SelectedMinutes)</span>
+                    }
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private enum RowStatus { Pending, Recording, Recorded, Failed }
+
+    /// <summary>One row of the day being recorded. Mutated in place as rows are booked, so a
+    /// partial failure only ever needs a retry of what is left rather than a rebuild.</summary>
+    private sealed class RowVm
+    {
+        public required Guid AllocationId { get; init; }
+        public required int WorkItemId { get; init; }
+        public required string WorkItemTitle { get; init; } = "";
+        public required string WorkItemType { get; init; } = "";
+        public required DateTime Start { get; init; }
+        public required DateTime End { get; init; }
+        public required int DurationMinutes { get; init; }
+        public required int RecordedMinutes { get; init; }
+        public required bool TracksTime { get; init; }
+
+        public bool Selected { get; set; }
+        public double Hours { get; set; }
+        public RowStatus Status { get; set; } = RowStatus.Pending;
+        public string? Error { get; set; }
+    }
+
+    private List<RowVm> _rows = [];
+    private DateTime? _openedFor;
+    private bool _reduceRemaining = true;
+    private string _note = "";
+    private bool _saving;
+
+    private int SelectedCount => _rows.Count(r => r.Selected);
+    private int SelectedMinutes => (int)Math.Round(_rows.Where(r => r.Selected).Sum(r => r.Hours) * 60);
+
+    /// <summary>Shared with the single-block dialog's note box, so it reads the same way.</summary>
+    private TextFormat NoteFormat
+    {
+        get => Settings.Current.Ui.CommentFormat;
+        set => Settings.Update(s => s.Ui.CommentFormat = value);
+    }
+
+    private string NoteHint => NoteFormat switch
+    {
+        TextFormat.Markdown => "Markdown: **bold**, `code`, - lists, [links](url) and tables.",
+        TextFormat.Html => "Passed through as markup. Scripts and event handlers are stripped.",
+        _ => "Exactly what you type; line breaks are kept.",
+    };
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    protected override void OnParametersSet() => Prime();
+
+    /// <summary>Builds the row list once per day the dialog opens for, not on every re-render -
+    /// a full rebuild on every <see cref="AppState.Changed"/> would throw away hours someone
+    /// just edited, or a row's in-flight recording status.</summary>
+    private void Prime()
+    {
+        if (State.RecordDayFor is not { } day) return;
+        if (_openedFor == day) return;
+
+        _openedFor = day;
+        _rows = [.. Plan.ForDay(day).OrderBy(a => a.Start).Select(BuildRow)];
+        _reduceRemaining = Settings.Current.Planning.ReduceRemainingOnRecord;
+        _note = "";
+        _saving = false;
+    }
+
+    private RowVm BuildRow(Allocation a)
+    {
+        var tracksTime = State.WorkItems.FirstOrDefault(i => i.Id == a.WorkItemId)?.TracksTime ?? false;
+
+        // Mirrors the banner in the single-block dialog: time recorded elsewhere only
+        // still matters until this machine has booked something of its own.
+        var recordedHere = Plan.RecordedMinutesForBlock(a.Id);
+        var recorded = recordedHere > 0 ? recordedHere : recordedHere + a.RecordedElsewhereMinutes;
+        var remainder = Math.Max(0, a.DurationMinutes - recorded);
+
+        return new RowVm
+        {
+            AllocationId = a.Id,
+            WorkItemId = a.WorkItemId,
+            WorkItemTitle = a.WorkItemTitle,
+            WorkItemType = a.WorkItemType,
+            Start = a.Start,
+            End = a.End,
+            DurationMinutes = a.DurationMinutes,
+            RecordedMinutes = recorded,
+            TracksTime = tracksTime,
+            Selected = tracksTime && remainder > 0,
+            Hours = Math.Round(remainder / 60.0, 2),
+        };
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        Prime();
+        StateHasChanged();
+    });
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    private void OnRowSelected(RowVm row, ChangeEventArgs e) =>
+        row.Selected = e.Value is true or "true" or "on";
+
+    private void OnRowHoursChanged(RowVm row, ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            row.Hours = Math.Clamp(Math.Round(parsed, 2), 0, 24);
+    }
+
+    private void OnReduceChanged(ChangeEventArgs e) =>
+        _reduceRemaining = e.Value is true or "true" or "on";
+
+    private void OnNoteChanged(ChangeEventArgs e) => _note = e.Value?.ToString() ?? "";
+
+    private void OnNoteFormatChanged(TextFormat format) => NoteFormat = format;
+
+    private void Cancel()
+    {
+        _openedFor = null;
+        State.CancelRecordDay();
+    }
+
+    /// <summary>
+    /// Books every selected, not-yet-recorded row in turn through the same write the
+    /// single-block dialog uses. A row that fails is left ticked and marked so pressing
+    /// Record again retries just that one - the rows that already went through are not
+    /// touched a second time.
+    /// </summary>
+    private async Task SaveAsync()
+    {
+        var toRecord = _rows.Where(r => r.Selected && r.Status != RowStatus.Recorded && r.Hours > 0).ToList();
+        if (_saving || toRecord.Count == 0) return;
+
+        _saving = true;
+        try
+        {
+            var settings = Settings.Current;
+            if (settings.Planning.ReduceRemainingOnRecord != _reduceRemaining)
+            {
+                settings.Planning.ReduceRemainingOnRecord = _reduceRemaining;
+                Settings.Save(settings);
+            }
+
+            var okCount = 0;
+            var okMinutes = 0;
+            var failCount = 0;
+
+            foreach (var row in toRecord)
+            {
+                row.Status = RowStatus.Recording;
+                row.Error = null;
+                StateHasChanged();
+
+                var allocation = Plan.Find(row.AllocationId);
+                if (allocation is null)
+                {
+                    row.Status = RowStatus.Failed;
+                    row.Error = "This block has since been removed from the plan.";
+                    failCount++;
+                    StateHasChanged();
+                    continue;
+                }
+
+                var (success, error) = await State.RecordTimeSilentAsync(
+                    allocation, row.Hours, _reduceRemaining, _note, NoteFormat);
+
+                if (success)
+                {
+                    row.Status = RowStatus.Recorded;
+                    row.Selected = false;
+                    okCount++;
+                    okMinutes += (int)Math.Round(row.Hours * 60);
+                }
+                else
+                {
+                    row.Status = RowStatus.Failed;
+                    row.Error = error;
+                    failCount++;
+                }
+
+                StateHasChanged();
+            }
+
+            if (failCount == 0)
+                Toasts.Success($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)");
+            else if (okCount == 0)
+                Toasts.Error($"Could not record {failCount} block(s)", "Fix whatever they need below and try again.");
+            else
+                Toasts.Warning($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)",
+                    $"{failCount} did not go through - fix them below and try again.");
+
+            // Only closes once nothing is left to retry, so a partial failure stays on
+            // screen rather than making you find those blocks again from the calendar.
+            if (failCount == 0) Cancel();
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+}

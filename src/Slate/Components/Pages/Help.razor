@@ -186,6 +186,15 @@
                         length of the block. Saving writes to Azure DevOps: <em>Completed Work</em> goes up and,
                         unless you turn it off, <em>Remaining Work</em> comes down by the same amount.</dd>
 
+                    <dt>Booking a whole day</dt>
+                    <dd>Click the hours in a day's column header, the <strong>Record today</strong> button in the
+                        toolbar, or press <span class="kbd">Ctrl</span><span class="kbd">R</span> to open every
+                        block for that day in one dialog. Each row keeps its own editable hours - defaulting to
+                        whatever of the block is not already recorded - and a tick to leave it out. One optional
+                        note is shared by every row you record. Rows are booked one at a time through the same
+                        write as the single-block dialog, so a row that fails stays ticked with the reason and a
+                        second press of <strong>Record</strong> only retries those.</dd>
+
                     <dt>Moving it on</dt>
                     <dd>The dialog also offers the work item's <strong>status</strong>, so finishing
                         something and saying so is one step. It leaves the state alone unless you pick
@@ -496,6 +505,7 @@
         (["T"], "Jump back to this week"),
         (["R"], "Reload work items from Azure DevOps"),
         (["Ctrl", "S"], "Send everything pending to Outlook"),
+        (["Ctrl", "R"], "Record today's blocks (Advanced mode)"),
         (["Del"], "Delete the selected block"),
         (["Esc"], "Close a menu or window, or cancel a drag in progress"),
         (["/"], "Jump to the work item filter"),
