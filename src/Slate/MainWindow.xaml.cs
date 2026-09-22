@@ -13,9 +13,11 @@ public partial class MainWindow : Window
         BlazorView.Services = App.Services;
         SourceInitialized += (_, _) => ApplyDarkTitleBar();
 
-        // Closing between the two renames of an update would leave no Slate.exe behind.
-        // The swap takes a moment, so the close is simply refused until it is done.
-        Closing += (_, e) => e.Cancel |= SelfUpdater.IsSwapping;
+        // Closing between the two renames of an update would leave no Slate.exe behind, and
+        // closing before the new copy is up would leave nothing to put the old one back if
+        // the new one fails. Both are over within the update's own time limit, and the
+        // update bar says Slate is restarting by itself, so the close is simply refused.
+        Closing += (_, e) => e.Cancel |= SelfUpdater.IsSwapping || SelfUpdater.IsHandingOver;
     }
 
     /// <summary>

@@ -24,7 +24,8 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
 ///
 /// Every step that can fail before the old copy exits is undone if it does, so the original
 /// path always holds a working Slate. Settings and the plan live in the data folder and are
-/// written as they change, so restarting loses nothing.
+/// written as they change, and before any file moves the old copy finishes whatever it was
+/// sending and then writes nothing more, so restarting loses nothing.
 /// </summary>
 public sealed class SelfUpdater
 {
@@ -126,7 +127,12 @@ public sealed class SelfUpdater
     /// something to tell the user when it cannot, having put everything back as it was, or
     /// <see cref="OperationCanceledException"/> after <see cref="Cancel"/>.
     /// </summary>
-    public async Task InstallAsync(ReleaseInfo release)
+    /// <param name="beforeSwap">
+    /// Runs once the download has checked out and before any file moves: brings the rest of
+    /// the app to a standstill, so nothing is cut off halfway by the shutdown at the end or
+    /// written after the new copy has read it. False abandons the install.
+    /// </param>
+    public async Task InstallAsync(ReleaseInfo release, Func<Task<bool>>? beforeSwap = null)
     {
         if (IsBusy) return;
 
@@ -156,6 +162,12 @@ public sealed class SelfUpdater
             await VerifyAsync(download, asset.Sha256, _cancel.Token).ConfigureAwait(false);
 
             SetPhase(UpdatePhase.Installing);
+            _handingOver = true;
+
+            if (beforeSwap is not null && !await beforeSwap().ConfigureAwait(false))
+                throw new SelfUpdateException(
+                    "Slate was still sending changes to Azure DevOps or Outlook, and restarting now would have cut them off.");
+
             await Task.Run(() => Swap(exe, download, old)).ConfigureAwait(false);
             await StartAndHandOverAsync(exe, download, old, release.Version).ConfigureAwait(false);
         }
@@ -164,6 +176,9 @@ public sealed class SelfUpdater
             // Only while something is at the original path: if every way of putting a copy
             // back there failed, the download may be the one working Slate left to recover.
             if (File.Exists(exe)) TryDelete(download);
+
+            // Everything that could be put back has been by now.
+            _handingOver = false;
             SetPhase(UpdatePhase.Idle);
 
             if (ex is OperationCanceledException) throw;
@@ -356,7 +371,7 @@ public sealed class SelfUpdater
     {
         try
         {
-            if (File.Exists(old)) Retry(() => File.Delete(old));
+            if (File.Exists(old)) Retry(() => DeleteFile(old));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -406,6 +421,22 @@ public sealed class SelfUpdater
     /// the original path empty.
     /// </summary>
     public static bool IsSwapping { get; private set; }
+
+    private static volatile bool _handingOver;
+
+    /// <summary>
+    /// True from the moment the install can no longer be cancelled until this copy has either
+    /// put everything back or handed over to the new copy - and after a handover, for the
+    /// rest of its life.
+    ///
+    /// The window refuses to close meanwhile: this copy is what notices a new version that
+    /// cannot start and puts the old one back, so if it goes before the new copy is up
+    /// nothing is left to undo a bad update. A display driver reset does not restart the app
+    /// meanwhile either, which would start a second copy beside the one this update starts
+    /// or puts back. Left set after a handover because the shutdown that follows ignores a
+    /// refused close, and nothing should restart a copy that is on its way out.
+    /// </summary>
+    public static bool IsHandingOver => _handingOver;
 
     /// <summary>
     /// Puts the old .exe back under its own name. <paramref name="displaced"/> is where the new
@@ -545,12 +576,17 @@ public sealed class SelfUpdater
     /// <summary>The version this copy replaced, when it was started by an update and has not said so yet.</summary>
     private static string? _updatedFrom;
     private static Guid? _readyToken;
+    private static bool _cleanupStarted;
     private static bool _cleanupStopped;
 
     /// <summary>
-    /// Reads the flags an update starts the new copy with, and clears away what the last
-    /// update left next to the .exe. Called once, early in startup.
+    /// True in a copy started by an update until it has told the copy that started it that
+    /// it is up. Until then that copy may yet stop this one and put itself back, so this one
+    /// must not start another copy of itself in the meantime.
     /// </summary>
+    public static bool AwaitingReadySignal => _readyToken is not null;
+
+    /// <summary>Reads the flags an update starts the new copy with. Called once, early in startup.</summary>
     public static void OnStartup(string[] args)
     {
         for (var i = 0; i + 1 < args.Length; i++)
@@ -563,13 +599,12 @@ public sealed class SelfUpdater
 
         if (_updatedFrom is not null)
             CrashLog.WriteLine($"Updated from {_updatedFrom} to {AppInfo.Version}.");
-
-        if (ExePath is { } exe) _ = Task.Run(() => CleanUpAfterUpdateAsync(exe));
     }
 
     /// <summary>
-    /// Tells the copy that started this one that it is up, and returns the version it
-    /// replaced - once, so the "updated" note is shown only the first time.
+    /// Called once the window has rendered. Tells the copy that started this one that it is
+    /// up, clears away what the last update left next to the .exe, and returns the version
+    /// this one replaced - once, so the "updated" note is shown only the first time.
     /// </summary>
     public static string? TakeUpdatedFrom()
     {
@@ -585,6 +620,16 @@ public sealed class SelfUpdater
             {
                 // The old copy has already gone its own way; nothing is waiting.
             }
+        }
+
+        // Not at startup: until this copy has shown it can get this far, the .old beside it
+        // may be the only working Slate there is. The copy that started this one puts it
+        // back if this one never renders - and if that copy has died meanwhile, it is what
+        // the user has left to go back to.
+        if (!_cleanupStarted && ExePath is { } exe)
+        {
+            _cleanupStarted = true;
+            _ = Task.Run(() => CleanUpAfterUpdateAsync(exe));
         }
 
         var from = _updatedFrom;
@@ -613,13 +658,29 @@ public sealed class SelfUpdater
     {
         try
         {
-            if (File.Exists(path)) File.Delete(path);
+            DeleteFile(path);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// File.Delete refuses a read-only file, and a .exe copied off a read-only share or disc
+    /// keeps that attribute through the rename to .old. Left alone, that .old could never be
+    /// cleared away and would block every later update, looking like a copy still running.
+    /// </summary>
+    private static void DeleteFile(string path)
+    {
+        if (!File.Exists(path)) return;
+
+        var attributes = File.GetAttributes(path);
+        if (attributes.HasFlag(FileAttributes.ReadOnly))
+            File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+
+        File.Delete(path);
     }
 
     // ---------------------------------------------------------------- progress

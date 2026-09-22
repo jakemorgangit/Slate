@@ -486,6 +486,9 @@ public sealed class AppState(
 
     public async Task LoadEventsAsync()
     {
+        // The copy an update is starting reads the calendar for itself.
+        if (IsHandingOver) return;
+
         AdoptOverlayDefault();
 
         // Fetched whenever the calendar can be reached, not only when the overlay is on.
@@ -517,19 +520,30 @@ public sealed class AppState(
 
             ExistingEvents = events;
 
-            // Adoption is not two-way sync: it is this plan meeting its own blocks for the
-            // first time, and a machine that has never seen them has nothing to reconcile
-            // against. It runs whichever way that setting is turned.
-            var adopted = planner.AdoptOrphanEvents(events);
-            if (adopted > 0)
+            // Both of these write the plan. A handover that began while the calendar was
+            // being read skips them: the new copy may already have read the plan, and would
+            // never see what was written here.
+            if (!TryBeginWrite()) return;
+            try
             {
-                toasts.Info(
-                    adopted == 1 ? "Picked up 1 block from your calendar" : $"Picked up {adopted} blocks from your calendar",
-                    "Planned on another machine. You can move or delete them here as usual.");
-            }
+                // Adoption is not two-way sync: it is this plan meeting its own blocks for the
+                // first time, and a machine that has never seen them has nothing to reconcile
+                // against. It runs whichever way that setting is turned.
+                var adopted = planner.AdoptOrphanEvents(events);
+                if (adopted > 0)
+                {
+                    toasts.Info(
+                        adopted == 1 ? "Picked up 1 block from your calendar" : $"Picked up {adopted} blocks from your calendar",
+                        "Planned on another machine. You can move or delete them here as usual.");
+                }
 
-            if (Settings.Planning.TwoWaySync)
-                ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
+                if (Settings.Planning.TwoWaySync)
+                    ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
+            }
+            finally
+            {
+                EndWrite();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -685,7 +699,7 @@ public sealed class AppState(
     /// </summary>
     public void NudgeAutoSync()
     {
-        if (!AutoSyncOn || !CanUseOutlook) return;
+        if (IsHandingOver || !AutoSyncOn || !CanUseOutlook) return;
         if (IsSyncing || planner.PendingCount == 0) return;
 
         var delay = TimeSpan.FromSeconds(Math.Clamp(Settings.Planning.AutoSyncSeconds, 1, 60));
@@ -704,6 +718,7 @@ public sealed class AppState(
     private async Task AutoSyncNowAsync()
     {
         if (IsSyncing || !CanUseOutlook || planner.PendingCount == 0) return;
+        if (!TryBeginWrite()) return;
 
         IsSyncing = true;
         Changed?.Invoke();
@@ -727,13 +742,14 @@ public sealed class AppState(
         finally
         {
             IsSyncing = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
 
     public async Task SyncAsync()
     {
-        if (IsSyncing) return;
+        if (IsSyncing || IsHandingOver) return;
 
         if (!Settings.IsCalendarConfigured)
         {
@@ -746,6 +762,8 @@ public sealed class AppState(
             toasts.Info("Nothing to send", "Every allocation already matches Outlook.");
             return;
         }
+
+        if (!TryBeginWrite()) return;
 
         IsSyncing = true;
         Changed?.Invoke();
@@ -770,7 +788,27 @@ public sealed class AppState(
         finally
         {
             IsSyncing = false;
+            EndWrite();
             Changed?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// Sends a single block, for the inline "send to Outlook" action. Counted like the full
+    /// sync, because it too creates an event and only then writes down its id. False when it
+    /// did not go; the reason is on the block, unless an update is taking over.
+    /// </summary>
+    public async Task<bool> SyncOneAsync(Guid id)
+    {
+        if (!TryBeginWrite()) return false;
+
+        try
+        {
+            return await planner.SyncOneAsync(id);
+        }
+        finally
+        {
+            EndWrite();
         }
     }
 
@@ -1608,7 +1646,7 @@ public sealed class AppState(
 
     public void BeginRecordTime(Allocation allocation)
     {
-        if (!CanRecordTime) return;
+        if (!CanRecordTime || IsHandingOver) return;
 
         RecordingFor = allocation;
         Changed?.Invoke();
@@ -1628,7 +1666,7 @@ public sealed class AppState(
     /// </summary>
     public void BeginRecordDay(DateTime day)
     {
-        if (!CanRecordTime) return;
+        if (!CanRecordTime || IsHandingOver) return;
         if (RecordingFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
             || PriorityPrompt is not null || Creating is not null || SpawnFor is not null) return;
 
@@ -1663,6 +1701,12 @@ public sealed class AppState(
         Allocation allocation, double hours, bool reduceRemaining,
         string note = "", TextFormat noteFormat = TextFormat.Markdown)
     {
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not record that time", RestartingForUpdate);
+            return false;
+        }
+
         try
         {
             var result = await WriteTimeAsync(allocation, hours, reduceRemaining, note);
@@ -1685,6 +1729,10 @@ public sealed class AppState(
             toasts.Error("Could not record that time", ex.Message);
             return false;
         }
+        finally
+        {
+            EndWrite();
+        }
     }
 
     /// <summary>Blocks a "Record today" pass is booking at this moment.</summary>
@@ -1704,11 +1752,18 @@ public sealed class AppState(
         Allocation allocation, double hours, bool reduceRemaining,
         string note = "", TextFormat noteFormat = TextFormat.Markdown, bool postNote = true)
     {
+        // A row still to come when an update starts taking over is left for the new copy,
+        // which shows it as not yet recorded.
+        if (!TryBeginWrite()) return (false, RestartingForUpdate);
+
         // A pass left running behind a closed dialog can meet another started after the page
         // was left and come back to. The entry for a block only exists once its write is back,
         // so a block still on its way is turned away here rather than booked a second time.
         if (!_recordingBlocks.Add(allocation.Id))
+        {
+            EndWrite();
             return (false, "This block is already being recorded.");
+        }
 
         try
         {
@@ -1726,10 +1781,16 @@ public sealed class AppState(
         finally
         {
             _recordingBlocks.Remove(allocation.Id);
+            EndWrite();
         }
     }
 
-    /// <summary>The write itself: books the hours in Azure DevOps and keeps the local entry for it.</summary>
+    /// <summary>
+    /// The write itself: books the hours in Azure DevOps and keeps the local entry for it.
+    /// Callers count it in with <see cref="TryBeginWrite"/>: a copy that exits between the two
+    /// halves leaves hours booked that the plan knows nothing about, and the next copy offers
+    /// to book them again.
+    /// </summary>
     private async Task<TimeRecordResult> WriteTimeAsync(
         Allocation allocation, double hours, bool reduceRemaining, string note)
     {
@@ -1771,6 +1832,14 @@ public sealed class AppState(
     /// </summary>
     public async Task<bool> UndoTimeEntryAsync(TimeEntry entry)
     {
+        // Counted for the same reason as recording: cut off between the write and dropping
+        // the entry, the entry would survive to be undone a second time.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not undo that time", RestartingForUpdate);
+            return false;
+        }
+
         try
         {
             // Entries written before the applied amounts were recorded fall back to the
@@ -1795,6 +1864,10 @@ public sealed class AppState(
         {
             toasts.Error("Could not undo that time", ex.Message);
             return false;
+        }
+        finally
+        {
+            EndWrite();
         }
     }
 
@@ -1864,6 +1937,13 @@ public sealed class AppState(
     {
         if (SpawnFor is not { } allocation || SpawnParent is not { } parent || IsSpawning) return false;
 
+        // Counted: a task created but never pointed at would be offered, and created, again.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not create that task", RestartingForUpdate);
+            return false;
+        }
+
         IsSpawning = true;
         Changed?.Invoke();
 
@@ -1892,6 +1972,7 @@ public sealed class AppState(
         finally
         {
             IsSpawning = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1909,6 +1990,9 @@ public sealed class AppState(
 
     public void ConfigurePolling()
     {
+        // Stopped for a handover, and only started again if it is abandoned.
+        if (IsHandingOver) return;
+
         // Every edit to the plan arms the debounce. Subscribed here because this is where the
         // rest of the timers are set up, and guarded so repeated calls do not stack handlers.
         if (!_watchingPlan)
@@ -1936,6 +2020,87 @@ public sealed class AppState(
             var period = TimeSpan.FromSeconds(Math.Clamp(seconds, 15, 3600));
             _workItemPoll = new Timer(_ => _ = RefreshWorkItemsQuietlyAsync(), null, period, period);
         }
+    }
+
+    // ---------------------------------------------------------------- handing over to an update
+
+    /// <summary>Why something was refused while an update is taking over.</summary>
+    private const string RestartingForUpdate = "Slate is restarting to install an update.";
+
+    private volatile bool _handingOver;
+    private int _writesInFlight;
+
+    /// <summary>
+    /// True from the moment an update starts putting a new copy in this one's place until
+    /// this copy exits, or the update is abandoned. Nothing new goes to Azure DevOps, Outlook
+    /// or the plan meanwhile: the new copy reads the plan as it starts, so a write made here
+    /// after that is lost to it - and a booking or an event made remotely but not yet written
+    /// down here is one the new copy would make a second time.
+    /// </summary>
+    public bool IsHandingOver => _handingOver;
+
+    /// <summary>
+    /// Counts in a write to Azure DevOps, Outlook or the plan, unless a handover has begun;
+    /// every true must be paired with an <see cref="EndWrite"/>. Counting first and looking at
+    /// the flag second - the mirror image of <see cref="PrepareForHandoverAsync"/> - means a
+    /// write starting at the same instant as a handover is either refused here or waited for
+    /// there, whichever threads the two are on.
+    /// </summary>
+    private bool TryBeginWrite()
+    {
+        Interlocked.Increment(ref _writesInFlight);
+        if (!_handingOver) return true;
+
+        Interlocked.Decrement(ref _writesInFlight);
+        return false;
+    }
+
+    private void EndWrite() => Interlocked.Decrement(ref _writesInFlight);
+
+    /// <summary>
+    /// Brings this copy to a standstill before an update moves any files: the timers stop,
+    /// nothing new may start, and what is already under way is waited for rather than cut
+    /// off by the shutdown at the end of the handover. False when something is still going
+    /// when <paramref name="timeout"/> is up, which abandons the update - an unfinished write
+    /// is exactly what this is here to protect.
+    /// </summary>
+    public async Task<bool> PrepareForHandoverAsync(TimeSpan timeout)
+    {
+        // Seen by every thread before the count below is read; see TryBeginWrite.
+        _handingOver = true;
+        Interlocked.MemoryBarrier();
+
+        _poll?.Dispose();
+        _poll = null;
+        _workItemPoll?.Dispose();
+        _workItemPoll = null;
+        _autoSync?.Dispose();
+        _autoSync = null;
+        Changed?.Invoke();
+
+        var deadline = DateTime.UtcNow + timeout;
+        while (Volatile.Read(ref _writesInFlight) > 0)
+        {
+            if (DateTime.UtcNow > deadline) return false;
+            await Task.Delay(100);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Picks up where <see cref="PrepareForHandoverAsync"/> left off when the update did not
+    /// go ahead, so this copy carries on exactly as before: the timers come back, and any
+    /// edit that was waiting to reach Outlook is sent.
+    /// </summary>
+    public void ResumeAfterFailedHandover()
+    {
+        if (!_handingOver) return;
+
+        _handingOver = false;
+        ConfigurePolling();
+        NudgeAutoSync();
+        Changed?.Invoke();
     }
 
     // ---------------------------------------------------------------- selection
