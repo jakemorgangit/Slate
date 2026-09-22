@@ -43,6 +43,7 @@ public partial class App : Application
         services.AddSingleton<SecretProtector>();
         services.AddSingleton<SettingsStore>();
         services.AddSingleton<PlanStore>();
+        services.AddSingleton<WorkItemsCacheStore>();
         services.AddSingleton<ConfigTransfer>();
 
         // Auth
