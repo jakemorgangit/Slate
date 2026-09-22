@@ -317,6 +317,13 @@ public sealed class AppState(
             ClearWorkItemErrorToast();
             workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
 
+            // Once a session, now that Azure DevOps is known to be answering.
+            if (!_settledUnconfirmed)
+            {
+                _settledUnconfirmed = true;
+                _ = SettleUnconfirmedQuietlyAsync();
+            }
+
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
         }
@@ -1696,15 +1703,18 @@ public sealed class AppState(
     /// the point of this operation and they are already written by then, so a discussion
     /// that will not take the note says so and leaves the booking standing rather than
     /// unwinding a good write over a failed extra.
+    ///
+    /// The dialog is closed only while it is still showing this block: shut and reopened for
+    /// another one while this went through, that one is left open.
     /// </summary>
-    public async Task<bool> RecordTimeAsync(
+    public async Task<TimeWriteOutcome> RecordTimeAsync(
         Allocation allocation, double hours, bool reduceRemaining,
         string note = "", TextFormat noteFormat = TextFormat.Markdown)
     {
-        if (!TryBeginWrite())
+        if (TryClaimBlock(allocation.Id) is { } refused)
         {
-            toasts.Error("Could not record that time", RestartingForUpdate);
-            return false;
+            toasts.Error("Could not record that time", refused);
+            return TimeWriteOutcome.Failed;
         }
 
         try
@@ -1716,27 +1726,33 @@ public sealed class AppState(
                 $"Completed Work is now {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h."
                 + (noted ? " Your note is on the discussion." : ""));
 
-            RecordingFor = null;
+            if (RecordingFor?.Id == allocation.Id) RecordingFor = null;
             Changed?.Invoke();
 
             // Re-read the item in the background. It only refreshes the numbers already
             // shown, so the dialog must not sit on "Saving..." waiting for it.
             _ = RefreshWorkItemAsync(allocation.WorkItemId);
-            return true;
+            return TimeWriteOutcome.Recorded;
+        }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            // An error rather than a warning, so it stays until dismissed: the dialog it came
+            // from may already be shut, and this is something to act on.
+            toasts.Error($"{hours:0.##}h on #{allocation.WorkItemId} may already be booked",
+                ex.Message + (string.IsNullOrWhiteSpace(note) ? "" : " Your note has not been posted."));
+            Changed?.Invoke();
+            return TimeWriteOutcome.Unconfirmed;
         }
         catch (Exception ex)
         {
             toasts.Error("Could not record that time", ex.Message);
-            return false;
+            return TimeWriteOutcome.Failed;
         }
         finally
         {
-            EndWrite();
+            ReleaseBlock(allocation.Id);
         }
     }
-
-    /// <summary>Blocks a "Record today" pass is booking at this moment.</summary>
-    private readonly HashSet<Guid> _recordingBlocks = [];
 
     /// <summary>
     /// The batch counterpart to <see cref="RecordTimeAsync"/>, used by "Record today" to book
@@ -1748,22 +1764,13 @@ public sealed class AppState(
     /// whether it also goes to the discussion: a day with two blocks of the same item books
     /// both, and the item should still get the comment once.
     /// </summary>
-    public async Task<(bool Success, string? Error)> RecordTimeSilentAsync(
+    public async Task<(TimeWriteOutcome Outcome, string? Error)> RecordTimeSilentAsync(
         Allocation allocation, double hours, bool reduceRemaining,
         string note = "", TextFormat noteFormat = TextFormat.Markdown, bool postNote = true)
     {
         // A row still to come when an update starts taking over is left for the new copy,
         // which shows it as not yet recorded.
-        if (!TryBeginWrite()) return (false, RestartingForUpdate);
-
-        // A pass left running behind a closed dialog can meet another started after the page
-        // was left and come back to. The entry for a block only exists once its write is back,
-        // so a block still on its way is turned away here rather than booked a second time.
-        if (!_recordingBlocks.Add(allocation.Id))
-        {
-            EndWrite();
-            return (false, "This block is already being recorded.");
-        }
+        if (TryClaimBlock(allocation.Id) is { } refused) return (TimeWriteOutcome.Failed, refused);
 
         try
         {
@@ -1772,32 +1779,258 @@ public sealed class AppState(
 
             Changed?.Invoke();
             _ = RefreshWorkItemAsync(allocation.WorkItemId);
-            return (true, null);
+            return (TimeWriteOutcome.Recorded, null);
+        }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            Changed?.Invoke();
+            return (TimeWriteOutcome.Unconfirmed, ex.Message);
         }
         catch (Exception ex)
         {
-            return (false, ex.Message);
+            return (TimeWriteOutcome.Failed, ex.Message);
         }
         finally
         {
-            _recordingBlocks.Remove(allocation.Id);
-            EndWrite();
+            ReleaseBlock(allocation.Id);
         }
     }
 
     /// <summary>
-    /// The write itself: books the hours in Azure DevOps and keeps the local entry for it.
-    /// Callers count it in with <see cref="TryBeginWrite"/>: a copy that exits between the two
-    /// halves leaves hours booked that the plan knows nothing about, and the next copy offers
-    /// to book them again.
+    /// Blocks with a booking - or a check on one - on its way to Azure DevOps at this moment,
+    /// whichever dialog sent it. A block's entry only exists once its write is back, so
+    /// without this "Record time…" could book a block a Record day pass left running behind a
+    /// closed dialog was still writing, or the other way round.
+    /// </summary>
+    private readonly HashSet<Guid> _recordingBlocks = [];
+
+    private const string BlockBusy =
+        "This block is already being recorded. Wait for that to finish, then check what it booked before recording any more.";
+
+    /// <summary>
+    /// Counts a time write in and claims its block, or says why it cannot go ahead. Every
+    /// null must be paired with a <see cref="ReleaseBlock"/>.
+    /// </summary>
+    private string? TryClaimBlock(Guid allocationId)
+    {
+        if (!TryBeginWrite()) return RestartingForUpdate;
+
+        lock (_recordingBlocks)
+        {
+            if (_recordingBlocks.Add(allocationId)) return null;
+        }
+
+        EndWrite();
+        return BlockBusy;
+    }
+
+    private void ReleaseBlock(Guid allocationId)
+    {
+        lock (_recordingBlocks) _recordingBlocks.Remove(allocationId);
+        EndWrite();
+    }
+
+    /// <summary>
+    /// The write itself: books the hours in Azure DevOps and keeps the local entry for it -
+    /// or, when Azure DevOps could not say whether they went on, writes that down instead, so
+    /// the block is not offered again as though nothing had happened. Callers claim the block
+    /// with <see cref="TryClaimBlock"/>, which also counts the write in: a copy that exits
+    /// between the two halves leaves hours booked that the plan knows nothing about, and the
+    /// next copy offers to book them again.
     /// </summary>
     private async Task<TimeRecordResult> WriteTimeAsync(
         Allocation allocation, double hours, bool reduceRemaining, string note)
     {
-        var result = await ado.RecordTimeAsync(allocation.WorkItemId, hours, reduceRemaining);
+        TimeRecordResult result;
+        try
+        {
+            result = await ado.RecordTimeAsync(allocation.WorkItemId, hours, reduceRemaining);
+        }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            planner.AddUnconfirmed(allocation, hours, reduceRemaining, note, ex.Plan);
+            throw;
+        }
+
         planner.AddTimeEntry(allocation, hours, reduceRemaining,
             result.AppliedCompleted, result.AppliedRemaining, note);
+        if (result.Plan is { } landed) planner.DropUnconfirmedOvertakenBy(landed);
         return result;
+    }
+
+    /// <summary>
+    /// Looks again, without writing anything, for the bookings from a block that Azure DevOps
+    /// never confirmed. One that turns out to have landed is filed as the entry it would have
+    /// made; one that did not is let go, and the block can be booked again. Its note is not
+    /// posted either way: arriving this late, whether it is still wanted is the user's call.
+    /// </summary>
+    public async Task<TimeWriteOutcome> CheckUnconfirmedAsync(Guid allocationId)
+    {
+        if (TryClaimBlock(allocationId) is { } refused)
+        {
+            toasts.Error("Could not check that booking", refused);
+            return TimeWriteOutcome.Unconfirmed;
+        }
+
+        try
+        {
+            var bookings = planner.UnconfirmedForBlock(allocationId);
+            if (bookings.Count == 0) return TimeWriteOutcome.Failed;
+
+            var workItemId = bookings[0].Entry.WorkItemId;
+            var (landedMinutes, unsure, unpostedNote) = await SettleBlockAsync(bookings);
+
+            if (landedMinutes > 0)
+                toasts.Success($"{Ui.Hours(landedMinutes)} did go on #{workItemId}",
+                    "It is recorded here now as well."
+                    + (unpostedNote ? " Its note is kept on the entry; it was not posted to the discussion." : ""));
+
+            if (unsure > 0)
+                toasts.Error($"Still cannot tell whether that time went on #{workItemId}",
+                    "Azure DevOps could not be asked, or the change may still be on its way. Look at the work " +
+                    "item itself, or check again in a few minutes.");
+            else if (landedMinutes == 0)
+                toasts.Info($"Nothing was booked on #{workItemId}",
+                    "That time never reached the work item, so it can be recorded again.");
+
+            return unsure > 0 ? TimeWriteOutcome.Unconfirmed
+                : landedMinutes > 0 ? TimeWriteOutcome.Recorded
+                : TimeWriteOutcome.Failed;
+        }
+        catch (Exception ex)
+        {
+            toasts.Error("Could not check that booking", ex.Message);
+            return TimeWriteOutcome.Unconfirmed;
+        }
+        finally
+        {
+            ReleaseBlock(allocationId);
+        }
+    }
+
+    private bool _settledUnconfirmed;
+
+    /// <summary>
+    /// Does what <see cref="CheckUnconfirmedAsync"/> does for every unconfirmed booking, once a
+    /// session, after the first list of work items that loads - so they are settled even when
+    /// nobody presses Check, including ones from blocks deleted since, which no dialog can reach
+    /// any more. Quiet unless one turns out to have landed, which is news worth a toast; one
+    /// that still cannot be told is simply left for later.
+    /// </summary>
+    private async Task SettleUnconfirmedQuietlyAsync()
+    {
+        var landedMinutes = 0;
+
+        foreach (var group in planner.UnconfirmedBookings.GroupBy(b => b.Entry.AllocationId).ToList())
+        {
+            // A block being booked or checked right now is left to whatever is doing it.
+            if (TryClaimBlock(group.Key) is not null) continue;
+
+            try
+            {
+                landedMinutes += (await SettleBlockAsync([.. group])).LandedMinutes;
+            }
+            catch (Exception)
+            {
+                // Deliberately broad: this is housekeeping, and the next session tries again.
+            }
+            finally
+            {
+                ReleaseBlock(group.Key);
+            }
+        }
+
+        if (landedMinutes > 0)
+            toasts.Success($"{Ui.Hours(landedMinutes)} Azure DevOps had not confirmed did go on",
+                "It is recorded here now as well.");
+
+        // Undos the same way: one that did go through takes its entry with it, as it would
+        // have at the time.
+        var undoneMinutes = 0;
+        foreach (var entry in planner.TimeEntries.Where(e => e.UnconfirmedUndo is not null).ToList())
+        {
+            if (!TryBeginWrite()) break;
+
+            lock (_undoingEntries)
+            {
+                if (!_undoingEntries.Add(entry.Id))
+                {
+                    EndWrite();
+                    continue;
+                }
+            }
+
+            try
+            {
+                if (entry.UnconfirmedUndo is not { } plan) continue;
+
+                var (landed, _) = await ado.CheckTimeWriteAsync(plan);
+                if (landed is true)
+                {
+                    planner.RemoveTimeEntry(entry.Id);
+                    undoneMinutes += entry.Minutes;
+                    _ = RefreshWorkItemAsync(entry.WorkItemId);
+                }
+                else if (landed is false)
+                {
+                    planner.SetUnconfirmedUndo(entry.Id, null);
+                }
+            }
+            catch (Exception)
+            {
+                // Housekeeping again: the next Undo of it, or the next session, looks again.
+            }
+            finally
+            {
+                lock (_undoingEntries) _undoingEntries.Remove(entry.Id);
+                EndWrite();
+            }
+        }
+
+        if (undoneMinutes > 0)
+            toasts.Success($"An undo of {Ui.Hours(undoneMinutes)} Azure DevOps had not confirmed did go through",
+                "Its entry is gone from here now as well.");
+
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Settles what can be settled of one block's unconfirmed bookings. The caller claims the
+    /// block first, so nothing else books or checks it meanwhile.
+    /// </summary>
+    private async Task<(int LandedMinutes, int Unsure, bool UnpostedNote)> SettleBlockAsync(
+        IReadOnlyList<UnconfirmedBooking> bookings)
+    {
+        var landedMinutes = 0;
+        var unsure = 0;
+        var unpostedNote = false;
+
+        foreach (var booking in bookings)
+        {
+            // Settling an earlier one lets go of any pinned to the same revision: only one of
+            // them can ever have landed.
+            if (!planner.IsUnsettled(booking)) continue;
+
+            // Always written with a plan; one without could only come from a hand-edited file,
+            // and there is nothing to look for.
+            var landed = booking.Plan is { } plan ? (await ado.CheckTimeWriteAsync(plan)).Landed : false;
+
+            if (landed is null)
+            {
+                unsure++;
+                continue;
+            }
+
+            if (planner.SettleUnconfirmed(booking, landed.Value) && landed.Value)
+            {
+                landedMinutes += booking.Entry.Minutes;
+                unpostedNote |= booking.Entry.Comment.Length > 0;
+                _ = RefreshWorkItemAsync(booking.Entry.WorkItemId);
+            }
+        }
+
+        Changed?.Invoke();
+        return (landedMinutes, unsure, unpostedNote);
     }
 
     /// <summary>
@@ -1826,9 +2059,16 @@ public sealed class AppState(
         }
     }
 
+    /// <summary>Entries being taken back off at this moment, so a second Undo cannot take them off twice.</summary>
+    private readonly HashSet<Guid> _undoingEntries = [];
+
     /// <summary>
     /// Takes a booking back off the work item in Azure DevOps and drops the entry. Only
     /// removes the entry locally once the write has actually succeeded.
+    ///
+    /// An undo Azure DevOps never confirmed is written onto the entry, and the next Undo
+    /// looks for it before doing anything: taking the hours off again when the first one
+    /// had gone through would hand back work that was never there.
     /// </summary>
     public async Task<bool> UndoTimeEntryAsync(TimeEntry entry)
     {
@@ -1840,8 +2080,49 @@ public sealed class AppState(
             return false;
         }
 
+        lock (_undoingEntries)
+        {
+            if (!_undoingEntries.Add(entry.Id))
+            {
+                EndWrite();
+                toasts.Error("Could not undo that time", "That entry is already being undone.");
+                return false;
+            }
+        }
+
         try
         {
+            // Taken from the plan rather than the caller: a page can still be holding an entry
+            // that another Undo has already taken off and dropped.
+            if (planner.FindTimeEntry(entry.Id) is not { } current)
+            {
+                toasts.Error("Could not undo that time", "That entry has already been undone.");
+                return false;
+            }
+
+            if (current.UnconfirmedUndo is { } earlier)
+            {
+                var (landed, _) = await ado.CheckTimeWriteAsync(earlier);
+                if (landed is null)
+                {
+                    toasts.Error($"Still cannot tell whether the undo on #{entry.WorkItemId} went through",
+                        "Look at the work item itself, or try again in a few minutes.");
+                    return false;
+                }
+
+                planner.SetUnconfirmedUndo(entry.Id, null);
+
+                if (landed.Value)
+                {
+                    planner.RemoveTimeEntry(entry.Id);
+                    toasts.Success($"Undid {entry.Hours:0.##}h on #{entry.WorkItemId}",
+                        "The earlier undo had gone through after all, so nothing more was taken off.");
+                    Changed?.Invoke();
+                    _ = RefreshWorkItemAsync(entry.WorkItemId);
+                    return true;
+                }
+            }
+
             // Entries written before the applied amounts were recorded fall back to the
             // hours asked for, which is what those entries were undone by at the time.
             var completed = entry.AppliedCompleted != 0 ? entry.AppliedCompleted : entry.Hours;
@@ -1860,6 +2141,15 @@ public sealed class AppState(
             _ = RefreshWorkItemAsync(entry.WorkItemId);
             return true;
         }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            planner.SetUnconfirmedUndo(entry.Id, ex.Plan);
+            toasts.Error($"The undo on #{entry.WorkItemId} may already have gone through",
+                "Azure DevOps did not confirm it, and a look at the work item afterwards could not settle " +
+                "whether it went through. Undo again looks for it first, so the hours are never taken off twice.");
+            Changed?.Invoke();
+            return false;
+        }
         catch (Exception ex)
         {
             toasts.Error("Could not undo that time", ex.Message);
@@ -1867,6 +2157,7 @@ public sealed class AppState(
         }
         finally
         {
+            lock (_undoingEntries) _undoingEntries.Remove(entry.Id);
             EndWrite();
         }
     }

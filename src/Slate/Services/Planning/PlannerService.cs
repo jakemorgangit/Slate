@@ -542,7 +542,19 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         Allocation allocation, double hours, bool reducedRemaining,
         double appliedCompleted = 0, double appliedRemaining = 0, string comment = "")
     {
-        var entry = new TimeEntry
+        var entry = BuildTimeEntry(allocation, hours, reducedRemaining, appliedCompleted, appliedRemaining, comment);
+
+        store.TimeEntries.Add(entry);
+        Persist();
+        return entry;
+    }
+
+    /// <summary>The entry a booking from this block makes, not yet filed.</summary>
+    public static TimeEntry BuildTimeEntry(
+        Allocation allocation, double hours, bool reducedRemaining,
+        double appliedCompleted = 0, double appliedRemaining = 0, string comment = "")
+    {
+        return new TimeEntry
         {
             AllocationId = allocation.Id,
             WorkItemId = allocation.WorkItemId,
@@ -561,10 +573,78 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             Notes = allocation.Notes,
             Comment = comment.Trim(),
         };
+    }
 
-        store.TimeEntries.Add(entry);
+    // ---------------------------------------------------------------- unconfirmed bookings
+
+    /// <summary>
+    /// Writes down a booking Azure DevOps never confirmed. Nothing counts it as recorded:
+    /// it may not be on the work item. It only stops the block being offered again as if
+    /// nothing had happened, and keeps what a later check needs to settle it.
+    /// </summary>
+    public void AddUnconfirmed(Allocation allocation, double hours, bool reducedRemaining, string comment, TimeWritePlan plan)
+    {
+        store.UnconfirmedBookings.Add(new UnconfirmedBooking
+        {
+            Entry = BuildTimeEntry(allocation, hours, reducedRemaining,
+                plan.AppliedCompleted, plan.AppliedRemaining, comment),
+            Plan = plan,
+        });
         Persist();
-        return entry;
+    }
+
+    public IReadOnlyList<UnconfirmedBooking> UnconfirmedBookings => store.UnconfirmedBookings;
+
+    /// <summary>The unsettled bookings from one block, oldest first.</summary>
+    public IReadOnlyList<UnconfirmedBooking> UnconfirmedForBlock(Guid allocationId) =>
+        [.. store.UnconfirmedBookings.Where(b => b.Entry.AllocationId == allocationId).OrderBy(b => b.Entry.RecordedAt)];
+
+    public bool HasUnconfirmed(Guid allocationId) =>
+        store.UnconfirmedBookings.Any(b => b.Entry.AllocationId == allocationId);
+
+    /// <summary>Still waiting to be settled, rather than filed or let go since it was read.</summary>
+    public bool IsUnsettled(UnconfirmedBooking booking) => store.UnconfirmedBookings.Contains(booking);
+
+    /// <summary>
+    /// Settles one unconfirmed booking: filed as an entry when it turned out to have landed,
+    /// otherwise simply let go. False when it had already gone.
+    /// </summary>
+    public bool SettleUnconfirmed(UnconfirmedBooking booking, bool landed)
+    {
+        if (!store.UnconfirmedBookings.Remove(booking)) return false;
+
+        if (landed)
+        {
+            store.TimeEntries.Add(booking.Entry);
+            if (booking.Plan is { } plan) DropOvertaken(plan);
+        }
+
+        Persist();
+        return true;
+    }
+
+    /// <summary>
+    /// Lets go of the unconfirmed bookings a write that did land has overtaken: those pinned to
+    /// the same revision of the same work item. Only one write can ever become the revision
+    /// after it, so they cannot land now - and checking one later would find this write's
+    /// change there, and file it a second time if it happened to be the same size.
+    /// </summary>
+    public void DropUnconfirmedOvertakenBy(TimeWritePlan landed)
+    {
+        if (DropOvertaken(landed)) Persist();
+    }
+
+    private bool DropOvertaken(TimeWritePlan landed) =>
+        store.UnconfirmedBookings.RemoveAll(b =>
+            b.Plan is { } plan && plan.WorkItemId == landed.WorkItemId && plan.Rev == landed.Rev) > 0;
+
+    /// <summary>Writes down, or clears, an undo of this entry that was never confirmed.</summary>
+    public void SetUnconfirmedUndo(Guid entryId, TimeWritePlan? plan)
+    {
+        if (FindTimeEntry(entryId) is not { } entry) return;
+
+        entry.UnconfirmedUndo = plan;
+        Persist();
     }
 
     public void RemoveTimeEntry(Guid entryId)

@@ -71,8 +71,9 @@
                             <tbody>
                                 @foreach (var row in _rows)
                                 {
-                                    var disabled = !row.TracksTime || row.Status == RowStatus.Recorded || _saving;
-                                    <tr @key="row.AllocationId" class="@(row.Status == RowStatus.Failed ? "row-failed" : "")">
+                                    var disabled = !row.TracksTime || row.Status is RowStatus.Recorded or RowStatus.Unconfirmed
+                                                   || _saving || _checking;
+                                    <tr @key="row.AllocationId" class="@(row.Status is RowStatus.Failed or RowStatus.Unconfirmed ? "row-failed" : "")">
                                         <td>
                                             <input type="checkbox" checked="@row.Selected" disabled="@disabled"
                                                    title="@(row.TracksTime ? "" : "This work item type does not track time")"
@@ -111,6 +112,13 @@
                                                     break;
                                                 case RowStatus.Failed:
                                                     <span style="color: var(--danger); font-size: 11.5px" title="@row.Error">Failed - retry?</span>
+                                                    break;
+                                                case RowStatus.Unconfirmed:
+                                                    @* Not ticked and not tickable: sending it again is how the same
+                                                       hours would go on twice. Check looks without writing. *@
+                                                    <div style="color: var(--danger); font-size: 11.5px" title="@row.Error">May be booked</div>
+                                                    <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
+                                                            @onclick="() => CheckAsync(row)">Check</button>
                                                     break;
                                                 default:
                                                     @if (!row.TracksTime)
@@ -153,7 +161,7 @@
                 </span>
                 <span style="flex: 1"></span>
                 <button class="btn" @onclick="Cancel">@(_rows.Any(r => r.Status == RowStatus.Recorded) ? "Done" : "Cancel")</button>
-                <button class="btn btn-primary" disabled="@(_saving || SelectedCount == 0)" @onclick="SaveAsync">
+                <button class="btn btn-primary" disabled="@(_saving || _checking || SelectedCount == 0)" @onclick="SaveAsync">
                     @if (_saving)
                     {
                         <span class="spinner on-accent"></span>
@@ -170,7 +178,8 @@
 }
 
 @code {
-    private enum RowStatus { Pending, Recording, Recorded, Failed }
+    /// <summary>Where a row stands. Unconfirmed: sent, and Azure DevOps never said whether it landed.</summary>
+    private enum RowStatus { Pending, Recording, Recorded, Failed, Unconfirmed }
 
     /// <summary>One row of the day being recorded. Mutated in place as rows are booked, so a
     /// partial failure only ever needs a retry of what is left rather than a rebuild.</summary>
@@ -204,6 +213,7 @@
     private bool _reduceRemaining = true;
     private string _note = "";
     private bool _saving;
+    private bool _checking;
 
     /// <summary>
     /// The work items a note has already gone to in this opening, with the note that went.
@@ -246,8 +256,9 @@
     private void Prime()
     {
         // Never under a save that is still running: a rebuild would put the row it is booking
-        // back as unrecorded and let a second save book it again. The save primes once it ends.
-        if (_saving) return;
+        // back as unrecorded and let a second save book it again. The save primes once it
+        // ends, and so does a check.
+        if (_saving || _checking) return;
 
         if (State.RecordDayFor is not { } day)
         {
@@ -297,6 +308,10 @@
         var recorded = recordedHere > 0 ? recordedHere : recordedHere + a.RecordedElsewhereMinutes;
         var remainder = Math.Max(0, a.DurationMinutes - recorded);
 
+        // A booking from this block Azure DevOps never confirmed may be on the work item
+        // already, so the block is not offered as unrecorded until a check settles it.
+        var unconfirmed = Plan.HasUnconfirmed(a.Id);
+
         return new RowVm
         {
             AllocationId = a.Id,
@@ -309,8 +324,10 @@
             RecordedMinutes = recorded,
             RecordedHereMinutes = recordedHere,
             TracksTime = tracksTime,
-            Selected = tracksTime && remainder > 0,
+            Selected = tracksTime && remainder > 0 && !unconfirmed,
             Hours = Math.Round(remainder / 60.0, 2),
+            Status = unconfirmed ? RowStatus.Unconfirmed : RowStatus.Pending,
+            Error = unconfirmed ? UnconfirmedBefore : null,
         };
     }
 
@@ -350,8 +367,9 @@
     /// </summary>
     private async Task SaveAsync()
     {
-        var toRecord = _rows.Where(r => r.Selected && r.Status != RowStatus.Recorded && r.Hours > 0).ToList();
-        if (_saving || toRecord.Count == 0) return;
+        var toRecord = _rows.Where(r => r.Selected && r.Status is not (RowStatus.Recorded or RowStatus.Unconfirmed)
+                                        && r.Hours > 0).ToList();
+        if (_saving || _checking || toRecord.Count == 0) return;
 
         _saving = true;
 
@@ -377,6 +395,7 @@
             var okCount = 0;
             var okMinutes = 0;
             var failCount = 0;
+            var unsureCount = 0;
 
             foreach (var row in toRecord)
             {
@@ -411,10 +430,10 @@
                 // One comment per work item, however many of its blocks are booked.
                 var postNote = !string.IsNullOrWhiteSpace(note) && !_notePosted.Contains((row.WorkItemId, note));
 
-                var (success, error) = await State.RecordTimeSilentAsync(
+                var (outcome, error) = await State.RecordTimeSilentAsync(
                     allocation, row.Hours, _reduceRemaining, note, noteFormat, postNote);
 
-                if (success)
+                if (outcome == TimeWriteOutcome.Recorded)
                 {
                     // Counted as sent even if the discussion turned it down: that has already
                     // been reported, and trying again on the item's next block could double it
@@ -426,6 +445,15 @@
                     okCount++;
                     okMinutes += (int)Math.Round(row.Hours * 60);
                 }
+                else if (outcome == TimeWriteOutcome.Unconfirmed)
+                {
+                    // Unticked, and locked until a check settles it: the one-click retry a
+                    // failure gets is exactly how these hours would go on twice.
+                    row.Status = RowStatus.Unconfirmed;
+                    row.Selected = false;
+                    row.Error = error;
+                    unsureCount++;
+                }
                 else
                 {
                     row.Status = RowStatus.Failed;
@@ -436,17 +464,11 @@
                 StateHasChanged();
             }
 
-            if (failCount == 0)
-                Toasts.Success($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)");
-            else if (okCount == 0)
-                Toasts.Error($"Could not record {failCount} block(s)", "Fix whatever they need below and try again.");
-            else
-                Toasts.Warning($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)",
-                    $"{failCount} did not go through - fix them below and try again.");
+            Summarise(day, okCount, okMinutes, failCount, unsureCount);
 
-            // Only closes once nothing is left to retry, so a partial failure stays on
-            // screen rather than making you find those blocks again from the calendar.
-            if (failCount == 0 && State.RecordDayFor == day) Cancel();
+            // Only closes once nothing is left to retry or check, so those stay on screen
+            // rather than making you find those blocks again from the calendar.
+            if (failCount == 0 && unsureCount == 0 && State.RecordDayFor == day) Cancel();
         }
         finally
         {
@@ -454,6 +476,91 @@
 
             // Catches up with anything held back while the run was going: a close forgets
             // the rows, and a reopen for another day builds that day's.
+            Prime();
+        }
+    }
+
+    private const string UnconfirmedBefore =
+        "A booking from this block was never confirmed by Azure DevOps and may already be on the work item. " +
+        "Check settles it without booking anything.";
+
+    /// <summary>
+    /// The one toast a run ends with. Worded for where its rows are by then: still on screen,
+    /// or gone - the dialog shut, or opened for another day, while the run carried on - when
+    /// "below" would point at nothing, and reopening the day is what brings them back.
+    /// </summary>
+    private void Summarise(DateTime? day, int okCount, int okMinutes, int failCount, int unsureCount)
+    {
+        if (failCount == 0 && unsureCount == 0)
+        {
+            Toasts.Success($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)");
+            return;
+        }
+
+        var onScreen = day is not null && State.RecordDayFor == day;
+        var reopen = day is { } d ? $"open Record {Ui.RelativeDay(d).ToLowerInvariant()} again" : "open that day again";
+
+        var lines = new List<string>();
+
+        if (failCount > 0)
+            lines.Add(okCount == 0 && unsureCount == 0
+                ? onScreen ? "Fix whatever they need below and try again." : $"To retry them, {reopen}."
+                : onScreen ? $"{failCount} did not go through - fix them below and try again."
+                : $"{failCount} did not go through - {reopen} to retry them.");
+
+        if (unsureCount > 0)
+            lines.Add($"{unsureCount} may already be booked: Azure DevOps never confirmed {(unsureCount == 1 ? "it" : "them")}. "
+                      + (onScreen ? "Check them below before recording again." : $"{Capitalise(reopen)} to check them before recording again."));
+
+        var detail = string.Join(" ", lines);
+
+        // Errors stay until dismissed, which an unconfirmed booking needs: it is something to act on.
+        if (unsureCount > 0)
+            Toasts.Error(okCount > 0
+                ? $"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s), {unsureCount} not confirmed"
+                : $"{unsureCount} block(s) not confirmed", detail);
+        else if (okCount == 0)
+            Toasts.Error($"Could not record {failCount} block(s)", detail);
+        else
+            Toasts.Warning($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)", detail);
+
+        static string Capitalise(string text) => char.ToUpperInvariant(text[0]) + text[1..];
+    }
+
+    /// <summary>
+    /// Looks again for a row's unconfirmed booking without booking anything. Landed, the row
+    /// is recorded; never arrived, it is offered again ticked, as a failed row would be.
+    /// </summary>
+    private async Task CheckAsync(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+
+        _checking = true;
+        row.Status = RowStatus.Recording;
+        try
+        {
+            switch (await State.CheckUnconfirmedAsync(row.AllocationId))
+            {
+                case TimeWriteOutcome.Recorded:
+                    row.Status = RowStatus.Recorded;
+                    row.Selected = false;
+                    row.Error = null;
+                    break;
+
+                case TimeWriteOutcome.Failed:
+                    row.Status = RowStatus.Pending;
+                    row.Selected = row.TracksTime && row.Hours > 0;
+                    row.Error = null;
+                    break;
+
+                default:
+                    row.Status = RowStatus.Unconfirmed;
+                    break;
+            }
+        }
+        finally
+        {
+            _checking = false;
             Prime();
         }
     }

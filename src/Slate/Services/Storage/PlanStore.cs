@@ -21,6 +21,8 @@ public sealed class PlanStore
 
     public List<TimeEntry> TimeEntries => Cached.TimeEntries;
 
+    public List<UnconfirmedBooking> UnconfirmedBookings => Cached.UnconfirmedBookings;
+
     public Dictionary<int, int> Priorities => Cached.Priorities;
 
     public List<string> PendingDeletes => Cached.PendingDeletes;
@@ -122,6 +124,7 @@ public sealed class PlanStore
             {
                 Allocations = [.. current.Allocations],
                 TimeEntries = [.. current.TimeEntries],
+                UnconfirmedBookings = [.. current.UnconfirmedBookings],
                 Priorities = new Dictionary<int, int>(current.Priorities),
                 PendingDeletes = [.. current.PendingDeletes],
                 Disowned = [.. current.Disowned],

@@ -7,6 +7,12 @@ public sealed class PlanFile
     public List<Allocation> Allocations { get; set; } = [];
     public List<TimeEntry> TimeEntries { get; set; } = [];
 
+    /// <summary>
+    /// Bookings Azure DevOps never confirmed or denied. Kept apart from the entries: they may
+    /// not be on the work item at all, so they count towards nothing until a check says so.
+    /// </summary>
+    public List<UnconfirmedBooking> UnconfirmedBookings { get; set; } = [];
+
     /// <summary>Work item id to locally-assigned priority. Never written back to Azure DevOps.</summary>
     public Dictionary<int, int> Priorities { get; set; } = [];
 

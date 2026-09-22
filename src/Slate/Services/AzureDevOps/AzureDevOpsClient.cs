@@ -10,7 +10,7 @@ using Slate.Services.Storage;
 
 namespace Slate.Services.AzureDevOps;
 
-public sealed class AzureDevOpsException(string message, Exception? inner = null) : Exception(message, inner)
+public class AzureDevOpsException(string message, Exception? inner = null) : Exception(message, inner)
 {
     /// <summary>
     /// The HTTP status behind this failure, when there was a response to read one from.
@@ -24,6 +24,30 @@ public sealed class AzureDevOpsException(string message, Exception? inner = null
     /// Nothing is wrong with the credential or the configuration.
     /// </summary>
     public bool IsTransient { get; init; }
+
+    /// <summary>
+    /// The request may have reached the service, and no answer came back that says whether
+    /// it was carried out: the connection dropped or timed out after it was sent, the service
+    /// failed while handling it, or it said yes in a form that could not be read. A write
+    /// that ends like this may or may not have happened. False when it was turned down, or
+    /// never left this machine - both of which mean nothing was done.
+    /// </summary>
+    public bool Unanswered { get; init; }
+
+    /// <summary>Azure DevOps' own name for the failure (its typeKey), when it gave one.</summary>
+    public string? ErrorKey { get; init; }
+}
+
+/// <summary>
+/// A change to a work item's time that went out without an answer, where looking at the work
+/// item afterwards could not settle whether it landed either. Distinct from a failure, which
+/// is safe to try again: this one may already be on the work item.
+/// </summary>
+public sealed class TimeWriteUnconfirmedException(string message, TimeWritePlan plan, Exception? inner = null)
+    : AzureDevOpsException(message, inner)
+{
+    /// <summary>What was sent, so a later check can still look for it.</summary>
+    public TimeWritePlan Plan { get; } = plan;
 }
 
 /// <summary>
@@ -133,12 +157,15 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             }
             catch (HttpRequestException ex)
             {
-                throw new AzureDevOpsException($"Could not reach {OrgUrl}. {ex.Message}", ex) { IsTransient = true };
+                throw new AzureDevOpsException($"Could not reach {OrgUrl}. {ex.Message}", ex)
+                { IsTransient = true, Unanswered = !NeverSent(ex) };
             }
             catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
             {
-                // HttpClient's own timeout, not the caller cancelling.
-                throw new AzureDevOpsException($"Timed out reaching {OrgUrl}.", ex) { IsTransient = true };
+                // HttpClient's own timeout, not the caller cancelling. The request may be
+                // sitting at the service still, and may yet be carried out.
+                throw new AzureDevOpsException($"Timed out reaching {OrgUrl}.", ex)
+                { IsTransient = true, Unanswered = true };
             }
 
             if (response.StatusCode == HttpStatusCode.Unauthorized && canRenew && !renewed)
@@ -150,6 +177,14 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             return await ReadAsync(response, ct);
         }
     }
+
+    /// <summary>
+    /// Failures that happen before the request is on its way: nothing reached the service, so
+    /// nothing can have been done there.
+    /// </summary>
+    private static bool NeverSent(HttpRequestException ex) => ex.HttpRequestError is
+        HttpRequestError.NameResolutionError or HttpRequestError.ConnectionError
+        or HttpRequestError.SecureConnectionError or HttpRequestError.ProxyTunnelError;
 
     private static readonly HashSet<HttpStatusCode> BusyStatuses =
     [
@@ -163,9 +198,17 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         {
             var payload = await response.Content.ReadAsStringAsync(ct);
 
+            // A server error can come from a gateway that gave up while the service carried
+            // on, or from the service failing after the change was already saved. Throttling
+            // and outright refusals are answered before anything is done.
             if (!response.IsSuccessStatusCode)
                 throw new AzureDevOpsException(DescribeFailure(response, payload))
-                { Status = response.StatusCode, IsTransient = BusyStatuses.Contains(response.StatusCode) };
+                {
+                    Status = response.StatusCode,
+                    IsTransient = BusyStatuses.Contains(response.StatusCode),
+                    Unanswered = (int)response.StatusCode >= 500 || response.StatusCode == HttpStatusCode.RequestTimeout,
+                    ErrorKey = ReadErrorKey(payload),
+                };
 
             // A sign-in redirect comes back as 200 plus HTML, which means the credential was rejected.
             if (payload.StartsWith('<'))
@@ -178,9 +221,28 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             }
             catch (JsonException ex)
             {
+                // The service said yes, so a write did happen - it is only the account of it
+                // that is missing.
                 throw new AzureDevOpsException(
-                    "Azure DevOps returned a response this app could not read. " + ex.Message, ex);
+                    "Azure DevOps returned a response this app could not read. " + ex.Message, ex)
+                { Unanswered = true };
             }
+        }
+    }
+
+    private static string? ReadErrorKey(string payload)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                   && doc.RootElement.TryGetProperty("typeKey", out var key) && key.ValueKind == JsonValueKind.String
+                ? key.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
         }
     }
 
@@ -852,74 +914,6 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     private static DateTimeOffset? ReadDate(JsonElement element, string name) =>
         element.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String &&
         DateTimeOffset.TryParse(v.GetString(), out var parsed) ? parsed : null;
-
-    /// <summary>Books time against a work item.</summary>
-    public Task<TimeRecordResult> RecordTimeAsync(
-        int id, double hours, bool reduceRemaining, CancellationToken ct = default)
-    {
-        if (hours <= 0) throw new AzureDevOpsException("Enter a number of hours greater than zero.");
-        return AdjustTimeAsync(id, hours, reduceRemaining ? -hours : 0, ct);
-    }
-
-    /// <summary>
-    /// Takes a previous booking back off the work item. Reverses the changes that were
-    /// actually applied rather than the hours that were asked for: recording clamps at
-    /// zero, so undoing by the asked-for hours hands back work that was never there.
-    /// </summary>
-    public Task<TimeRecordResult> UndoTimeAsync(
-        int id, double appliedCompleted, double appliedRemaining, CancellationToken ct = default)
-    {
-        if (appliedCompleted == 0 && appliedRemaining == 0)
-            throw new AzureDevOpsException("Nothing to undo.");
-
-        return AdjustTimeAsync(id, -appliedCompleted, -appliedRemaining, ct);
-    }
-
-    /// <summary>
-    /// Moves Completed Work and Remaining Work by signed amounts, reporting what it managed
-    /// to apply as well as where the fields ended up. Uses a rev test so a concurrent edit
-    /// fails loudly instead of being clobbered.
-    /// </summary>
-    private async Task<TimeRecordResult> AdjustTimeAsync(
-        int id, double completedDelta, double remainingDelta, CancellationToken ct)
-    {
-
-        double completed, remaining;
-        int rev;
-
-        using (var current = await SendAsync(HttpMethod.Get,
-                   $"{OrgUrl}/_apis/wit/workitems/{id}?api-version={ApiVersion}", null, ct))
-        {
-            var fields = current.RootElement.GetProperty("fields");
-            rev = current.RootElement.GetProperty("rev").GetInt32();
-            completed = Num(fields, "Microsoft.VSTS.Scheduling.CompletedWork") ?? 0;
-            remaining = Num(fields, "Microsoft.VSTS.Scheduling.RemainingWork") ?? 0;
-        }
-
-        var adjustRemaining = remainingDelta != 0;
-        var newCompleted = Math.Round(Math.Max(0, completed + completedDelta), 2);
-        var newRemaining = Math.Round(Math.Max(0, remaining + remainingDelta), 2);
-
-        var patch = new List<object>
-        {
-            new { op = "test", path = "/rev", value = rev },
-            new { op = "add", path = "/fields/Microsoft.VSTS.Scheduling.CompletedWork", value = newCompleted },
-        };
-
-        if (adjustRemaining)
-            patch.Add(new { op = "add", path = "/fields/Microsoft.VSTS.Scheduling.RemainingWork", value = newRemaining });
-
-        using var updated = await SendAsync(HttpMethod.Patch,
-            $"{OrgUrl}/_apis/wit/workitems/{id}?api-version={ApiVersion}",
-            patch, ct, "application/json-patch+json");
-
-        var result = updated.RootElement.GetProperty("fields");
-        return new TimeRecordResult(
-            Num(result, "Microsoft.VSTS.Scheduling.CompletedWork") ?? newCompleted,
-            Num(result, "Microsoft.VSTS.Scheduling.RemainingWork") ?? (adjustRemaining ? newRemaining : remaining),
-            newCompleted - completed,
-            adjustRemaining ? newRemaining - remaining : 0);
-    }
 
     /// <summary>Renders any field value as display text.</summary>
     private static string Describe(JsonElement value) => value.ValueKind switch
