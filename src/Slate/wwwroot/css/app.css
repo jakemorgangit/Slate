@@ -685,6 +685,24 @@ input, select, textarea, button { font: inherit; color: inherit; }
 .col-head .load { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
 .col-head .load.heavy { color: var(--warn); font-weight: 600; }
 
+/* The load figure doubles as the "Record today" trigger once there is something to book -
+   same spot, same text, just clickable, so the header does not grow a second control. */
+.col-head .record-day {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin: 1px auto 0;
+    padding: 0;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: 10.5px;
+    color: var(--text-3);
+    cursor: pointer;
+}
+.col-head .record-day:hover { color: var(--danger); }
+.col-head .record-day.heavy { color: var(--warn); font-weight: 600; }
+
 .gutter-cell {
     position: relative;
     height: var(--slot-h);
@@ -1020,7 +1038,7 @@ body.is-dragging .alloc:hover { filter: none; box-shadow: var(--shadow-1); }
 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 @media (max-width: 720px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
 
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; min-width: 0; }
 table.data {
     width: 100%;
     border-collapse: collapse;
@@ -1048,6 +1066,17 @@ table.data tbody tr:hover { background: var(--surface-2); }
 table.data tbody tr:last-child td { border-bottom: none; }
 .cell-title { max-width: 460px; }
 .cell-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* "Record today": rows for a booking that failed stay ticked and get a tint, so a retry
+   is a second click on the same Record button rather than a hunt through the list. */
+.record-day-table tbody tr.row-failed { background: var(--danger-soft); }
+.record-day-table tbody tr.row-failed:hover { background: var(--danger-soft); }
+.record-day-table td { vertical-align: middle; }
+
+/* Fixed layout (widths come from the <colgroup>) so a long title or status message wraps
+   inside its own cell instead of stretching the table - and the modal around it - wider. */
+.record-day-table { table-layout: fixed; }
+.record-day-table th, .record-day-table td { overflow: hidden; }
 
 .empty-state {
     height: 100%;
@@ -1223,6 +1252,9 @@ table.data tbody tr:last-child td { border-bottom: none; }
 }
 .modal.narrow { width: min(460px, 100%); }
 
+/* "Record today" needs more room for its table than the usual modal. */
+.modal.record-day-modal { width: min(900px, 100%); }
+
 .modal-head {
     display: flex;
     align-items: flex-start;
@@ -1244,6 +1276,7 @@ table.data tbody tr:last-child td { border-bottom: none; }
 
 .modal-body {
     flex: 1;
+    min-width: 0;
     min-height: 0;
     overflow-y: auto;
     padding: 16px 18px;

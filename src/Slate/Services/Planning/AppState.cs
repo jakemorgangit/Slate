@@ -1536,6 +1536,28 @@ public sealed class AppState(
         Changed?.Invoke();
     }
 
+    /// <summary>The day the "Record today" dialog is open for, or null while it is closed.</summary>
+    public DateTime? RecordDayFor { get; private set; }
+
+    /// <summary>
+    /// Opens the whole-day recording dialog for the given day - "today" by default, but any
+    /// day the calendar has on screen works the same way.
+    /// </summary>
+    public void BeginRecordDay(DateTime day)
+    {
+        if (!CanRecordTime) return;
+
+        RecordDayFor = day.Date;
+        Changed?.Invoke();
+    }
+
+    public void CancelRecordDay()
+    {
+        if (RecordDayFor is null) return;
+        RecordDayFor = null;
+        Changed?.Invoke();
+    }
+
     public void CancelRecordTime()
     {
         if (RecordingFor is null) return;
@@ -1558,11 +1580,7 @@ public sealed class AppState(
     {
         try
         {
-            var result = await ado.RecordTimeAsync(allocation.WorkItemId, hours, reduceRemaining);
-
-            planner.AddTimeEntry(allocation, hours, reduceRemaining,
-                result.AppliedCompleted, result.AppliedRemaining, note);
-
+            var result = await WriteTimeAsync(allocation, hours, reduceRemaining, note);
             var noted = await PostTimeNoteAsync(allocation, note, noteFormat);
 
             toasts.Success($"Recorded {hours:0.##}h on #{allocation.WorkItemId}",
@@ -1582,6 +1600,41 @@ public sealed class AppState(
             toasts.Error("Could not record that time", ex.Message);
             return false;
         }
+    }
+
+    /// <summary>
+    /// The batch counterpart to <see cref="RecordTimeAsync"/>, used by "Record today" to book
+    /// several blocks in one pass. Same write, same time entry, same note - it just hands the
+    /// outcome back instead of toasting it, so a run of many rows can show its own per-row
+    /// result and end in one summary toast rather than one per block.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> RecordTimeSilentAsync(
+        Allocation allocation, double hours, bool reduceRemaining,
+        string note = "", TextFormat noteFormat = TextFormat.Markdown)
+    {
+        try
+        {
+            await WriteTimeAsync(allocation, hours, reduceRemaining, note);
+            await PostTimeNoteAsync(allocation, note, noteFormat);
+
+            Changed?.Invoke();
+            _ = RefreshWorkItemAsync(allocation.WorkItemId);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>The write itself: books the hours in Azure DevOps and keeps the local entry for it.</summary>
+    private async Task<TimeRecordResult> WriteTimeAsync(
+        Allocation allocation, double hours, bool reduceRemaining, string note)
+    {
+        var result = await ado.RecordTimeAsync(allocation.WorkItemId, hours, reduceRemaining);
+        planner.AddTimeEntry(allocation, hours, reduceRemaining,
+            result.AppliedCompleted, result.AppliedRemaining, note);
+        return result;
     }
 
     /// <summary>

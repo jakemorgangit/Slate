@@ -194,6 +194,14 @@
             <button class="chip @(Settings.Current.Ui.CompactDensity ? "on" : "")"
                     title="Fit more hours on screen" @onclick="ToggleDensity">Compact</button>
 
+            @if (State.CanRecordTime && TodayMinutes > 0)
+            {
+                <button class="btn btn-sm" title="Book time for everything planned today (Ctrl+R)"
+                        @onclick="() => State.BeginRecordDay(DateTime.Today)">
+                    <span style="color: var(--danger)"><ClockIcon Size="13" /></span> Record today
+                </button>
+            }
+
             @if (WeekMinutes > 0)
             {
                 <button class="btn btn-sm btn-danger" title="Remove every allocation in this week"
@@ -213,9 +221,21 @@
                     <div class="col-head @(day.Date == DateTime.Today ? "today" : "")" @key="@("h" + day.Ticks)">
                         <div class="dow">@day.ToString("ddd")</div>
                         <div class="dom">@day.Day</div>
-                        <div class="load @(minutes > CapacityMinutes ? "heavy" : "")">
-                            @(minutes == 0 ? "—" : Ui.Duration(minutes))
-                        </div>
+                        @if (State.CanRecordTime && minutes > 0)
+                        {
+                            <button class="record-day @(minutes > CapacityMinutes ? "heavy" : "")"
+                                    title="Record time for @Ui.RelativeDay(day).ToLowerInvariant()"
+                                    @onclick="() => State.BeginRecordDay(day)">
+                                <ClockIcon Size="10" />
+                                <span>@Ui.Duration(minutes)</span>
+                            </button>
+                        }
+                        else
+                        {
+                            <div class="load @(minutes > CapacityMinutes ? "heavy" : "")">
+                                @(minutes == 0 ? "—" : Ui.Duration(minutes))
+                            </div>
+                        }
                     </div>
                 }
 
@@ -555,6 +575,7 @@
 
 <WorkItemModal OnSchedule="ScheduleNextFree" />
 <RecordTimeDialog />
+<RecordDayDialog />
 <ScheduleDialog />
 <SpawnTaskDialog />
 <PriorityDialog />
@@ -609,6 +630,8 @@
     private int WeekMinutes => _days.Sum(DayMinutes);
 
     private int DayMinutes(DateTime day) => Plan.ForDay(day).Sum(a => a.DurationMinutes);
+
+    private int TodayMinutes => DayMinutes(DateTime.Today);
 
     private int? NowOffsetPx
     {
@@ -907,6 +930,7 @@
             case "t": State.GoToToday(); break;
             case "r": await State.LoadWorkItemsAsync(showToast: true); break;
             case "ctrl+s": if (State.CanUseOutlook) await State.SyncAsync(); break;
+            case "ctrl+r": State.BeginRecordDay(DateTime.Today); break;
             case "delete":
                 if (State.SelectedAllocationId is Guid id) DeleteAllocation(id);
                 break;
@@ -914,6 +938,7 @@
                 CloseMenu();
                 State.CloseWorkItem();
                 State.CancelRecordTime();
+                State.CancelRecordDay();
                 State.CancelSchedule();
                 State.SelectAllocation(null);
                 _inspectorOpen = false;

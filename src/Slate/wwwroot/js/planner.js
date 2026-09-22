@@ -324,7 +324,7 @@ window.planner = (() => {
 
         const combo = (e.ctrlKey ? 'ctrl+' : '') + (e.shiftKey ? 'shift+' : '') + e.key.toLowerCase();
         const handled = [
-            'arrowleft', 'arrowright', 't', 'r', 'delete', 'escape', 'f', '/', 'ctrl+s', 'ctrl+f',
+            'arrowleft', 'arrowright', 't', 'r', 'delete', 'escape', 'f', '/', 'ctrl+s', 'ctrl+f', 'ctrl+r',
         ];
 
         if (!handled.includes(combo)) return;

@@ -135,6 +135,7 @@ The **Plan** tab is a week grid with your work items down the left.
 | See a work item | Click it anywhere — sidebar, calendar block, or table — for the full record in a scrollable modal |
 | More actions | Right-click a calendar block: record time, edit, duplicate, send, delete |
 | Record time | Right-click a block → **Record time…**, or the button in the inspector — with an optional note that posts to the discussion |
+| Record a whole day | Click the hours in a day's header, **Record today** in the toolbar, or <kbd>Ctrl</kbd>+<kbd>R</kbd> — one dialog, every block, editable hours per row |
 | Undo recorded time | Right-click the same block → **Undo recorded time**, or Undo in the Time tab |
 | Set a priority | Right-click a work item or block → **Your triage** stays here, **Azure DevOps** writes back |
 | Change the status | Open the work item and pick a state, or set one while recording time |
@@ -157,8 +158,9 @@ field and its links — in a scrollable modal, so you rarely need the browser.
 and the triage row](docs/screenshots/06-workitem.png)
 
 **Shortcuts:** <kbd>←</kbd>/<kbd>→</kbd> change week · <kbd>T</kbd> today · <kbd>R</kbd> reload work
-items · <kbd>Ctrl</kbd>+<kbd>S</kbd> send to Outlook · <kbd>Del</kbd> delete the selected block ·
-<kbd>Esc</kbd> deselect · <kbd>/</kbd> focus the filter.
+items · <kbd>Ctrl</kbd>+<kbd>S</kbd> send to Outlook · <kbd>Ctrl</kbd>+<kbd>R</kbd> record today's
+blocks · <kbd>Del</kbd> delete the selected block · <kbd>Esc</kbd> deselect · <kbd>/</kbd> focus
+the filter.
 
 ---
 
@@ -241,6 +243,23 @@ below it grouped by day](docs/screenshots/03-time.png)
 
 Undo is also on the calendar block's right-click menu, which reverses the most recent booking
 made from that block.
+
+### Recording a whole day
+
+Booking every block one at a time is fine for one or two, but a full day means opening the same
+dialog over and over. **Record today** does it in one pass: click the hours in a day's column
+header, the button in the calendar toolbar, or press <kbd>Ctrl</kbd>+<kbd>R</kbd> — all three
+open every block for that day (not just today; the header button works on any day in view).
+
+Each row starts ticked with the block's unrecorded remainder — its length minus whatever is
+already booked against it, including time recorded elsewhere — and unticked if there is nothing
+left to book. Every row's hours are editable, there is one shared optional note posted to each
+work item recorded, and a running total across the ticked rows.
+
+Rows are booked one at a time through the exact same write as the single-block dialog, so
+`ReduceRemainingOnRecord`, the untrackable-type handling and the time entries it leaves behind
+all behave identically. A row that fails stays ticked with its error, the rows that already went
+through are left alone, and pressing **Record** again only retries what is left.
 
 ## Types that cannot record time
 
