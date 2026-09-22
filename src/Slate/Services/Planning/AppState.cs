@@ -52,6 +52,21 @@ public sealed class AppState(
         AreaTree = null;
         Members = [];
         ado.ForgetPeople();
+
+        // A cached list is only ever a stand-in for this same connection's own list - once
+        // the connection has moved on, holding onto it would let a failed load for the new
+        // one keep showing the old one as if it were current, with the red banner suppressed
+        // to make room for the (now wrong) "showing a cached list" notice. Raised here, once,
+        // rather than left to each caller: a quiet poll or a background lookup like
+        // EnsureMembersAsync can be the one to drop it, and the UI still needs to hear about
+        // it even though neither of those otherwise has a reason to call Changed itself.
+        if (WorkItemsAreCached)
+        {
+            WorkItems = [];
+            WorkItemsLoadedAt = null;
+            WorkItemsAreCached = false;
+            Changed?.Invoke();
+        }
     }
     public PlannerService Planner => planner;
     public ToastService Toasts => toasts;
@@ -208,6 +223,16 @@ public sealed class AppState(
     {
         if (!Settings.IsAdoConfigured)
         {
+            // An unconfigured connection has nothing behind it to show as "cached" - and
+            // without this, clearing the org URL would leave a previous connection's list
+            // on screen under the "not configured" banner instead of showing no list at all.
+            if (WorkItemsAreCached)
+            {
+                WorkItems = [];
+                WorkItemsLoadedAt = null;
+                WorkItemsAreCached = false;
+            }
+
             WorkItemError = "Azure DevOps is not configured yet.";
             Changed?.Invoke();
             return;
@@ -221,15 +246,21 @@ public sealed class AppState(
         WorkItemError = null;
         Changed?.Invoke();
 
+        // Which connection this fetch is actually for. Declared out here rather than just
+        // inside the try, so a failure below can still tell a stale attempt apart from a
+        // current one; reassigned throughout, since a retry can span a settings change.
+        var stamp = ConnectionStamp;
+
         try
         {
             DropStaleCaches();
+            stamp = ConnectionStamp;
 
             // Before the network is even asked: if this is the first load of the session and
             // a previous run left a list behind for this same connection, show it right away
             // rather than sitting on "Loading work items…" while a network that is often still
             // coming up - after a reboot, on waking, or on a new release - catches up.
-            if (atStartup && WorkItems.Count == 0 && workItemsCache.TryLoad(ConnectionStamp) is { } cached)
+            if (atStartup && WorkItems.Count == 0 && workItemsCache.TryLoad(stamp) is { } cached)
             {
                 WorkItems = cached.Items;
                 WorkItemsLoadedAt = cached.LoadedAt;
@@ -241,6 +272,13 @@ public sealed class AppState(
             List<WorkItem> items;
             for (var attempt = 0; ; attempt++)
             {
+                // Re-checked on every attempt, not just once before the loop: a retry can span
+                // a settings change, and GetWorkItemsAsync always fetches for whatever
+                // connection is current by then, so what it returns must be judged - and
+                // saved - against that same connection, not the one this load started for.
+                DropStaleCaches();
+                stamp = ConnectionStamp;
+
                 try
                 {
                     items = await ado.GetWorkItemsAsync(cts.Token);
@@ -258,12 +296,26 @@ public sealed class AppState(
             // first on a network that is not up yet, nobody would ever be told who we are.
             await EnsureIdentityAsync(cts.Token);
 
+            if (cts.IsCancellationRequested) return;
+
+            if (stamp != ConnectionStamp)
+            {
+                // The connection moved on again between that last fetch starting and now - too
+                // late to judge this answer by it, and too late to just leave, since the old
+                // connection's list would otherwise sit on screen looking current with neither
+                // the amber notice nor the red banner. Drop it and let a fresh load for
+                // whichever connection is current now pick this back up.
+                DropStaleCaches();
+                _ = LoadWorkItemsAsync(showToast, atStartup);
+                return;
+            }
+
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
             WorkItemsAreCached = false;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(ConnectionStamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
 
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
@@ -274,6 +326,16 @@ public sealed class AppState(
         }
         catch (Exception ex)
         {
+            if (stamp != ConnectionStamp)
+            {
+                // Same reasoning as above: this failure was for a connection that is no longer
+                // current, so it is not this connection's error to show, and it is not this
+                // connection's cached list sitting underneath it either.
+                DropStaleCaches();
+                _ = LoadWorkItemsAsync(showToast, atStartup);
+                return;
+            }
+
             WorkItemError = ex.Message;
             ClearWorkItemErrorToast();
             _workItemErrorToast = toasts.Error("Could not load work items", ex.Message);
@@ -324,8 +386,21 @@ public sealed class AppState(
         try
         {
             DropStaleCaches();
+            var stamp = ConnectionStamp;
+
             var items = await ado.GetWorkItemsAsync(CancellationToken.None);
             await EnsureIdentityAsync(CancellationToken.None);
+
+            // The connection may have changed while this quiet poll was in flight - and a
+            // foreground load that started after it, for a newer connection, must win rather
+            // than being overwritten by this older answer. Either way, a cached list left
+            // over from a connection nobody is looking at any more is not this poll's to keep:
+            // drop it rather than leave it looking current with neither notice nor banner.
+            if (stamp != ConnectionStamp || IsLoadingWorkItems)
+            {
+                DropStaleCaches();
+                return;
+            }
 
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
@@ -333,12 +408,15 @@ public sealed class AppState(
             WorkItemError = null;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(ConnectionStamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
             Changed?.Invoke();
         }
         catch (Exception)
         {
-            // A background poll must stay silent; the manual Refresh reports failures.
+            // A background poll must stay silent about the failure itself, but a connection
+            // change that happened during it still needs its stale cache dropped - and
+            // DropStaleCaches raises Changed on its own once it actually clears one.
+            DropStaleCaches();
         }
     }
 
