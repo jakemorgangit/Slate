@@ -226,6 +226,20 @@ input, select, textarea, button { font: inherit; color: inherit; }
     font-size: 12px;
 }
 .update-bar .dismiss:hover { background: var(--surface-3); color: var(--text); }
+.update-bar .btn { flex: none; white-space: nowrap; }
+.update-progress {
+    flex: 0 1 220px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--surface-3);
+    overflow: hidden;
+}
+.update-progress > span {
+    display: block;
+    height: 100%;
+    background: var(--warn);
+    transition: width 0.2s linear;
+}
 
 .topbar {
     display: flex;

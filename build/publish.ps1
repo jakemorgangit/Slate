@@ -46,7 +46,10 @@ $arguments = @(
     '/p:IncludeNativeLibrariesForSelfExtract=true',
     # Bundle compression is only legal for self-contained publishes.
     "/p:EnableCompressionInSingleFile=$(if ($Slim) { 'false' } else { 'true' })",
-    '/p:DebugType=embedded'
+    '/p:DebugType=embedded',
+    # Tells the app which release asset it is, so it can install the same flavour when it
+    # updates itself. Without this a build only ever offers the release page.
+    "/p:SlateFlavour=$flavour"
 )
 
 & dotnet @arguments

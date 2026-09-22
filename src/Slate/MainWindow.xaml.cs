@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using Slate.Services;
 
 namespace Slate;
 
@@ -11,6 +12,10 @@ public partial class MainWindow : Window
         InitializeComponent();
         BlazorView.Services = App.Services;
         SourceInitialized += (_, _) => ApplyDarkTitleBar();
+
+        // Closing between the two renames of an update would leave no Slate.exe behind.
+        // The swap takes a moment, so the close is simply refused until it is done.
+        Closing += (_, e) => e.Cancel |= SelfUpdater.IsSwapping;
     }
 
     /// <summary>

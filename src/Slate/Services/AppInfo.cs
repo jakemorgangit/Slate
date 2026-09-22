@@ -18,11 +18,39 @@ public static class AppInfo
     public static string Version =>
         Self.GetName().Version is { } v ? $"{v.Major}.{v.Minor}.{v.Build}" : "1.0.0";
 
-    public static string BuildDate =>
+    public static string BuildDate => Metadata("BuildDate") ?? "unknown";
+
+    /// <summary>
+    /// "slim" or "standalone" when build/publish.ps1 made this build, otherwise null. The
+    /// two are different files on the release, and installing the wrong one over the other
+    /// would either bloat a slim copy or strand a standalone one without a runtime - so
+    /// anything unrecognised, including a dev build, is treated as not knowing.
+    /// </summary>
+    public static string? Flavour => Metadata("SlateFlavour") switch
+    {
+        "slim" => "slim",
+        "standalone" => "standalone",
+        _ => null,
+    };
+
+    /// <summary>The runtime identifier the build was published for, such as win-x64.</summary>
+    public static string? Runtime => Metadata("SlateRuntime") is { } rid && rid.StartsWith("win-", StringComparison.Ordinal)
+        ? rid
+        : null;
+
+    /// <summary>
+    /// The release asset that is this same build at another version, following the naming
+    /// the releases use: Slate-1.5.6-win-x64-standalone.exe. Null when the build does not
+    /// know what it is, which is the signal not to offer an in-place install at all.
+    /// </summary>
+    public static string? ReleaseAssetName(string version) =>
+        Flavour is { } flavour && Runtime is { } rid ? $"Slate-{version}-{rid}-{flavour}.exe" : null;
+
+    private static string? Metadata(string key) =>
         Self.GetCustomAttributes<AssemblyMetadataAttribute>()
-            .FirstOrDefault(a => a.Key == "BuildDate")?.Value is { Length: > 0 } stamped
+            .FirstOrDefault(a => a.Key == key)?.Value is { Length: > 0 } stamped
             ? stamped
-            : "unknown";
+            : null;
 
     /// <summary>The build date as something to read, falling back to the raw stamp.</summary>
     public static string BuildDateLong =>

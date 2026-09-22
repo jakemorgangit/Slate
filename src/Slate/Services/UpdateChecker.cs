@@ -5,7 +5,19 @@ using System.Text.Json;
 namespace Slate.Services;
 
 /// <summary>A release on GitHub that is newer than the one running.</summary>
-public sealed record ReleaseInfo(string Version, string Url);
+public sealed record ReleaseInfo(string Version, string Url, IReadOnlyList<ReleaseAsset> Assets)
+{
+    /// <summary>The file that is this same build at the new version, when the release has it.</summary>
+    public ReleaseAsset? AssetFor(string? name) =>
+        name is null ? null : Assets.FirstOrDefault(a => string.Equals(a.Name, name, StringComparison.OrdinalIgnoreCase));
+}
+
+/// <summary>
+/// One file attached to a release. <paramref name="Sha256"/> is the lower-case hex digest
+/// GitHub computed on upload, or empty when it gave none - in which case the file is never
+/// installed, because there would be nothing to check the download against.
+/// </summary>
+public sealed record ReleaseAsset(string Name, string DownloadUrl, long Size, string Sha256);
 
 /// <summary>
 /// Asks GitHub once per launch whether there is a newer release, so the app can say so
@@ -24,6 +36,28 @@ public sealed class UpdateChecker
     private const string ReleasesPage = "https://github.com/jakemorgangit/Slate/releases/latest";
 
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
+
+    /// <summary>
+    /// Test hook: SLATE_UPDATE_FEED points the check at a stand-in for the latest-release
+    /// API (a local listener serving the same JSON), so installing an update can be tried
+    /// end to end without publishing anything. It exists only in Debug builds. A Release
+    /// build compiles it out, so nothing in the environment can steer a shipped copy to
+    /// download and run an executable from anywhere but this repository's releases.
+    /// </summary>
+    internal static Uri? TestFeed
+    {
+        get
+        {
+#if DEBUG
+            return Uri.TryCreate(Environment.GetEnvironmentVariable("SLATE_UPDATE_FEED"), UriKind.Absolute, out var feed)
+                   && (feed.Scheme == Uri.UriSchemeHttp || feed.Scheme == Uri.UriSchemeHttps)
+                ? feed
+                : null;
+#else
+            return null;
+#endif
+        }
+    }
 
     /// <summary>The newer release, once one has been found and not yet dismissed.</summary>
     public ReleaseInfo? Available { get; private set; }
@@ -44,7 +78,7 @@ public sealed class UpdateChecker
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, LatestReleaseApi);
+            using var request = new HttpRequestMessage(HttpMethod.Get, TestFeed?.AbsoluteUri ?? LatestReleaseApi);
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 
             // GitHub rejects anonymous calls that do not identify themselves.
@@ -64,8 +98,9 @@ public sealed class UpdateChecker
 
             var url = Text(root, "html_url");
             Available = new ReleaseInfo(
-                tag.TrimStart('v', 'V'),
-                string.IsNullOrWhiteSpace(url) ? ReleasesPage : url);
+                tag.Trim().TrimStart('v', 'V'),
+                string.IsNullOrWhiteSpace(url) ? ReleasesPage : url,
+                Assets(root));
 
             Changed?.Invoke();
         }
@@ -95,6 +130,43 @@ public sealed class UpdateChecker
         return Version.TryParse(tag.Trim().TrimStart('v', 'V'), out var latest)
                && Version.TryParse(current, out var running)
                && latest > running;
+    }
+
+    /// <summary>
+    /// The files on the release, keeping only what could be installed: a name, an address
+    /// and a SHA-256 digest in the "sha256:hex" form the API reports.
+    /// </summary>
+    private static List<ReleaseAsset> Assets(JsonElement release)
+    {
+        var assets = new List<ReleaseAsset>();
+        if (!release.TryGetProperty("assets", out var list) || list.ValueKind != JsonValueKind.Array) return assets;
+
+        foreach (var asset in list.EnumerateArray())
+        {
+            if (asset.ValueKind != JsonValueKind.Object) continue;
+
+            var name = Text(asset, "name");
+            var url = Text(asset, "browser_download_url");
+            if (name.Length == 0 || url.Length == 0) continue;
+
+            var size = asset.TryGetProperty("size", out var s) && s.ValueKind == JsonValueKind.Number
+                       && s.TryGetInt64(out var n) && n > 0
+                ? n
+                : 0;
+            assets.Add(new ReleaseAsset(name, url, size, Sha256(Text(asset, "digest"))));
+        }
+
+        return assets;
+    }
+
+    /// <summary>The hex part of "sha256:...", lower-cased; empty for anything else.</summary>
+    internal static string Sha256(string digest)
+    {
+        const string prefix = "sha256:";
+        if (!digest.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return "";
+
+        var hex = digest[prefix.Length..].Trim();
+        return hex.Length == 64 && hex.All(Uri.IsHexDigit) ? hex.ToLowerInvariant() : "";
     }
 
     private static string Text(JsonElement element, string name) =>
