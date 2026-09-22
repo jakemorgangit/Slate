@@ -7,8 +7,11 @@
 
 @if (State.DetailWorkItemId is int id)
 {
-    @* Handles its own Escape so closing never depends on another component's shortcuts. *@
-    <div class="modal-scrim" @onclick="Close" @onkeydown="OnKeyDown" tabindex="-1">
+    @* Handles its own Escape so closing never depends on another component's shortcuts, and
+       data-own-escape keeps the calendar's Escape shortcut from also closing whatever this
+       was opened over - Record day, when it came from one of its rows. *@
+    <div id="wi-modal-scrim" class="modal-scrim" data-own-escape
+         @onclick="Close" @onkeydown="OnKeyDown" tabindex="-1">
         <div class="modal" @onclick:stopPropagation="true">
 
             <div class="modal-head">
@@ -575,13 +578,14 @@
             if (State.DetailWorkItemId is not null) _ = State.EnsureMembersAsync();
         }
 
-        // Focus the scrim so it receives key events as soon as it opens.
+        // Focus the scrim so it receives key events as soon as it opens. By id: opened from
+        // Record day, the first scrim on the page is that dialog's, not this one.
         if (State.DetailWorkItemId is not null && _focusedFor != State.DetailWorkItemId)
         {
             _focusedFor = State.DetailWorkItemId;
             try
             {
-                await Js.InvokeVoidAsync("planner.focusSelector", ".modal-scrim");
+                await Js.InvokeVoidAsync("planner.focusSelector", "#wi-modal-scrim");
             }
             catch (Exception ex) when (ex is JSDisconnectedException or InvalidOperationException)
             {

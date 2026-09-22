@@ -573,9 +573,12 @@
     }
 </ContextMenu>
 
+@* Every dialog shares one z-index, so the later one here is the one on top. Record day comes
+   first because it is the one others open over: a work item opened from one of its rows, and
+   whatever that goes on to open, has to land above it rather than dimmed out behind it. *@
+<RecordDayDialog />
 <WorkItemModal OnSchedule="ScheduleNextFree" />
 <RecordTimeDialog />
-<RecordDayDialog />
 <ScheduleDialog />
 <SpawnTaskDialog />
 <PriorityDialog />
@@ -935,10 +938,15 @@
                 if (State.SelectedAllocationId is Guid id) DeleteAllocation(id);
                 break;
             case "escape":
+                // Record day sits under whatever was opened from it, so Escape takes that off
+                // first and only reaches Record day once nothing covers it - its edits intact.
+                var recordDayCovered = State.DetailWorkItemId is not null
+                                       || State.SchedulingFor is not null
+                                       || State.PriorityPrompt is not null;
                 CloseMenu();
                 State.CloseWorkItem();
                 State.CancelRecordTime();
-                State.CancelRecordDay();
+                if (!recordDayCovered) State.CancelRecordDay();
                 State.CancelSchedule();
                 State.SelectAllocation(null);
                 _inspectorOpen = false;

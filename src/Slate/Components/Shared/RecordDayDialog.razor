@@ -11,8 +11,13 @@
    Every row still goes through AppState.RecordTimeSilentAsync - the exact write, time entry
    and note handling the single-block dialog uses - so the only thing this adds is the list,
    the per-row hours and the batching around it. *@
-@if (State.RecordDayFor is { } day)
+@if (State.RecordDayFor is { } requested)
 {
+    @* The day the rows are for, which is the one asked for except while a save for another
+       day - closed and then reopened elsewhere - is still running. Its rows stay on screen
+       until it ends, so the heading has to name their day, not the one just asked for. *@
+    var day = _openedFor ?? requested;
+
     <div class="modal-scrim" @onclick="Cancel">
         <div class="modal record-day-modal" @onclick:stopPropagation="true">
 
@@ -179,7 +184,14 @@
         public required DateTime End { get; init; }
         public required int DurationMinutes { get; init; }
         public required int RecordedMinutes { get; init; }
-        public required bool TracksTime { get; init; }
+
+        /// <summary>What this machine had booked on the block when the row was built - what
+        /// <see cref="Hours"/> was worked out from, and so what a save checks is still true.</summary>
+        public required int RecordedHereMinutes { get; init; }
+
+        /// <summary>Settable because a row built before the work item list had loaded cannot
+        /// know yet, and is opened up once the list says the item does take time.</summary>
+        public required bool TracksTime { get; set; }
 
         public bool Selected { get; set; }
         public double Hours { get; set; }
@@ -192,6 +204,13 @@
     private bool _reduceRemaining = true;
     private string _note = "";
     private bool _saving;
+
+    /// <summary>
+    /// The work items a note has already gone to in this opening, with the note that went.
+    /// Kept across retries, so neither a second block of the same item nor a retried row
+    /// posts the same comment to a discussion twice - while an edited note is still new.
+    /// </summary>
+    private readonly HashSet<(int WorkItemId, string Note)> _notePosted = [];
 
     private int SelectedCount => _rows.Count(r => r.Selected);
     private int SelectedMinutes => (int)Math.Round(_rows.Where(r => r.Selected).Sum(r => r.Hours) * 60);
@@ -214,19 +233,58 @@
 
     protected override void OnParametersSet() => Prime();
 
-    /// <summary>Builds the row list once per day the dialog opens for, not on every re-render -
-    /// a full rebuild on every <see cref="AppState.Changed"/> would throw away hours someone
-    /// just edited, or a row's in-flight recording status.</summary>
+    /// <summary>
+    /// Builds the row list once per opening, not on every re-render - a full rebuild on every
+    /// <see cref="AppState.Changed"/> would throw away hours someone just edited, or a row's
+    /// in-flight recording status.
+    ///
+    /// "Once per opening" is decided here rather than by whichever button closed it: Escape
+    /// closes it from the page's shortcuts, which never reach this component, and a list kept
+    /// from before a close would offer time booked since - by "Record time…", say - as still
+    /// unrecorded, and book it again.
+    /// </summary>
     private void Prime()
     {
-        if (State.RecordDayFor is not { } day) return;
-        if (_openedFor == day) return;
+        // Never under a save that is still running: a rebuild would put the row it is booking
+        // back as unrecorded and let a second save book it again. The save primes once it ends.
+        if (_saving) return;
+
+        if (State.RecordDayFor is not { } day)
+        {
+            _openedFor = null;
+            return;
+        }
+
+        if (_openedFor == day)
+        {
+            EnableRowsThatNowTrackTime();
+            return;
+        }
 
         _openedFor = day;
         _rows = [.. Plan.ForDay(day).OrderBy(a => a.Start).Select(BuildRow)];
         _reduceRemaining = Settings.Current.Planning.ReduceRemainingOnRecord;
         _note = "";
-        _saving = false;
+        _notePosted.Clear();
+    }
+
+    /// <summary>
+    /// Opened before the work item list has loaded - the first launch after an upgrade, with
+    /// no cached list yet - every row reads as a type that cannot take time. Once the list
+    /// arrives, the ones that can are ticked with their remainder, as if the dialog had been
+    /// opened then. Those rows were disabled until now, so nothing typed into them is lost.
+    /// </summary>
+    private void EnableRowsThatNowTrackTime()
+    {
+        foreach (var row in _rows.Where(r => !r.TracksTime && r.Status == RowStatus.Pending))
+        {
+            if (State.WorkItems.FirstOrDefault(i => i.Id == row.WorkItemId) is not { TracksTime: true }) continue;
+
+            var remainder = Math.Max(0, row.DurationMinutes - row.RecordedMinutes);
+            row.TracksTime = true;
+            row.Selected = remainder > 0;
+            row.Hours = Math.Round(remainder / 60.0, 2);
+        }
     }
 
     private RowVm BuildRow(Allocation a)
@@ -249,6 +307,7 @@
             End = a.End,
             DurationMinutes = a.DurationMinutes,
             RecordedMinutes = recorded,
+            RecordedHereMinutes = recordedHere,
             TracksTime = tracksTime,
             Selected = tracksTime && remainder > 0,
             Hours = Math.Round(remainder / 60.0, 2),
@@ -279,11 +338,9 @@
 
     private void OnNoteFormatChanged(TextFormat format) => NoteFormat = format;
 
-    private void Cancel()
-    {
-        _openedFor = null;
-        State.CancelRecordDay();
-    }
+    /// <summary>Closing is the same whichever way it happens - <see cref="Prime"/> forgets the
+    /// rows once the dialog is shut, or once a save still running behind it has ended.</summary>
+    private void Cancel() => State.CancelRecordDay();
 
     /// <summary>
     /// Books every selected, not-yet-recorded row in turn through the same write the
@@ -297,6 +354,17 @@
         if (_saving || toRecord.Count == 0) return;
 
         _saving = true;
+
+        // The day these rows are for. The dialog can be closed while they go through, and
+        // even reopened for another day, so the end of the run checks it is still the one
+        // on screen before closing anything.
+        var day = _openedFor;
+
+        // Read once: the note box stays editable during the run, and a note changed halfway
+        // would go to the rest of the items as a second, different comment.
+        var note = _note;
+        var noteFormat = NoteFormat;
+
         try
         {
             var settings = Settings.Current;
@@ -326,11 +394,33 @@
                     continue;
                 }
 
+                // The hours were worked out from what was booked on the block when the list
+                // was built. Anything booked on it since - "Record time…" used while this run
+                // carried on behind a closed dialog, say - means they are no longer what is
+                // left, so the row is refused rather than booked on top of it.
+                if (Plan.RecordedMinutesForBlock(row.AllocationId) != row.RecordedHereMinutes)
+                {
+                    row.Status = RowStatus.Failed;
+                    row.Selected = false;
+                    row.Error = "Time was recorded on this block after this list was opened. Close and reopen to see what is left.";
+                    failCount++;
+                    StateHasChanged();
+                    continue;
+                }
+
+                // One comment per work item, however many of its blocks are booked.
+                var postNote = !string.IsNullOrWhiteSpace(note) && !_notePosted.Contains((row.WorkItemId, note));
+
                 var (success, error) = await State.RecordTimeSilentAsync(
-                    allocation, row.Hours, _reduceRemaining, _note, NoteFormat);
+                    allocation, row.Hours, _reduceRemaining, note, noteFormat, postNote);
 
                 if (success)
                 {
+                    // Counted as sent even if the discussion turned it down: that has already
+                    // been reported, and trying again on the item's next block could double it
+                    // up if the first one did land after all.
+                    if (postNote) _notePosted.Add((row.WorkItemId, note));
+
                     row.Status = RowStatus.Recorded;
                     row.Selected = false;
                     okCount++;
@@ -356,11 +446,15 @@
 
             // Only closes once nothing is left to retry, so a partial failure stays on
             // screen rather than making you find those blocks again from the calendar.
-            if (failCount == 0) Cancel();
+            if (failCount == 0 && State.RecordDayFor == day) Cancel();
         }
         finally
         {
             _saving = false;
+
+            // Catches up with anything held back while the run was going: a close forgets
+            // the rows, and a reopen for another day builds that day's.
+            Prime();
         }
     }
 }

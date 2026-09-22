@@ -1620,10 +1620,17 @@ public sealed class AppState(
     /// <summary>
     /// Opens the whole-day recording dialog for the given day - "today" by default, but any
     /// day the calendar has on screen works the same way.
+    ///
+    /// Only over the calendar itself: Ctrl+R is ignored while any other dialog is open. They
+    /// are all drawn above this one, so that a work item opened from one of its rows lands on
+    /// top, which means this opened from under one of them would sit hidden behind it. Under
+    /// "Record time…" it would also read that block as unrecorded before the booking went in.
     /// </summary>
     public void BeginRecordDay(DateTime day)
     {
         if (!CanRecordTime) return;
+        if (RecordingFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
+            || PriorityPrompt is not null || Creating is not null || SpawnFor is not null) return;
 
         RecordDayFor = day.Date;
         Changed?.Invoke();
@@ -1680,20 +1687,33 @@ public sealed class AppState(
         }
     }
 
+    /// <summary>Blocks a "Record today" pass is booking at this moment.</summary>
+    private readonly HashSet<Guid> _recordingBlocks = [];
+
     /// <summary>
     /// The batch counterpart to <see cref="RecordTimeAsync"/>, used by "Record today" to book
     /// several blocks in one pass. Same write, same time entry, same note - it just hands the
     /// outcome back instead of toasting it, so a run of many rows can show its own per-row
     /// result and end in one summary toast rather than one per block.
+    ///
+    /// The note is kept on the time entry every time, but <paramref name="postNote"/> decides
+    /// whether it also goes to the discussion: a day with two blocks of the same item books
+    /// both, and the item should still get the comment once.
     /// </summary>
     public async Task<(bool Success, string? Error)> RecordTimeSilentAsync(
         Allocation allocation, double hours, bool reduceRemaining,
-        string note = "", TextFormat noteFormat = TextFormat.Markdown)
+        string note = "", TextFormat noteFormat = TextFormat.Markdown, bool postNote = true)
     {
+        // A pass left running behind a closed dialog can meet another started after the page
+        // was left and come back to. The entry for a block only exists once its write is back,
+        // so a block still on its way is turned away here rather than booked a second time.
+        if (!_recordingBlocks.Add(allocation.Id))
+            return (false, "This block is already being recorded.");
+
         try
         {
             await WriteTimeAsync(allocation, hours, reduceRemaining, note);
-            await PostTimeNoteAsync(allocation, note, noteFormat);
+            if (postNote) await PostTimeNoteAsync(allocation, note, noteFormat);
 
             Changed?.Invoke();
             _ = RefreshWorkItemAsync(allocation.WorkItemId);
@@ -1702,6 +1722,10 @@ public sealed class AppState(
         catch (Exception ex)
         {
             return (false, ex.Message);
+        }
+        finally
+        {
+            _recordingBlocks.Remove(allocation.Id);
         }
     }
 
