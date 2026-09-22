@@ -52,6 +52,17 @@ public sealed class AppState(
         AreaTree = null;
         Members = [];
         ado.ForgetPeople();
+
+        // A cached list is only ever a stand-in for this same connection's own list - once
+        // the connection has moved on, holding onto it would let a failed load for the new
+        // one keep showing the old one as if it were current, with the red banner suppressed
+        // to make room for the (now wrong) "showing a cached list" notice.
+        if (WorkItemsAreCached)
+        {
+            WorkItems = [];
+            WorkItemsLoadedAt = null;
+            WorkItemsAreCached = false;
+        }
     }
     public PlannerService Planner => planner;
     public ToastService Toasts => toasts;
@@ -208,6 +219,16 @@ public sealed class AppState(
     {
         if (!Settings.IsAdoConfigured)
         {
+            // An unconfigured connection has nothing behind it to show as "cached" - and
+            // without this, clearing the org URL would leave a previous connection's list
+            // on screen under the "not configured" banner instead of showing no list at all.
+            if (WorkItemsAreCached)
+            {
+                WorkItems = [];
+                WorkItemsLoadedAt = null;
+                WorkItemsAreCached = false;
+            }
+
             WorkItemError = "Azure DevOps is not configured yet.";
             Changed?.Invoke();
             return;
@@ -225,11 +246,17 @@ public sealed class AppState(
         {
             DropStaleCaches();
 
+            // Fixed at the start of the load: the settings can change under a load that is
+            // still in flight, and what gets assigned or saved below must stay true to the
+            // connection this fetch was actually made for, not whatever is current by the
+            // time it returns.
+            var stamp = ConnectionStamp;
+
             // Before the network is even asked: if this is the first load of the session and
             // a previous run left a list behind for this same connection, show it right away
             // rather than sitting on "Loading work items…" while a network that is often still
             // coming up - after a reboot, on waking, or on a new release - catches up.
-            if (atStartup && WorkItems.Count == 0 && workItemsCache.TryLoad(ConnectionStamp) is { } cached)
+            if (atStartup && WorkItems.Count == 0 && workItemsCache.TryLoad(stamp) is { } cached)
             {
                 WorkItems = cached.Items;
                 WorkItemsLoadedAt = cached.LoadedAt;
@@ -258,12 +285,16 @@ public sealed class AppState(
             // first on a network that is not up yet, nobody would ever be told who we are.
             await EnsureIdentityAsync(cts.Token);
 
+            // The connection may have moved on while this was in flight - assigning or saving
+            // its answer now would show, or persist, one connection's list under another's name.
+            if (cts.IsCancellationRequested || stamp != ConnectionStamp) return;
+
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
             WorkItemsAreCached = false;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(ConnectionStamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
 
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
@@ -324,8 +355,15 @@ public sealed class AppState(
         try
         {
             DropStaleCaches();
+            var stamp = ConnectionStamp;
+
             var items = await ado.GetWorkItemsAsync(CancellationToken.None);
             await EnsureIdentityAsync(CancellationToken.None);
+
+            // The connection may have changed while this quiet poll was in flight - and a
+            // foreground load that started after it, for a newer connection, must win rather
+            // than being overwritten by this older answer.
+            if (stamp != ConnectionStamp || IsLoadingWorkItems) return;
 
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
@@ -333,7 +371,7 @@ public sealed class AppState(
             WorkItemError = null;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(ConnectionStamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
             Changed?.Invoke();
         }
         catch (Exception)
