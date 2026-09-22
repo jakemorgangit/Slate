@@ -746,6 +746,36 @@ input, select, textarea, button { font: inherit; color: inherit; }
 .busy-block .busy-time { font-size: 9.5px; opacity: 0.85; font-variant-numeric: tabular-nums; }
 .busy-block.tentative { background: repeating-linear-gradient(135deg, var(--busy) 0 6px, transparent 6px 12px); }
 
+/* The same Outlook event again, above the plan: a see-through dashed outline wherever a block
+   covers it, and on every event while a block is being dragged. Below the now line and the
+   sticky day headers, so it never draws over either. */
+.busy-outline {
+    display: none;
+    position: absolute;
+    left: 2px; right: 2px;
+    z-index: 10;
+    border: 1.5px dashed var(--danger);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--danger) 7%, transparent);
+    pointer-events: none;
+}
+.busy-outline.covered, body.is-dragging .busy-outline { display: block; }
+.busy-outline-label {
+    position: absolute;
+    top: 2px; right: 12px;
+    max-width: 60%;
+    padding: 0 4px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--surface) 88%, transparent);
+    color: var(--danger);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 /* Slots covered by an existing event cannot take work while the overlap rule is on. */
 .slot.busy { background: color-mix(in srgb, var(--busy) 55%, transparent); }
 .slot.busy.hoverable:hover { cursor: not-allowed; }
@@ -844,7 +874,8 @@ input, select, textarea, button { font: inherit; color: inherit; }
     pointer-events: none;
     border-radius: 7px;
     border: 1.5px solid var(--accent);
-    background: color-mix(in srgb, var(--accent) 30%, var(--surface));
+    /* See-through, so Outlook's events and their outlines stay readable beneath it. */
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
     color: var(--text);
     padding: 3px 7px;
     font-size: 11.5px;
@@ -857,7 +888,7 @@ input, select, textarea, button { font: inherit; color: inherit; }
 .drag-ghost.copying { border-style: dashed; }
 .drag-ghost.blocked {
     border-color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 26%, var(--surface));
+    background: color-mix(in srgb, var(--danger) 26%, transparent);
 }
 .drag-ghost.blocked::after {
     content: "blocked";

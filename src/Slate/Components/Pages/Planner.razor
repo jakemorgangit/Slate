@@ -313,6 +313,30 @@
                             </div>
                         }
 
+                        @* Outlook's own events, drawn again above the plan as a see-through outline
+                           wherever a block sits over one, so nothing on the calendar is ever hidden
+                           behind Slate. While a block is being dragged every event gets one, to show
+                           what a drop would land on. Inert to the pointer, like the event beneath. *@
+                        @if (State.ShowOutlook && Settings.Current.Planning.ShowExistingEvents)
+                        {
+                            var planned = Plan.ForDay(day).ToList();
+
+                            @foreach (var busy in State.BusyOn(day))
+                            {
+                                var top = OffsetPx(day, busy.Start);
+                                var height = SpanPx(day, busy.Start, busy.End);
+                                if (height <= 0) { continue; }
+
+                                var covered = planned.Any(a => a.Start < busy.End && busy.Start < a.End);
+
+                                <div class="busy-outline @(covered ? "covered" : "")"
+                                     style="top: @(top)px; height: @(height)px"
+                                     @key="@("o" + busy.Id)">
+                                    <span class="busy-outline-label">@busy.Subject · @Ui.TimeRange(busy.Start, busy.End)</span>
+                                </div>
+                            }
+                        }
+
                         @if (day.Date == DateTime.Today && NowOffsetPx is int nowTop)
                         {
                             <div class="now-line" style="top: @(nowTop)px"></div>
