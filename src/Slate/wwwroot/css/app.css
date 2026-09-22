@@ -1067,6 +1067,10 @@ table.data tbody tr:last-child td { border-bottom: none; }
 .banner.info { border-color: var(--accent-line); background: var(--accent-soft); }
 .banner code { font-family: var(--mono); font-size: 11.5px; -webkit-user-select: text; user-select: text; }
 
+/* A cached list already says everything the big banners do - this just needs to be noticed
+   above the list, not to stop you reading it. */
+.banner.compact { align-items: center; padding: 6px 11px; font-size: 11.5px; }
+
 .steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 7px; font-size: 12.5px; color: var(--text-2); }
 .steps strong { color: var(--text); }
 .steps code {

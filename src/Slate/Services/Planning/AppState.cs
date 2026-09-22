@@ -18,7 +18,8 @@ public sealed class AppState(
     GraphCalendarClient graph,
     PlannerService planner,
     MsalAuthService auth,
-    ToastService toasts)
+    ToastService toasts,
+    WorkItemsCacheStore workItemsCache)
 {
     private CancellationTokenSource? _workItemLoad;
     private CancellationTokenSource? _eventLoad;
@@ -65,6 +66,24 @@ public sealed class AppState(
     public bool IsLoadingWorkItems { get; private set; }
     public string? WorkItemError { get; private set; }
     public DateTimeOffset? WorkItemsLoadedAt { get; private set; }
+
+    /// <summary>
+    /// True while what is in <see cref="WorkItems"/> is left over from a previous run rather
+    /// than something this session actually fetched. Cleared the moment a load succeeds, so a
+    /// manual refresh of an already-fresh list is never mistaken for this.
+    /// </summary>
+    public bool WorkItemsAreCached { get; private set; }
+
+    /// <summary>
+    /// What to say about a cached list while its own refresh is still in flight or has just
+    /// failed - null once there is nothing stale to explain, which is what lets the sidebar
+    /// fall back to its ordinary loading and error handling.
+    /// </summary>
+    public string? StaleWorkItemsNotice =>
+        !WorkItemsAreCached ? null
+        : IsLoadingWorkItems ? $"Showing list from {Ui.Ago(WorkItemsLoadedAt)} · refreshing…"
+        : WorkItemError is not null ? $"Showing list from {Ui.Ago(WorkItemsLoadedAt)} · couldn't refresh"
+        : null;
 
     public string Search { get; set; } = "";
     public HashSet<string> TypeFilter { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -206,6 +225,18 @@ public sealed class AppState(
         {
             DropStaleCaches();
 
+            // Before the network is even asked: if this is the first load of the session and
+            // a previous run left a list behind for this same connection, show it right away
+            // rather than sitting on "Loading work items…" while a network that is often still
+            // coming up - after a reboot, on waking, or on a new release - catches up.
+            if (atStartup && WorkItems.Count == 0 && workItemsCache.TryLoad(ConnectionStamp) is { } cached)
+            {
+                WorkItems = cached.Items;
+                WorkItemsLoadedAt = cached.LoadedAt;
+                WorkItemsAreCached = true;
+                Changed?.Invoke();
+            }
+
             var retries = atStartup ? PatientRetries : QuickRetries;
             List<WorkItem> items;
             for (var attempt = 0; ; attempt++)
@@ -229,8 +260,10 @@ public sealed class AppState(
 
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
+            WorkItemsAreCached = false;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
+            workItemsCache.Save(ConnectionStamp, WorkItemsLoadedAt.Value, items);
 
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
@@ -296,9 +329,11 @@ public sealed class AppState(
 
             WorkItems = items;
             WorkItemsLoadedAt = DateTimeOffset.Now;
+            WorkItemsAreCached = false;
             WorkItemError = null;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
+            workItemsCache.Save(ConnectionStamp, WorkItemsLoadedAt.Value, items);
             Changed?.Invoke();
         }
         catch (Exception)

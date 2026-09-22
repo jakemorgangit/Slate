@@ -68,7 +68,9 @@
         </div>
 
         <div class="sidebar-list">
-            @if (State.WorkItemError is { } error)
+            @* A cached list on screen never loses its place to the big red banner below - a
+               compact line above the list says the same thing without hiding what is loaded. *@
+            @if (State.WorkItemError is { } error && !State.WorkItemsAreCached)
             {
                 <div class="banner error">
                     <span>✕</span>
@@ -90,26 +92,43 @@
             {
                 <p class="muted" style="padding: 12px">Loading work items…</p>
             }
-            else if (_visibleItems.Count == 0)
-            {
-                <div class="empty-state" style="padding: 28px 12px">
-                    <span class="glyph">◔</span>
-                    <p>@(State.WorkItems.Count == 0 ? "No work items came back from that query." : "Nothing matches these filters.")</p>
-                </div>
-            }
             else
             {
-                @foreach (var item in _visibleItems)
+                @if (State.StaleWorkItemsNotice is { } notice)
                 {
-                    <WorkItemCard @key="item.Id"
-                                  Item="item"
-                                  Allocated="@Plan.AllocatedMinutes(item.Id)"
-                                  Recorded="@Plan.RecordedMinutes(item.Id)"
-                                  Priority="@Plan.LocalPriority(item.Id)"
-                                  OnSelect="item => State.ShowWorkItemAsync(item.Id)"
-                                  OnDragStarted="BeginItemDragAsync"
-                                  OnContextMenu="OpenItemMenu"
-                                  OnSchedule="ScheduleNextFree" />
+                    <div class="banner warn compact">
+                        <span class="grow">@notice</span>
+                        @if (State.WorkItemError is not null)
+                        {
+                            <button class="btn btn-sm" disabled="@State.IsLoadingWorkItems"
+                                    @onclick="() => State.LoadWorkItemsAsync(showToast: true)">
+                                Re-check
+                            </button>
+                        }
+                    </div>
+                }
+
+                if (_visibleItems.Count == 0)
+                {
+                    <div class="empty-state" style="padding: 28px 12px">
+                        <span class="glyph">◔</span>
+                        <p>@(State.WorkItems.Count == 0 ? "No work items came back from that query." : "Nothing matches these filters.")</p>
+                    </div>
+                }
+                else
+                {
+                    @foreach (var item in _visibleItems)
+                    {
+                        <WorkItemCard @key="item.Id"
+                                      Item="item"
+                                      Allocated="@Plan.AllocatedMinutes(item.Id)"
+                                      Recorded="@Plan.RecordedMinutes(item.Id)"
+                                      Priority="@Plan.LocalPriority(item.Id)"
+                                      OnSelect="item => State.ShowWorkItemAsync(item.Id)"
+                                      OnDragStarted="BeginItemDragAsync"
+                                      OnContextMenu="OpenItemMenu"
+                                      OnSchedule="ScheduleNextFree" />
+                    }
                 }
             }
         </div>
