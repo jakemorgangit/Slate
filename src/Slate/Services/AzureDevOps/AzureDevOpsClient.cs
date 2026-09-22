@@ -2,7 +2,6 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Slate.Models;
@@ -43,49 +42,9 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     {
         AutomaticDecompression = DecompressionMethods.All,
         PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-        ConnectCallback = ConnectPreferringIPv4Async,
+        ConnectCallback = PreferIPv4.ConnectAsync,
     })
     { Timeout = TimeSpan.FromSeconds(60) };
-
-    /// <summary>
-    /// Opens the connection over IPv4 when the host has an IPv4 address, and only falls back
-    /// to IPv6 when it has none or IPv4 cannot connect.
-    ///
-    /// Azure DevOps is reachable on both, and Windows offers IPv6 first. On some networks the
-    /// IPv6 route to Azure DevOps accepts the connection and then resets it partway through
-    /// the TLS handshake - "The SSL connection could not be established" - on every attempt,
-    /// while IPv4 to the same service works and Graph and sign-in work over IPv6. The reset
-    /// arrives after the connection is made, too late for anything to fall back on its own.
-    /// </summary>
-    private static async ValueTask<Stream> ConnectPreferringIPv4Async(
-        SocketsHttpConnectionContext context, CancellationToken ct)
-    {
-        var endpoint = context.DnsEndPoint;
-        var addresses = await Dns.GetHostAddressesAsync(endpoint.Host, ct);
-        Exception? last = null;
-
-        foreach (var address in addresses.OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1))
-        {
-            var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            try
-            {
-                await socket.ConnectAsync(address, endpoint.Port, ct);
-                return new NetworkStream(socket, ownsSocket: true);
-            }
-            catch (SocketException ex)
-            {
-                socket.Dispose();
-                last = ex;
-            }
-            catch
-            {
-                socket.Dispose();
-                throw;
-            }
-        }
-
-        throw last ?? new SocketException((int)SocketError.HostNotFound);
-    }
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 

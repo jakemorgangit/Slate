@@ -21,6 +21,7 @@ public partial class App : Application
     protected override void OnStartup(StartupEventArgs e)
     {
         _restartedAfterRenderFailure = e.Args.Contains(RestartedFlag);
+        SelfUpdater.OnStartup(e.Args);
 
         base.OnStartup(e);
 
@@ -56,6 +57,7 @@ public partial class App : Application
 
         // App state / orchestration
         services.AddSingleton<UpdateChecker>();
+        services.AddSingleton<SelfUpdater>();
         services.AddSingleton<AppState>();
         services.AddSingleton<PlannerService>();
         services.AddSingleton<ToastService>();

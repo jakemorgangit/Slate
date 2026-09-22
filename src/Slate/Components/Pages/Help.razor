@@ -462,8 +462,11 @@
 
                 <p class="muted" style="font-size: 12px">
                     Slate asks GitHub once per launch whether there is a newer release. If there is,
-                    a yellow bar appears above the header with a link to it. Nothing is downloaded or
-                    installed for you, and if GitHub cannot be reached the check passes in silence.
+                    a yellow bar appears above the header with a link to it and, for a published
+                    build, <strong>Install and restart</strong>: the new .exe is downloaded next to
+                    this one, checked against GitHub's checksum, swapped in under the same name and
+                    started. If any step fails the old one is put back and the release page opens
+                    instead. If GitHub cannot be reached the check passes in silence.
                 </p>
 
                 <div class="banner">

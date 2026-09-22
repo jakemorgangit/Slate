@@ -5,6 +5,7 @@
 
 @inject AppState State
 @inject UpdateChecker Updates
+@inject SelfUpdater Updater
 @inject SettingsStore Settings
 @inject PlannerService Planner
 @inject ToastService Toasts
@@ -18,14 +19,40 @@
     {
         <div class="update-bar">
             <span class="glyph">↑</span>
-            <span>
-                <strong>Slate @release.Version</strong> is available — you are on @AppInfo.Version.
-            </span>
-            <a href="@release.Url" @onclick="OpenReleaseAsync" @onclick:preventDefault="true">
-                View the release ↗
-            </a>
-            <span class="topbar-spacer"></span>
-            <button class="dismiss" title="Dismiss until next launch" @onclick="Updates.Dismiss">✕</button>
+            @if (Updater.IsBusy)
+            {
+                <span>@UpdateStatus(release)</span>
+                @if (Updater.Phase == UpdatePhase.Downloading)
+                {
+                    <span class="update-progress" role="progressbar" aria-valuenow="@Updater.Percent" aria-valuemin="0" aria-valuemax="100">
+                        <span style="width: @(Updater.Percent)%"></span>
+                    </span>
+                }
+                <span class="topbar-spacer"></span>
+                @if (Updater.CanCancel)
+                {
+                    <button class="btn btn-sm" title="Stop the download and stay on @AppInfo.Version" @onclick="Updater.Cancel">Cancel</button>
+                }
+            }
+            else
+            {
+                <span>
+                    <strong>Slate @release.Version</strong> is available — you are on @AppInfo.Version.
+                </span>
+                @if (Updater.CanInstall(release))
+                {
+                    <button class="btn btn-sm btn-primary"
+                            title="Download @release.Version, check it, and restart into it. Settings and the plan carry over."
+                            @onclick="() => InstallUpdateAsync(release)">
+                        Install and restart
+                    </button>
+                }
+                <a href="@release.Url" @onclick="OpenReleaseAsync" @onclick:preventDefault="true">
+                    View the release ↗
+                </a>
+                <span class="topbar-spacer"></span>
+                <button class="dismiss" title="Dismiss until next launch" @onclick="Updates.Dismiss">✕</button>
+            }
         </div>
     }
 
@@ -189,11 +216,16 @@
         Toasts.Changed += OnStateChanged;
         Settings.Changed += OnSettingsChanged;
         Updates.Changed += OnStateChanged;
+        Updater.Changed += OnStateChanged;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (!firstRender) return;
+
+        // First, because the copy this one replaced is waiting on it before it exits.
+        if (SelfUpdater.TakeUpdatedFrom() is { } previous)
+            Toasts.Success($"Updated to {AppInfo.Version}", $"Slate was on {previous}. Settings and the plan carried over.");
 
         await ApplyThemeAsync();
         await State.RefreshSignInAsync();
@@ -219,6 +251,40 @@
     {
         SystemShell.OpenUrl(Updates.Available?.Url);
         return Task.CompletedTask;
+    }
+
+    private string UpdateStatus(ReleaseInfo release) => Updater.Phase switch
+    {
+        UpdatePhase.Downloading when Updater.Total > 0 =>
+            $"Downloading Slate {release.Version}… {Updater.Percent}% ({Megabytes(Updater.Received)} of {Megabytes(Updater.Total)} MB)",
+        UpdatePhase.Downloading => $"Downloading Slate {release.Version}… {Megabytes(Updater.Received)} MB",
+        UpdatePhase.Verifying => "Checking the download against GitHub's checksum…",
+        _ => $"Installing Slate {release.Version} and restarting…",
+    };
+
+    private static string Megabytes(long bytes) => (bytes / 1048576d).ToString("0.0");
+
+    /// <summary>
+    /// Anything that stops the install leaves this copy exactly as it was, so the fallback is
+    /// the same as before in-app updates existed: the release page, to download it by hand.
+    /// </summary>
+    private async Task InstallUpdateAsync(ReleaseInfo release)
+    {
+        try
+        {
+            await Updater.InstallAsync(release);
+        }
+        catch (OperationCanceledException)
+        {
+            Toasts.Info("Update cancelled", $"Still on {AppInfo.Version}.");
+        }
+        catch (SelfUpdateException ex)
+        {
+            Toasts.Error(
+                $"Could not install Slate {release.Version}",
+                $"{ex.Message} Nothing was changed. The release page is open so you can download it yourself.");
+            SystemShell.OpenUrl(release.Url);
+        }
     }
 
     private async Task ApplyThemeAsync()
@@ -256,5 +322,6 @@
         Toasts.Changed -= OnStateChanged;
         Settings.Changed -= OnSettingsChanged;
         Updates.Changed -= OnStateChanged;
+        Updater.Changed -= OnStateChanged;
     }
 }

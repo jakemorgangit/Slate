@@ -465,13 +465,25 @@ own.
 ## Keeping up to date
 
 On launch the app asks GitHub once whether there is a newer release. If there is, a yellow bar
-appears above the header — the new version number, the one you are on, and a link straight to that
-release's page for the download. Dismiss it and it stays gone until the next launch.
+appears above the header — the new version number, the one you are on, **Install and restart**,
+and a link straight to that release's page. Dismiss it and it stays gone until the next launch.
 
 The check is deliberately quiet and best-effort: it runs after the first paint so it can never hold
 the window up, and no network, a rate limit or a draft release all mean nothing is shown rather
-than an error. Nothing is downloaded or installed for you — upgrading is still a matter of swapping
-the `.exe`.
+than an error.
+
+**Install and restart** downloads the same flavour you are running (standalone or slim) into the
+folder the `.exe` lives in, with progress in the bar and a Cancel button; the app stays usable
+meanwhile. The download is only used if its SHA-256 matches the checksum GitHub published for the
+file, and only if it came from this repository's releases over HTTPS. The running `.exe` is then
+renamed to `<name>.old`, the new one takes its name — so shortcuts and pins keep working — and the
+new version starts; the old one closes once the new window is up, and the `.old` file is removed.
+Settings and the plan live in the data folder, so nothing is lost across the restart.
+
+If anything gets in the way — the folder cannot be written to, the file is locked, the checksum
+does not match, or the new version fails to start — the old `.exe` is put back where it was, the
+app keeps running, and the release page opens so you can download it by hand. A build made with
+plain `dotnet build` does not know which flavour it is, so it only ever offers the link.
 
 ## Carrying your setup around
 
