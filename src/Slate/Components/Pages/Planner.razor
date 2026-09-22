@@ -771,6 +771,10 @@
     [JSInvokable]
     public void OnPointerDrop(string kind, string id, string day, int slotIndex, bool copy)
     {
+        // A drag still held when an update began handing over lands on a plan that the new
+        // copy may already have read, so it would be lost; better it visibly does nothing.
+        if (State.IsHandingOver) return;
+
         if (!DateTime.TryParseExact(day, "yyyy-MM-dd", CultureInfo.InvariantCulture,
                 DateTimeStyles.None, out var date))
             return;
@@ -848,7 +852,7 @@
             return;
         }
 
-        if (await Plan.SyncOneAsync(id))
+        if (await State.SyncOneAsync(id))
         {
             Toasts.Success("Sent to Outlook");
             await State.LoadEventsAsync();
@@ -872,9 +876,11 @@
         if (!Guid.TryParse(allocationId, out var id)) return;
 
         // Growing a block downwards can reach an existing calendar entry just as dropping one
-        // can, so it is refused the same way rather than quietly booking over a meeting.
+        // can, so it is refused the same way rather than quietly booking over a meeting. A
+        // resize finished during an update's handover is refused like a drop (see above).
         var allocation = Plan.Find(id);
-        if (allocation is not null && Reject(allocation.Start, allocation.Start.AddMinutes(minutes)))
+        if (State.IsHandingOver
+            || allocation is not null && Reject(allocation.Start, allocation.Start.AddMinutes(minutes)))
         {
             InvokeAsync(StateHasChanged);
             return;
@@ -923,6 +929,9 @@
     [JSInvokable]
     public async Task OnShortcut(string combo)
     {
+        // The overlay shown during an update's handover stops clicks, not keys.
+        if (State.IsHandingOver) return;
+
         switch (combo)
         {
             case "arrowleft": State.GoToWeek(-1); break;

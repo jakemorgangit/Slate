@@ -132,6 +132,13 @@ public partial class App : Application
         // several can arrive before the shutdown below takes effect.
         if (_restarting) return true;
 
+        // An update is swapping this copy for another, or this is the new copy and the one
+        // that started it may still stop it and put itself back. Starting a copy now would
+        // leave two running on the same plan. Treated as handled rather than reported: the
+        // update settles within its own time limit, and if this copy is still the one
+        // running afterwards, the next window message brings the failure round again.
+        if (SelfUpdater.IsHandingOver || SelfUpdater.AwaitingReadySignal) return true;
+
         if (_restartedAfterRenderFailure && DateTime.UtcNow - _startedAt < RestartGrace) return false;
         if (Environment.ProcessPath is not { Length: > 0 } exe || !File.Exists(exe)) return false;
 

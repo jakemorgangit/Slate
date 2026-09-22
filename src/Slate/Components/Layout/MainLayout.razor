@@ -12,7 +12,8 @@
 @inject IJSRuntime Js
 @inject NavigationManager Nav
 
-<div class="app-shell @(Updates.Available is not null ? "has-notice" : "")">
+@* Inert while an update hands over, so a field that had focus cannot take a keypress either. *@
+<div class="app-shell @(Updates.Available is not null ? "has-notice" : "")" inert="@IsInstalling">
 
     @* Only present when GitHub has something newer than this build. *@
     @if (Updates.Available is { } release)
@@ -172,6 +173,24 @@
     </main>
 </div>
 
+@* Once files start moving this copy has to stand still: the new copy reads the plan as it
+   starts, and an edit made here after that would never reach it. *@
+@if (IsInstalling)
+{
+    <div class="modal-scrim handover" role="alertdialog" aria-labelledby="handover-title">
+        <div class="modal narrow">
+            <div class="modal-body handover-body">
+                <span class="boot-spinner"></span>
+                <h2 id="handover-title">Installing Slate @Updates.Available?.Version</h2>
+                <p class="muted">
+                    Anything already on its way to Azure DevOps or Outlook finishes first.
+                    Slate will restart by itself.
+                </p>
+            </div>
+        </div>
+    </div>
+}
+
 <Toasts />
 
 @code {
@@ -264,6 +283,14 @@
 
     private static string Megabytes(long bytes) => (bytes / 1048576d).ToString("0.0");
 
+    private bool IsInstalling => Updater.Phase == UpdatePhase.Installing;
+
+    /// <summary>
+    /// Long enough for a sync of a busy week or a slow booking to finish. Anything still going
+    /// after this is more likely stuck, and the update is abandoned rather than cutting it off.
+    /// </summary>
+    private static readonly TimeSpan HandoverWait = TimeSpan.FromSeconds(30);
+
     /// <summary>
     /// Anything that stops the install leaves this copy exactly as it was, so the fallback is
     /// the same as before in-app updates existed: the release page, to download it by hand.
@@ -272,14 +299,16 @@
     {
         try
         {
-            await Updater.InstallAsync(release);
+            await Updater.InstallAsync(release, () => State.PrepareForHandoverAsync(HandoverWait));
         }
         catch (OperationCanceledException)
         {
+            State.ResumeAfterFailedHandover();
             Toasts.Info("Update cancelled", $"Still on {AppInfo.Version}.");
         }
         catch (SelfUpdateException ex)
         {
+            State.ResumeAfterFailedHandover();
             Toasts.Error(
                 $"Could not install Slate {release.Version}",
                 $"{ex.Message} Nothing was changed. The release page is open so you can download it yourself.");

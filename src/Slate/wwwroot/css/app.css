@@ -1255,6 +1255,12 @@ table.data tbody tr:last-child td { border-bottom: none; }
 /* "Record today" needs more room for its table than the usual modal. */
 .modal.record-day-modal { width: min(900px, 100%); }
 
+/* An update handing over sits above every other layer, context menus included: nothing
+   underneath may be used until Slate restarts or the update is abandoned. */
+.modal-scrim.handover { z-index: 1000; cursor: progress; }
+.handover-body { align-items: center; gap: 12px; padding: 26px 22px; text-align: center; }
+.handover-body p { margin: 0; }
+
 .modal-head {
     display: flex;
     align-items: flex-start;
