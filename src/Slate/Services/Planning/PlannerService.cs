@@ -34,6 +34,14 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     public event Action? Changed;
 
+    /// <summary>
+    /// Whether changes to the plan actually reach the disk - see <see cref="PlanStore.CanSave"/>.
+    /// False for the whole session when the file that is there could not be read and must not
+    /// be written over, which is why a time write is refused while it holds: the hours would go
+    /// on the work item with nothing anywhere to say they had.
+    /// </summary>
+    public bool CanSave => store.CanSave;
+
     public IReadOnlyList<Allocation> Allocations => store.All;
 
     public IEnumerable<Allocation> InRange(DateTime start, DateTime end) =>
@@ -63,7 +71,12 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             DurationMinutes = Math.Max(settings.Current.Planning.SlotMinutes, durationMinutes),
         };
 
-        store.All.Add(allocation);
+        // Through the store, under the lock a save holds. Every list in the plan file is
+        // written from the UI thread and copied by a save running on one of the polling
+        // timers' thread-pool callbacks, and a copy reads the count and then takes the items:
+        // a list that grew in between no longer fits and the save comes apart with it. On the
+        // calendar path that exception is swallowed, taking whatever was being saved with it.
+        store.Edit(file => file.Allocations.Add(allocation));
         Persist();
         return allocation;
     }
@@ -104,16 +117,22 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null) return;
 
-        if (allocation.OutlookEventId is { Length: > 0 } eventId)
+        // Both lists in one pass under the store's lock, so no save can copy a plan that has
+        // let go of the block but not yet remembered its event.
+        store.Edit(file =>
         {
-            // Either the event goes too, or it stays and has to be remembered as one this
-            // plan has finished with - otherwise the stamp it still carries would have the
-            // next refresh adopt it straight back.
-            if (settings.Current.Calendar.DeleteEventWithAllocation) PendingDeletes.Add(eventId);
-            else Disown(eventId);
-        }
+            if (allocation.OutlookEventId is { Length: > 0 } eventId)
+            {
+                // Either the event goes too, or it stays and has to be remembered as one this
+                // plan has finished with - otherwise the stamp it still carries would have the
+                // next refresh adopt it straight back.
+                if (settings.Current.Calendar.DeleteEventWithAllocation) file.PendingDeletes.Add(eventId);
+                else Disown(file, eventId);
+            }
 
-        store.All.Remove(allocation);
+            file.Allocations.Remove(allocation);
+        });
+
         Persist();
     }
 
@@ -123,18 +142,22 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null) return;
 
-        // Unlinking is the whole point here, so the event has to be remembered as let go of.
-        if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(eventId);
+        store.Edit(file =>
+        {
+            // Unlinking is the whole point here, so the event has to be remembered as let go of.
+            if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(file, eventId);
 
-        store.All.Remove(allocation);
+            file.Allocations.Remove(allocation);
+        });
+
         Persist();
     }
 
     /// <summary>Remembers an event this plan has finished with, so adoption leaves it alone.</summary>
-    private void Disown(string eventId)
+    private static void Disown(PlanFile file, string eventId)
     {
-        if (!store.Disowned.Contains(eventId, StringComparer.Ordinal))
-            store.Disowned.Add(eventId);
+        if (!file.Disowned.Contains(eventId, StringComparer.Ordinal))
+            file.Disowned.Add(eventId);
     }
 
     public Allocation? Duplicate(Guid id, DateTime newStart)
@@ -150,7 +173,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         copy.SyncedFingerprint = null;
         copy.LastError = null;
 
-        store.All.Add(copy);
+        store.Edit(file => file.Allocations.Add(copy));
         Persist();
         return copy;
     }
@@ -211,7 +234,9 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var byId = items.ToDictionary(i => i.Id);
         var dirty = false;
 
-        foreach (var allocation in store.All)
+        // Copied under the store's lock: this runs from the work item poll as well as from
+        // the UI thread, and enumerating the live list while the other adds to it throws.
+        foreach (var allocation in store.Edit(file => file.Allocations.ToList()))
         {
             if (!byId.TryGetValue(allocation.WorkItemId, out var item)) continue;
             if (allocation.WorkItemTitle == item.Title &&
@@ -238,12 +263,14 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     {
         int created = 0, updated = 0, deleted = 0, failed = 0;
 
-        foreach (var eventId in PendingDeletes.ToList())
+        // Both copies taken under the store's lock: this runs from the auto-sync timer, so
+        // the UI thread can be adding to either list while it does.
+        foreach (var eventId in store.Edit(file => file.PendingDeletes.ToList()))
         {
             try
             {
                 await graph.DeleteEventAsync(eventId, ct);
-                PendingDeletes.Remove(eventId);
+                store.Edit(file => { file.PendingDeletes.Remove(eventId); });
                 deleted++;
             }
             catch (Exception)
@@ -254,7 +281,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
         try
         {
-            foreach (var allocation in store.All.ToList())
+            foreach (var allocation in store.Edit(file => file.Allocations.ToList()))
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -343,17 +370,20 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     public void SetLocalPriority(int workItemId, int priority)
     {
-        if (priority is < 1 or > 4)
-            store.Priorities.Remove(workItemId);
-        else
-            store.Priorities[workItemId] = priority;
+        // A dictionary is copied by enumerating it, so a save running on a polling thread
+        // while this writes brings the whole save down - see PlanStore.Edit.
+        store.Edit(file =>
+        {
+            if (priority is < 1 or > 4) file.Priorities.Remove(workItemId);
+            else file.Priorities[workItemId] = priority;
+        });
 
         Persist();
     }
 
     public void ClearLocalPriority(int workItemId)
     {
-        if (store.Priorities.Remove(workItemId)) Persist();
+        if (store.Edit(file => file.Priorities.Remove(workItemId))) Persist();
     }
 
     // ---------------------------------------------------------------- two-way sync
@@ -379,15 +409,19 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// </summary>
     public int AdoptOrphanEvents(IReadOnlyList<ExistingEvent> events)
     {
-        var known = store.All.Select(a => a.Id).ToHashSet();
-        var claimed = store.All
-            .Where(a => a.OutlookEventId is not null)
-            .Select(a => a.OutlookEventId!)
-            .ToHashSet(StringComparer.Ordinal);
-
-        // Both are lists on disk; lifted out of the loop because every event tests against them.
-        var pending = store.PendingDeletes.ToHashSet(StringComparer.Ordinal);
-        var disowned = store.Disowned.ToHashSet(StringComparer.Ordinal);
+        // All four taken together under the store's lock. This runs from the calendar poll's
+        // timer callback while the UI thread can be adding blocks and disowning events, and
+        // each of these copies reads a count and then takes the items - see PlanStore.Edit.
+        // The last two are lists on disk, lifted out of the loop because every event tests
+        // against them.
+        var (known, claimed, pending, disowned) = store.Edit(file => (
+            file.Allocations.Select(a => a.Id).ToHashSet(),
+            file.Allocations
+                .Where(a => a.OutlookEventId is not null)
+                .Select(a => a.OutlookEventId!)
+                .ToHashSet(StringComparer.Ordinal),
+            file.PendingDeletes.ToHashSet(StringComparer.Ordinal),
+            file.Disowned.ToHashSet(StringComparer.Ordinal)));
 
         var adopted = new List<Allocation>();
 
@@ -447,7 +481,9 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
         int moved = 0, newlyMissing = 0, restored = 0, readopted = 0;
 
-        foreach (var allocation in store.All)
+        // Copied under the store's lock, for the same reason adoption takes its own copies:
+        // this runs from the calendar poll and the UI thread adds to the same list.
+        foreach (var allocation in store.Edit(file => file.Allocations.ToList()))
         {
             if (allocation.OutlookEventId is null) continue;
 
@@ -524,12 +560,16 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null || !allocation.MissingInOutlook) return;
 
-        // The event is believed gone, but "believed" is doing work there: it was judged
-        // missing from one week's worth of calendar. If it turns up again, it is still one
-        // this plan has finished with.
-        if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(eventId);
+        store.Edit(file =>
+        {
+            // The event is believed gone, but "believed" is doing work there: it was judged
+            // missing from one week's worth of calendar. If it turns up again, it is still one
+            // this plan has finished with.
+            if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(file, eventId);
 
-        store.All.Remove(allocation);
+            file.Allocations.Remove(allocation);
+        });
+
         Persist();
     }
 
@@ -702,18 +742,49 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// one organization, so without that a booking made before a switch would be let go on the
     /// strength of a revision of some other organization's #7 - and its hours could still be
     /// sitting on the item it really went to.
+    ///
+    /// An entry written before the stamp existed carries no organization at all, and an empty
+    /// one matches everything - which is no confinement whatever. Those are judged on the work
+    /// item link they were kept with instead: it is built from the organization address, so
+    /// two links to the same work item number from the same organization are the same address
+    /// and one from another organization plainly is not.
+    ///
+    /// Anything that says nothing about where it came from is left in, as everything was
+    /// before there was a stamp to go by. An overtaken pin left behind is the worse of the two
+    /// mistakes: a later check would find this write's change sitting on the work item and
+    /// file the same hours a second time.
     /// </summary>
     private static bool DropOvertaken(PlanFile file, TimeWritePlan landed, TimeEntry from)
     {
         var where = OrganizationRef.For(from.Organization, from.OrganizationId);
 
+        // Only used when the stamp says nothing, which is the case BelongsTo cannot confine.
+        var here = where.Url.Length == 0 && where.Id.Length == 0
+            ? TimeEntry.NormaliseOrganization(from.WorkItemUrl)
+            : "";
+
+        bool Confined(TimeEntry entry)
+        {
+            if (here.Length == 0) return entry.BelongsTo(where);
+
+            // The candidate's own address: its stamp when it has one, its work item link when
+            // it does not. Either way the link above starts with it, unless the two are from
+            // different organizations.
+            var there = TimeEntry.NormaliseOrganization(
+                entry.Organization.Length > 0 ? entry.Organization : entry.WorkItemUrl);
+
+            return there.Length == 0
+                   || there == here
+                   || here.StartsWith(there + "/", StringComparison.Ordinal);
+        }
+
         var dropped = file.UnconfirmedBookings.RemoveAll(
-            b => b.Plan is { } plan && Overtaken(plan, landed) && b.Entry.BelongsTo(where)) > 0;
+            b => b.Plan is { } plan && Overtaken(plan, landed) && Confined(b.Entry)) > 0;
 
         foreach (var entry in file.TimeEntries)
         {
             if (entry.UnconfirmedUndo is not { } undo || !Overtaken(undo, landed)) continue;
-            if (!entry.BelongsTo(where)) continue;
+            if (!Confined(entry)) continue;
 
             entry.UnconfirmedUndo = null;
             dropped = true;
@@ -802,6 +873,11 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// Only the stamp changes. Nothing is written to Azure DevOps, and the booking is no more
     /// settled than it was - it can simply be checked and answered for again. Returns how many
     /// were brought over.
+    ///
+    /// Only the bookings that are actually refused. A block can hold one made before an
+    /// organization was switched and one made after, and the user saying that the old address
+    /// is this organization says nothing about the one that was already here - re-stamping
+    /// that one too would quietly move a booking nobody asked about.
     /// </summary>
     public int AdoptOrganization(Guid allocationId, OrganizationRef organization)
     {
@@ -811,6 +887,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             foreach (var booking in file.UnconfirmedBookings)
             {
                 if (booking.Entry.AllocationId != allocationId) continue;
+                if (booking.Entry.BelongsTo(organization)) continue;
                 if (Stamp(booking.Entry, organization)) count++;
             }
 

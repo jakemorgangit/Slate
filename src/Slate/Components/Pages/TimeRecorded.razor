@@ -78,20 +78,23 @@
                                Nothing here can be settled against it - #7 over here is a
                                different work item - and a renamed or moved organization has no
                                old address left to switch back to, so the only way out is the
-                               user saying it is the same one. *@
+                               user saying it is the same one. Said of the bookings it is true
+                               of: a block can hold one from either side of a switch. *@
                             @if (block.Elsewhere is { } where)
                             {
                                 <div>
-                                    It was booked against <span class="mono">@where</span>, which Slate is not
-                                    connected to now, so nothing here can settle it.
+                                    @(block.AllElsewhere ? "It was booked" : "Part of it was booked")
+                                    against <span class="mono">@where</span>, which Slate is not
+                                    connected to now, so nothing here can settle
+                                    @(block.AllElsewhere ? "it" : "that part").
                                 </div>
                             }
-                            else
+                            @if (!block.AllElsewhere)
                             {
                                 <div>It may already be on the work item - look there before recording those hours again.</div>
                             }
                             <div class="row" style="margin-top: 8px; gap: 6px">
-                                @if (block.Elsewhere is null)
+                                @if (!block.AllElsewhere)
                                 {
                                     <button class="btn btn-sm" disabled="@(_busy is not null)"
                                             @onclick="() => CheckAsync(block)">
@@ -117,7 +120,7 @@
                                             title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps; the booking simply becomes one this connection can check and answer for."
                                             @onclick="() => Adopt(block)">Same organization - settle it here</button>
                                 }
-                                else if (block.CanBeLetGo)
+                                @if (block.CanBeLetGo)
                                 {
                                     <button class="btn btn-sm btn-ghost" disabled="@(_busy is not null)"
                                             title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
@@ -125,6 +128,74 @@
                                     <button class="btn btn-sm btn-ghost" disabled="@(_busy is not null)"
                                             title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting."
                                             @onclick="() => LetGo(block)">Never went on</button>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
+    @* Undos Azure DevOps never confirmed, for entries booked in some other week. An entry
+       showing this week is answered from its own row further down; one from three weeks ago
+       has no row here at all, and until its undo is answered that entry can never be undone.
+       That makes it outstanding in exactly the same sense as the bookings above, so like them
+       it is shown whatever week is on screen rather than only on its own. *@
+    @if (_stuckUndos.Count > 0)
+    {
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Undos not confirmed, from other weeks</h2>
+                    <div class="sub">
+                        Sent, with no answer either way. Until one is answered, its entry cannot be undone.
+                    </div>
+                </div>
+            </div>
+            <div class="card-body">
+                @foreach (var (entry, undo) in _stuckUndos)
+                {
+                    <div class="banner error" @key="entry.Id">
+                        <span>!</span>
+                        <div class="grow">
+                            <div>
+                                <strong>@Ui.DecimalHours(entry.Minutes)h</strong> for
+                                <span class="mono">#@entry.WorkItemId</span>
+                                <span>@Ui.Clip(entry.WorkItemTitle, NoteLimit)</span>,
+                                booked @entry.Date.ToString("d MMM yyyy").
+                            </div>
+                            <div>
+                                Azure DevOps never confirmed the undo sent @Ui.Ago(undo.SentAt),
+                                so those hours may or may not still be on the work item.
+                            </div>
+                            @if (!entry.BelongsTo(_organization))
+                            {
+                                <div>
+                                    It was booked against <span class="mono">@Booked(entry)</span>, which Slate is
+                                    not connected to now, so nothing here can settle it.
+                                </div>
+                            }
+                            <div class="row" style="margin-top: 8px; gap: 6px">
+                                @if (entry.WorkItemUrl is { Length: > 0 } undoneUrl)
+                                {
+                                    <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
+                                            @onclick="() => SystemShell.OpenUrl(undoneUrl)">Open #@entry.WorkItemId ↗</button>
+                                }
+                                @if (!entry.BelongsTo(_organization))
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                            title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps."
+                                            @onclick="() => AdoptEntry(entry)">Same organization</button>
+                                }
+                                else if (!undo.CouldStillLand)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                            title="Only once you have looked at the work item and those hours are no longer on it. Nothing is written to Azure DevOps; the entry is simply dropped, as the undo would have."
+                                            @onclick="() => AnswerUndo(entry, wentThrough: true)">The undo did go through</button>
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                            title="Only once you have looked at the work item and those hours are still on it. Nothing is written to Azure DevOps; the entry stands and Undo works on it again."
+                                            @onclick="() => AnswerUndo(entry, wentThrough: false)">It never went through</button>
                                 }
                             </div>
                         </div>
@@ -267,7 +338,9 @@
                                        unanswerable question. The work item itself can answer
                                        it, so the two answers are offered here - once no send
                                        of that undo could still be arriving, which is the same
-                                       window a booking's answers wait for. *@
+                                       window a booking's answers wait for. An entry booked in
+                                       another week has no row here at all; those are gathered
+                                       into their own section at the top of the page. *@
                                     @if (entry.UnconfirmedUndo is { } undo)
                                     {
                                         <div style="margin-top: 4px; font-size: 11.5px; color: var(--danger)">
@@ -348,6 +421,13 @@
     private List<DateTime> _days = [];
     private List<Row> _rows = [];
     private List<Unsettled> _unsettled = [];
+    /// <summary>
+    /// Entries whose undo Azure DevOps never confirmed, from weeks other than the one on
+    /// screen. The pin is taken here rather than read again while rendering: the quiet settle
+    /// runs on its own thread and can answer one of these in between, and a row that read the
+    /// pin a second time would find it gone.
+    /// </summary>
+    private List<(TimeEntry Entry, TimeWritePlan Undo)> _stuckUndos = [];
     private Guid? _undoing;
     private Guid? _busy;
 
@@ -359,19 +439,31 @@
 
     /// <summary>
     /// One block's worth of bookings Azure DevOps never confirmed, oldest first.
-    /// <see cref="Elsewhere"/> is the address they were booked against when that is not the
-    /// organization Slate is connected to now - nothing here can settle those, because #7
-    /// over here is a different work item.
+    /// <see cref="Mine"/> are the ones this connection may act on; <see cref="Elsewhere"/> is
+    /// the address the rest were booked against, when there are any - nothing here can settle
+    /// those, because #7 over there is a different work item.
+    ///
+    /// The two are kept apart rather than the block being judged by its first booking, because
+    /// a block can hold one made before an organization was switched and one made after. Read
+    /// off the oldest, a mixed block offered no check and no answers for the booking that is
+    /// plainly this organization's, and its one way out - "same organization" - re-stamped the
+    /// foreign booking as well.
     /// </summary>
     private sealed record Unsettled(
-        Guid AllocationId, IReadOnlyList<UnconfirmedBooking> Bookings, string? Elsewhere)
+        Guid AllocationId,
+        IReadOnlyList<UnconfirmedBooking> Bookings,
+        IReadOnlyList<UnconfirmedBooking> Mine,
+        string? Elsewhere)
     {
         public TimeEntry First => Bookings[0].Entry;
 
         public int Minutes => Bookings.Sum(b => b.Entry.Minutes);
 
-        /// <summary>Only once none of them could still be arriving.</summary>
-        public bool CanBeLetGo => Bookings.All(b => b.CanBeLetGo);
+        /// <summary>Nothing on this block can be answered for from here.</summary>
+        public bool AllElsewhere => Mine.Count == 0;
+
+        /// <summary>Only once none of the ones that can be answered could still be arriving.</summary>
+        public bool CanBeLetGo => Mine.Count > 0 && Mine.All(b => b.CanBeLetGo);
     }
 
     /// <summary>One work item's week: its per-day totals.</summary>
@@ -444,10 +536,23 @@
             .GroupBy(b => b.Entry.AllocationId)
             .Select(g => Group(g.Key, [.. g.OrderBy(b => b.Entry.RecordedAt)]))
             .OrderBy(u => u.First.RecordedAt)];
+
+        // An entry whose undo is stuck is outstanding in the same sense, and it cannot be
+        // undone until that undo is answered. The ones this week is showing are answered from
+        // their own rows; the rest have no row here, so they are collected above.
+        var weekEnd = State.WeekStart.AddDays(7);
+        _stuckUndos = [];
+
+        foreach (var entry in Plan.TimeEntries.OrderBy(e => e.Date).ThenBy(e => e.Start))
+        {
+            if (entry.Date.Date >= State.WeekStart.Date && entry.Date.Date < weekEnd.Date) continue;
+            if (entry.UnconfirmedUndo is { } undo) _stuckUndos.Add((entry, undo));
+        }
     }
 
     private Unsettled Group(Guid allocationId, IReadOnlyList<UnconfirmedBooking> bookings) =>
         new(allocationId, bookings,
+            [.. bookings.Where(b => b.Entry.BelongsTo(_organization))],
             bookings.Select(b => b.Entry).FirstOrDefault(e => !e.BelongsTo(_organization)) is { } entry
                 ? Booked(entry)
                 : null);

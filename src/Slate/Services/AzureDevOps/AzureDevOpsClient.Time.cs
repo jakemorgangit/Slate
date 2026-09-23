@@ -41,11 +41,25 @@ public sealed partial class AzureDevOpsClient
     private static readonly TimeSpan ClockSkew = TimeSpan.FromMinutes(10);
 
     /// <summary>
+    /// What names one work item to the two dictionaries below: the organization it is on as
+    /// well as its number. A work item number means nothing outside one organization, so a
+    /// change pinned to one organization's #7 must never be settled - or held to account -
+    /// against another's. Keyed on the number alone, everything below went on reasoning about
+    /// "#7" for the rest of a session after a switch.
+    ///
+    /// The address is reduced to one spelling, the same way an entry's stamp is, so that a
+    /// trailing slash or a change of case is not taken for a different organization.
+    /// </summary>
+    private readonly record struct TimeItem(string Organization, int WorkItemId);
+
+    private TimeItem Item(int workItemId) => new(TimeEntry.NormaliseOrganization(OrgUrl), workItemId);
+
+    /// <summary>
     /// One time change per work item at a time from this copy. Two pinned to the same
     /// revision would otherwise race, and the loser's look at the work item would find the
     /// winner's change - same size, same person - and take it for its own.
     /// </summary>
-    private readonly ConcurrentDictionary<int, SemaphoreSlim> _timeGates = new();
+    private readonly ConcurrentDictionary<TimeItem, SemaphoreSlim> _timeGates = new();
 
     /// <summary>
     /// The last change this session sent to a work item that came back unanswered and is not
@@ -58,7 +72,7 @@ public sealed partial class AzureDevOpsClient
     /// This session's sends only. One left behind by a previous copy lives in the plan file,
     /// and is settled through <see cref="CheckTimeWriteAsync"/> before it can matter.
     /// </summary>
-    private readonly ConcurrentDictionary<int, TimeWritePlan> _unanswered = new();
+    private readonly ConcurrentDictionary<TimeItem, TimeWritePlan> _unanswered = new();
 
     /// <summary>
     /// Told what is about to go out, just before each send of it. The caller writes the change
@@ -99,22 +113,26 @@ public sealed partial class AzureDevOpsClient
     public async Task<(bool? Landed, TimeRecordResult? Result)> CheckTimeWriteAsync(
         TimeWritePlan plan, CancellationToken ct = default)
     {
-        var gate = _timeGates.GetOrAdd(plan.WorkItemId, _ => new SemaphoreSlim(1, 1));
+        var item = Item(plan.WorkItemId);
+        var gate = _timeGates.GetOrAdd(item, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
         try
         {
             var (landing, now, _) = await SettleAsync(plan, ct);
 
-            var answer = landing switch
+            // Only these two mean the work item itself has spoken: it made the revision this
+            // was pinned to make, or it has moved past that revision without it. The expired
+            // answer below is this copy giving up on the wait, and the item standing still
+            // says nothing at all - so nothing is forgotten on the strength of it.
+            if (landing is Landing.Landed or Landing.Lost) ForgetUnanswered(item, plan);
+
+            return landing switch
             {
                 Landing.Landed => (Landed: (bool?)true, Result: ResultFrom(plan, now!)),
                 Landing.Lost => (false, null),
                 Landing.NotYet when !plan.CouldStillLand => (false, null),
                 _ => (null, null),
             };
-
-            if (answer.Landed is not null) ForgetUnanswered(plan);
-            return answer;
         }
         finally
         {
@@ -123,13 +141,17 @@ public sealed partial class AzureDevOpsClient
     }
 
     /// <summary>
-    /// Stops watching for a change once it is settled - or once something else has taken the
-    /// one revision it could ever have become, which settles it just as finally.
+    /// Stops watching for a change once the work item has settled it either way.
+    ///
+    /// Only ever this very change: a plan left behind by a previous session and one this
+    /// session sent can be pinned to the same revision and describe the same move, and
+    /// settling the old one says nothing whatever about the live one. Matched by identity,
+    /// because that is the question - not "a change like this one" but "this one".
     /// </summary>
-    private void ForgetUnanswered(TimeWritePlan settled)
+    private void ForgetUnanswered(TimeItem item, TimeWritePlan settled)
     {
-        if (_unanswered.TryGetValue(settled.WorkItemId, out var held) && held.Rev == settled.Rev)
-            _unanswered.TryRemove(settled.WorkItemId, out _);
+        if (_unanswered.TryGetValue(item, out var held) && ReferenceEquals(held, settled))
+            _unanswered.TryRemove(item, out _);
     }
 
     /// <summary>
@@ -145,27 +167,34 @@ public sealed partial class AzureDevOpsClient
     private async Task<TimeRecordResult> AdjustTimeAsync(
         int id, double completedDelta, double remainingDelta, PinnedHandler? pinning, CancellationToken ct)
     {
-        var gate = _timeGates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+        // Worked out once, so that an organization switched while this is in flight cannot
+        // file the answer under a different item than the one the wait was taken out on.
+        var item = Item(id);
+
+        var gate = _timeGates.GetOrAdd(item, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
         try
         {
             // Whatever the last change to this item left unanswered is put to the work item
             // first, so this one is planned from where the item really stands rather than
             // from a revision the other is still about to move.
-            await SettleUnansweredAsync(id, ct);
+            await SettleUnansweredAsync(item, ct);
 
             var result = await AdjustTimeLockedAsync(id, completedDelta, remainingDelta, pinning, ct);
 
-            // This change made a revision of its own, so anything still pinned behind it had
-            // its chance and missed it.
-            _unanswered.TryRemove(id, out _);
+            // A change that was actually sent and landed made a revision of its own, so
+            // anything still pinned behind it had its chance and missed it. The one return
+            // that sends nothing - an undo worked out against an item already at zero - comes
+            // back without a plan and makes no revision, so a straggler behind it is still
+            // free to land and stays remembered.
+            if (result.Plan is not null) _unanswered.TryRemove(item, out _);
             return result;
         }
         catch (TimeWriteUnconfirmedException ex)
         {
             // Still out there, and still able to land at any moment until the item moves past
             // the revision it is pinned to.
-            _unanswered[id] = ex.Plan;
+            _unanswered[item] = ex.Plan;
             throw;
         }
         finally
@@ -179,15 +208,17 @@ public sealed partial class AzureDevOpsClient
     /// the item itself has settled it either way. What cannot be settled stays remembered: it
     /// is still free to land, and the next change is planned knowing that.
     /// </summary>
-    private async Task SettleUnansweredAsync(int id, CancellationToken ct)
+    private async Task SettleUnansweredAsync(TimeItem item, CancellationToken ct)
     {
-        if (!_unanswered.TryGetValue(id, out var earlier)) return;
+        if (!_unanswered.TryGetValue(item, out var earlier)) return;
 
         var (landing, _, _) = await SettleAsync(earlier, ct);
 
+        // The expired answer counts here, unlike in CheckTimeWriteAsync: what is being given
+        // up on is this very pin, which is the one thing its own wait has any say over.
         if (landing is Landing.Landed or Landing.Lost
             || (landing is Landing.NotYet && !earlier.CouldStillLand))
-            _unanswered.TryRemove(id, out _);
+            _unanswered.TryRemove(item, out _);
     }
 
     private async Task<TimeRecordResult> AdjustTimeLockedAsync(
@@ -366,17 +397,29 @@ public sealed partial class AzureDevOpsClient
         // then put back hours that were never taken off. Not claimed, and not ruled out.
         if (!revision.RemainingAgrees(plan))
             return Undecided(plan, now,
-                $"revision {plan.Rev + 1} of #{plan.WorkItemId} made this change to Completed Work, but "
+                $"revision {plan.Rev + 1} of #{plan.WorkItemId} makes the change this one makes, but "
                 + (plan.SetsRemaining
                     ? $"left Remaining Work at {revision.RemainingNew ?? plan.RemainingBefore:0.##}h where this "
                       + $"change sets it to {plan.RemainingAfter:0.##}h"
                     : $"also moved Remaining Work to {revision.RemainingNew ?? 0:0.##}h, which this change "
                       + "does not touch"));
 
+        // The same question the other way round, for a change that moves Remaining Work alone -
+        // an undo whose Completed Work delta clamped to nothing, because the work item's
+        // Completed Work is already at nothing. Filing that revision as ours would write down
+        // an applied Completed of zero against a revision that did move Completed Work, the
+        // sweep would let go of whatever really made that move, and a later Undo would put the
+        // zero back: the field left permanently out by the difference.
+        if (!revision.CompletedAgrees(plan))
+            return Undecided(plan, now,
+                $"revision {plan.Rev + 1} of #{plan.WorkItemId} makes the change this one makes, but also "
+                + $"moved Completed Work to {revision.CompletedNew ?? 0:0.##}h, which this change leaves "
+                + $"at {plan.CompletedAfter:0.##}h");
+
         // Another change of ours, pinned to the same revision, that went out without an answer
         // and could still be the one sitting here. Only one of the two can have made it, and
         // nothing on the revision itself can say which, so neither may claim it.
-        if (_unanswered.TryGetValue(plan.WorkItemId, out var other)
+        if (_unanswered.TryGetValue(Item(plan.WorkItemId), out var other)
             && !ReferenceEquals(other, plan) && other.Rev == plan.Rev && revision.Made(other))
             return Undecided(plan, now,
                 $"an earlier change to #{plan.WorkItemId} pinned to the same revision went out without an "
@@ -466,8 +509,9 @@ public sealed partial class AzureDevOpsClient
         /// change found it to exactly where it would leave it. Only that one field is held to
         /// account here, because a false answer from this one is a hard "never went on": the
         /// change is worked out again and sent, and hours already on the item go on twice.
-        /// What the other field did is asked separately, by <see cref="RemainingAgrees"/>,
-        /// where a no leaves the question open instead of answering it.
+        /// What each field did is asked separately, by <see cref="RemainingAgrees"/> and
+        /// <see cref="CompletedAgrees"/>, where a no leaves the question open instead of
+        /// answering it.
         /// </summary>
         public bool Made(TimeWritePlan plan)
         {
@@ -488,12 +532,13 @@ public sealed partial class AzureDevOpsClient
         /// <summary>
         /// True when this revision also left Remaining Work where the change would have.
         ///
-        /// A change that sets Remaining must be seen to have moved it; one that does not set
-        /// it must be seen not to have moved it at all - our patch does not carry the field,
-        /// so a revision that moved it is not simply ours. Both directions matter because the
-        /// applied amounts are what an Undo puts back: an entry filed for a revision that
-        /// moved Remaining Work by something other than what the entry says would leave that
-        /// field permanently out by the difference.
+        /// A change that moves Remaining must be seen to have moved it, exactly; one that does
+        /// not move it must be seen not to have moved it at all - our patch either leaves the
+        /// field out or sets it to where it already was, so a revision that moved it is not
+        /// simply ours. Both directions matter because the applied amounts are what an Undo
+        /// puts back: an entry filed for a revision that moved Remaining Work by something
+        /// other than what the entry says would leave that field permanently out by the
+        /// difference.
         /// </summary>
         public bool RemainingAgrees(TimeWritePlan plan) =>
             plan.SetsRemaining && !Same(plan.RemainingBefore, plan.RemainingAfter)
@@ -501,6 +546,22 @@ public sealed partial class AzureDevOpsClient
                   && Same(RemainingOld ?? 0, plan.RemainingBefore)
                   && Same(RemainingNew ?? 0, plan.RemainingAfter)
                 : !RemainingChanged;
+
+        /// <summary>
+        /// The same for Completed Work, which matters in the direction <see cref="Made"/>
+        /// answers on Remaining alone: an undo whose Completed delta clamped to zero, against
+        /// an item whose Completed Work is already nothing. Nothing there held Completed to
+        /// account, so a revision that moved Remaining exactly as the change would and also
+        /// moved Completed Work was claimed as ours, filed with an applied Completed of zero.
+        ///
+        /// Where Remaining is judged on whether the revision touched the field at all, this
+        /// asks where the field ended up: our patch always carries Completed Work, so a change
+        /// that leaves it where it found it may or may not be recorded as having changed it.
+        /// </summary>
+        public bool CompletedAgrees(TimeWritePlan plan) =>
+            CompletedChanged
+                ? Same(CompletedOld ?? 0, plan.CompletedBefore) && Same(CompletedNew ?? 0, plan.CompletedAfter)
+                : Same(plan.CompletedBefore, plan.CompletedAfter);
 
         private static bool Same(double a, double b) => Math.Abs(a - b) < 0.001;
     }

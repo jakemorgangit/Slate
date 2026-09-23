@@ -40,8 +40,35 @@ public sealed class PlanStore
     /// read, and it could not be put safely aside either. Everything in it - the blocks, the
     /// entries, and the record of which bookings and undos were never confirmed - is still in
     /// that file, and saving an empty plan on top would be the end of it.
+    ///
+    /// Set once by the load and never cleared: nothing re-reads the file for the rest of the
+    /// session.
     /// </summary>
     private bool _refuseToSave;
+
+    /// <summary>
+    /// False for the whole session once the plan on disk has been ruled unwritable by
+    /// <see cref="_refuseToSave"/>: <see cref="Save"/> then writes nothing at all, so nothing
+    /// this copy does is recorded anywhere.
+    ///
+    /// Exposed because that is not a thing to find out about afterwards. Booking time in Azure
+    /// DevOps writes hours onto a work item and nothing else; the record that says so - the
+    /// pin written before the send, and the entry written after it - lives only in this file.
+    /// A session that cannot write it would leave hours on work items with nothing pointing at
+    /// them, and offer the same blocks again next time, so time writes are refused while this
+    /// is false rather than allowed to go on unrecorded.
+    ///
+    /// Reading it loads the plan if nothing has yet, so that asking the question at startup
+    /// gets the answer rather than the moment before it.
+    /// </summary>
+    public bool CanSave
+    {
+        get
+        {
+            _ = Cached;
+            return !_refuseToSave;
+        }
+    }
 
     public List<Allocation> All => Cached.Allocations;
 
@@ -135,9 +162,10 @@ public sealed class PlanStore
             // There is a plan there; this copy simply could not get at it. Carrying on with an
             // empty one is fine - saving over the real one with it is not.
             _refuseToSave = true;
-            _loadProblem = $"Your plan could not be read ({ex.Message}). Nothing will be saved over it until " +
-                           "Slate can read it again, so close Slate, make sure nothing else is holding the file, " +
-                           "and start it again.";
+            _loadProblem = $"Your plan could not be read ({ex.Message}). Nothing will be saved over it, and " +
+                           "nothing you do now will be written down either - so recording time is refused for " +
+                           "this session. Close Slate, make sure nothing else is holding the file, and start " +
+                           "it again.";
             CrashLog.WriteLine($"Could not read the plan at {path}: {ex}");
             return new PlanFile();
         }
@@ -179,8 +207,9 @@ public sealed class PlanStore
         {
             _refuseToSave = true;
             _loadProblem = "Your plan could not be read, and it could not be put aside either. Nothing will be " +
-                           "saved over it, so close Slate and take a copy of plan.json from the Slate data folder " +
-                           "before starting it again.";
+                           "saved over it, and nothing you do now will be written down either - so recording " +
+                           "time is refused for this session. Close Slate and take a copy of plan.json from the " +
+                           "Slate data folder before starting it again.";
             CrashLog.WriteLine($"Could not set the unreadable plan at {path} aside: {move}");
         }
 
