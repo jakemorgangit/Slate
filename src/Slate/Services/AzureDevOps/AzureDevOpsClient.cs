@@ -141,6 +141,10 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     /// The same send with nothing read back, for a request whose answer is the status alone -
     /// a delete, which Azure DevOps replies to with an empty body. Parsing that as JSON would
     /// report a delete that plainly worked as an answer this app could not read.
+    ///
+    /// Nothing read back is not nothing checked: the sign-in page a rejected credential is
+    /// answered 2xx with is turned away inside the send itself, so this is no more willing to
+    /// call a request a success than any other here.
     /// </summary>
     private async Task SendNoAnswerAsync(HttpMethod method, string url, CancellationToken ct) =>
         await SendForPayloadAsync(method, url, null, ct, null);
@@ -239,18 +243,26 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
                     ErrorKey = ReadErrorKey(payload),
                 };
 
+            // A sign-in redirect comes back as 200 plus HTML, which means the credential was
+            // rejected and nothing was done. Judged on every answer rather than only on the
+            // ones read as data: a request whose answer is its status alone - a delete - would
+            // otherwise take that very page for the one 2xx nobody looks inside, and report a
+            // comment as removed while it is still on the discussion.
+            if (payload.StartsWith('<'))
+                throw new AzureDevOpsException(
+                    "Azure DevOps returned a sign-in page instead of an answer. The token is likely expired or lacks the Work Items scope this needs.");
+
             return payload;
         }
     }
 
-    /// <summary>Makes a document of an answer that was asked for as data.</summary>
+    /// <summary>
+    /// Makes a document of an answer that was asked for as data. Whether the body is an answer
+    /// at all is already settled by <see cref="ReadPayloadAsync"/>; all that is left here is
+    /// reading it.
+    /// </summary>
     private static JsonDocument ReadAnswer(string payload)
     {
-        // A sign-in redirect comes back as 200 plus HTML, which means the credential was rejected.
-        if (payload.StartsWith('<'))
-            throw new AzureDevOpsException(
-                "Azure DevOps returned a sign-in page instead of data. The token is likely expired or lacks the Work Items (Read) scope.");
-
         try
         {
             return JsonDocument.Parse(payload);
@@ -941,37 +953,47 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     /// left when those hours are undone. Needs the Work Items (Read &amp; Write) scope, like
     /// adding one.
     ///
-    /// A comment that is not there is what this asks for, so a 404 is left alone rather than
-    /// reported: it is how Azure DevOps answers for one already deleted - in the browser, by a
-    /// colleague, or by an earlier undo whose answer never came back. The same status also
-    /// covers a work item or a project the address cannot find, which is why the project the
-    /// comment was posted under is kept beside its id rather than worked out again here.
+    /// A 404 is neither a failure nor a removal, so it comes back as an answer of its own
+    /// rather than as silence. It is how Azure DevOps replies for a comment already gone - one
+    /// deleted in the browser, by a colleague, or by an earlier send of this whose answer never
+    /// came back - but it is equally how it replies when the address finds no such project or
+    /// work item, which a work item moved between projects and a project renamed since the note
+    /// went on will both produce. Telling the caller which of the two it was would take another
+    /// read of the discussion; telling it plainly that nothing was removed costs nothing and is
+    /// true either way.
+    ///
+    /// The project is taken as given, with no falling back to the selected one the way reading
+    /// and adding do: the point of a delete is not to guess what it lands on, and the project a
+    /// comment was posted under is kept beside its id for exactly this.
     /// </summary>
-    public async Task DeleteCommentAsync(
+    public async Task<CommentRemoval> DeleteCommentAsync(
         int id, string project, int commentId, CancellationToken ct = default)
     {
         if (commentId <= 0) throw new AzureDevOpsException("That note has no comment to remove.");
 
-        var scope = CommentScope(project);
-        if (string.IsNullOrWhiteSpace(scope))
-            throw new AzureDevOpsException("A project is needed to remove a comment from the discussion.");
+        if (string.IsNullOrWhiteSpace(project))
+            throw new AzureDevOpsException(
+                "Slate did not write down which project that note was posted under, so it cannot address the comment.");
 
         try
         {
             await SendNoAnswerAsync(HttpMethod.Delete,
-                $"{OrgUrl}{scope}/_apis/wit/workItems/{id}/comments/{commentId}?api-version={CommentsApiVersion}",
+                $"{OrgUrl}/{Uri.EscapeDataString(project)}/_apis/wit/workItems/{id}/comments/{commentId}?api-version={CommentsApiVersion}",
                 ct);
+
+            return CommentRemoval.Removed;
         }
         catch (AzureDevOpsException ex) when (ex.Status == HttpStatusCode.NotFound)
         {
-            // Already gone, which is the state this was asked to reach.
+            return CommentRemoval.NotThere;
         }
     }
 
     /// <summary>
-    /// The project segment the comments endpoints are reached through: the one asked for, or
-    /// the selected project when nothing was. Empty when neither says anything, which every
-    /// caller refuses rather than sending an address with a hole in it.
+    /// The project segment the discussion is read and added to through: the one asked for, or
+    /// the selected project when nothing was. Empty when neither says anything, which both
+    /// callers refuse rather than sending an address with a hole in it. Removing a comment does
+    /// not come through here - see <see cref="DeleteCommentAsync"/>.
     /// </summary>
     private string CommentScope(string project) =>
         string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);

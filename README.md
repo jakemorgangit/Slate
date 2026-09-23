@@ -252,6 +252,19 @@ posted and the entry belongs to the organization you are connected to; otherwise
 why there is nothing it can remove. An undo Azure DevOps could not confirm removes nothing — the
 hours may still be on the work item, and the note with them.
 
+Recording a whole day posts a work item's note once however many of its blocks are booked, and
+every one of those entries carries that comment — so the note comes off with the **last** of the
+hours it covers. Undo one of them while the others stand and the dialog names what the note also
+speaks for and leaves the tick off; you can still tick it, knowing what it leaves behind.
+
+The same question is asked wherever an entry is dropped. An undo Azure DevOps never confirmed
+leaves two answers on the Time tab: **The undo did go through** drops the entry, so it asks and
+offers the same tick — that entry is the only record of which comment the note was — while **It
+never went through** changes nothing but the pin and asks nothing. The one entry that goes
+without asking is one Slate settles by itself in the background: when it finds an unconfirmed
+undo really did land, the entry goes and the note stays. Nobody is there to be asked, and nothing
+is claimed about the comment.
+
 ### Recording a whole day
 
 Booking every block one at a time is fine for one or two, but a full day means opening the same

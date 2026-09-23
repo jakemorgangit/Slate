@@ -79,10 +79,15 @@ public sealed class TimeEntry
     /// hours can offer to take the comment off with them: hours reversed while the note that
     /// went with them still stands reads as work that was done.
     ///
-    /// Zero whenever Slate did not post one, and that is not the same as there being no note:
-    /// an entry written before this was kept has the text and no id, and so does the second
-    /// block of a day booked in one pass, where one comment is posted for the work item and
-    /// every entry keeps the text. Only the entry that posted a comment may remove it.
+    /// One comment can be several entries' note. A day booked in one pass posts a work item's
+    /// note once however many of its blocks are booked, and every entry it covers is given the
+    /// same id - so the note comes off with the last of the hours it speaks for rather than
+    /// with whichever happened to post it. The undo that finds others still carrying the id
+    /// says what the comment also stands for before offering to delete it.
+    ///
+    /// Zero whenever there is no comment to remove, which is not the same as there being no
+    /// note: an entry written before this was kept has the text and no id, and so does one
+    /// whose note never reached the discussion.
     /// </summary>
     public int CommentId { get; set; }
 
@@ -210,6 +215,17 @@ public sealed record OrganizationRef(string Url, string Id)
     public static OrganizationRef For(string organizationUrl, string id) =>
         new(TimeEntry.NormaliseOrganization(organizationUrl), id.Trim());
 }
+
+/// <summary>
+/// The comment a booking's note was posted as, and the project it went under - between them,
+/// everything it takes to address it again.
+///
+/// Handed from the booking that posted a note to the rest of a batch that shares it, so every
+/// entry the one comment covers is written down carrying it. Never a default value: a note
+/// posted to no project could not be addressed at all, so "nothing posted" is a null of this
+/// rather than an instance saying nothing.
+/// </summary>
+public readonly record struct TimeNote(int CommentId, string Project);
 
 /// <summary>How a time write ended, as far as it can be told.</summary>
 public enum TimeWriteOutcome

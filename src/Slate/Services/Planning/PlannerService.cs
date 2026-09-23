@@ -652,9 +652,12 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// offer to take the note off with them. The project goes down beside the id because that
     /// is how the comment is addressed, and the project selected here can move on afterwards.
     ///
-    /// Only the entry that actually posted one gets an id: a day booked in one pass posts a
-    /// work item's note once while every entry of it keeps the text, and a second entry
-    /// claiming that comment would have two undos both trying to remove it.
+    /// Every entry the comment covers gets it, not only the one that posted it. A day booked
+    /// in one pass posts a work item's note once and books several blocks behind it, and an id
+    /// on the posting entry alone would let that entry's undo delete a comment still speaking
+    /// for hours that are staying - and leave the rest with a note nothing here could ever take
+    /// off. Shared, the comment goes with the last of the hours it covers; see
+    /// <see cref="OthersSharingNote"/>, which is what tells an undo it is not the last.
     /// </summary>
     public void SetTimeNote(Guid entryId, int commentId, string project)
     {
@@ -671,6 +674,22 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
         if (set) Persist();
     }
+
+    /// <summary>
+    /// The other entries whose note is this very comment - the rest of a day booked in one
+    /// pass, which posts a work item's note once and stamps its id onto each entry behind it.
+    /// Empty when this entry is the only one left carrying it, which is what makes it the one
+    /// that may take the comment off without leaving hours behind it unexplained.
+    ///
+    /// Matched on the work item as well as the id: comment ids are numbered within a work item,
+    /// so the same small number belongs to a different comment on every other one.
+    /// </summary>
+    public IReadOnlyList<TimeEntry> OthersSharingNote(TimeEntry entry) =>
+        entry.CommentId <= 0
+            ? []
+            : [.. store.TimeEntries.Where(e => e.Id != entry.Id
+                                               && e.CommentId == entry.CommentId
+                                               && e.WorkItemId == entry.WorkItemId)];
 
     // ---------------------------------------------------------------- unconfirmed bookings
 

@@ -3,13 +3,16 @@
 
 @inject AppState State
 
-@* Undoing asks first, because one part of it cannot be put back: the note those hours left on
-   the work item's discussion either goes with them or stays, and a deleted comment is gone.
-   Every route to an undo - the Time tab, the block's menu, the inspector - comes through here. *@
+@* Dropping an entry asks first, because one part of it cannot be put back: the note those hours
+   left on the work item's discussion either goes with them or stays, and a deleted comment is
+   gone. Every route to an undo - the Time tab, the block's menu, the inspector - comes through
+   here, and so does the other answer that drops an entry: saying that an undo Azure DevOps never
+   confirmed did go through after all. *@
 @if (State.UndoingPrompt is { } prompt)
 {
     var entry = prompt.Entry;
     var busy = State.UndoingEntry is not null;
+    var settling = prompt.Ask == AppState.UndoAsk.SettleGone;
 
     <div class="modal-scrim" @onclick="Cancel" @onkeydown="OnKeyDown" tabindex="-1">
         <div class="modal narrow" @onclick:stopPropagation="true">
@@ -17,7 +20,7 @@
             <div class="modal-head">
                 <span class="dot" style="background: @Ui.ColorFor(entry.WorkItemType); margin-top: 7px"></span>
                 <div class="grow">
-                    <h2>Undo @Ui.Hours(entry.Minutes)?</h2>
+                    <h2>@(settling ? "Settle the undo of " : "Undo ")@Ui.Hours(entry.Minutes)?</h2>
                     <div class="sub">
                         <span class="mono">#@entry.WorkItemId</span>
                         <span>·</span>
@@ -27,12 +30,23 @@
             </div>
 
             <div class="modal-body">
-                <p class="hint">
-                    This takes the booking back off the work item in Azure DevOps:
-                    <em>Completed Work</em> goes back down@(entry.ReducedRemaining
-                        ? ", and Remaining Work back up by the same amount" : ""). The entry only
-                    disappears from the Time tab once that write has actually gone through.
-                </p>
+                @if (settling)
+                {
+                    <p class="hint">
+                        You have said #@entry.WorkItemId no longer has these hours, so the entry is dropped
+                        here to match. No time is written to Azure DevOps — the undo that could not be
+                        confirmed is what took the hours off.
+                    </p>
+                }
+                else
+                {
+                    <p class="hint">
+                        This takes the booking back off the work item in Azure DevOps:
+                        <em>Completed Work</em> goes back down@(entry.ReducedRemaining
+                            ? ", and Remaining Work back up by the same amount" : ""). The entry only
+                        disappears from the Time tab once that write has actually gone through.
+                    </p>
+                }
 
                 @* The same refusal the write itself would give, said before the button rather
                    than after it - a work item number means nothing outside the organization it
@@ -57,6 +71,18 @@
                    absent and the line below says why. *@
                 @if (prompt.CanRemoveNote)
                 {
+                    @* One comment can be several bookings' note - a day recorded in one pass
+                       posts it once for the work item. Still offered, because it is the user's
+                       call, but said plainly and left off by default: hours that are staying
+                       would be left with nothing explaining them. *@
+                    @if (prompt.NoteShared is { } shared)
+                    {
+                        <div class="banner warn" style="margin-top: 10px">
+                            <span>!</span>
+                            <div class="grow">@shared</div>
+                        </div>
+                    }
+
                     <label class="switch" style="margin-top: 10px">
                         <input type="checkbox" checked="@_removeNote" disabled="@busy"
                                @onchange="OnRemoveNoteChanged" />
@@ -64,8 +90,9 @@
                         <span class="label">Also remove the note from the work item's discussion</span>
                     </label>
                     <div class="hint" style="margin-top: 6px">
-                        The hours come off first. If the comment will not delete, the undo still stands
-                        and Slate says so.
+                        @(settling
+                            ? "The hours are already off, by your own account of the work item. If the comment will not delete, the entry still goes and Slate says so."
+                            : "The hours come off first. If the comment will not delete, the undo still stands and Slate says so.")
                     </div>
                 }
                 else if (prompt.NoteKept is { } kept)
@@ -78,16 +105,22 @@
                 <span style="flex: 1"></span>
                 <button class="btn" disabled="@busy" @onclick="Cancel">Cancel</button>
                 <button class="btn btn-danger" disabled="@(busy || prompt.Refused is not null)"
-                        title="@(prompt.Refused ?? "Take these hours back off the work item")"
+                        title="@(prompt.Refused ?? (settling
+                            ? "Drop the entry, since those hours are already off the work item"
+                            : "Take these hours back off the work item"))"
                         @onclick="Confirm">
                     @if (busy)
                     {
                         <span class="spinner"></span>
-                        <span>Undoing…</span>
+                        <span>@(settling ? "Settling…" : "Undoing…")</span>
+                    }
+                    else if (_removeNote && prompt.CanRemoveNote)
+                    {
+                        <span>@(settling ? "Drop it and remove the note" : "Undo and remove the note")</span>
                     }
                     else
                     {
-                        <span>@(_removeNote && prompt.CanRemoveNote ? "Undo and remove the note" : "Undo")</span>
+                        <span>@(settling ? "Drop the entry" : "Undo")</span>
                     }
                 </button>
             </div>
@@ -99,26 +132,35 @@
     /// <summary>How much of the note the dialog shows before the rest is left to the tooltip.</summary>
     private const int NoteLimit = 160;
 
-    /// <summary>Whether the note goes with the hours. Ticked by default wherever it can be done.</summary>
+    /// <summary>
+    /// Whether the note goes with the hours. Ticked by default wherever it can be done, except
+    /// where that one comment is also the note of hours that are staying.
+    /// </summary>
     private bool _removeNote;
 
     /// <summary>
-    /// The entry the box was last set up for. A fresh prompt starts from the default rather
-    /// than from whatever the previous one was left on, including one for the same entry
-    /// opened again after a failed undo.
+    /// The prompt the box was last set up for, by identity. A fresh prompt starts from the
+    /// default rather than from whatever the previous one was left on - including one for the
+    /// same entry opened again after a failed undo, which is a new question, not the old one.
     /// </summary>
-    private Guid? _askedAbout;
+    private AppState.UndoPrompt? _askedAbout;
 
     protected override void OnInitialized() => State.Changed += OnChanged;
 
-    private void OnChanged()
+    /// <summary>
+    /// Everything this touches is touched on the renderer's own thread. <c>Changed</c> is raised
+    /// from wherever the change happened - the quiet settle raises it from a timer thread - and
+    /// the tick is read while the dialog renders, so setting it up outside the dispatcher would
+    /// be a write racing a read.
+    /// </summary>
+    private void OnChanged() => InvokeAsync(() =>
     {
         if (State.UndoingPrompt is { } prompt)
         {
-            if (_askedAbout != prompt.Entry.Id)
+            if (!ReferenceEquals(_askedAbout, prompt))
             {
-                _askedAbout = prompt.Entry.Id;
-                _removeNote = prompt.CanRemoveNote;
+                _askedAbout = prompt;
+                _removeNote = prompt.CanRemoveNote && prompt.NoteShared is null;
             }
         }
         else
@@ -126,8 +168,8 @@
             _askedAbout = null;
         }
 
-        InvokeAsync(StateHasChanged);
-    }
+        StateHasChanged();
+    });
 
     public void Dispose() => State.Changed -= OnChanged;
 

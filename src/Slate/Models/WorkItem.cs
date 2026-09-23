@@ -118,6 +118,24 @@ public sealed record TimeRecordResult(
     double AppliedRemaining = 0,
     TimeWritePlan? Plan = null);
 
+/// <summary>
+/// What became of a comment somebody asked to have taken off a discussion. Anything that went
+/// wrong is an exception, as everywhere else here; these are the two ways it can go right, and
+/// they are kept apart because only one of them may be spoken of as a comment removed.
+/// </summary>
+public enum CommentRemoval
+{
+    /// <summary>Azure DevOps took it off the discussion.</summary>
+    Removed,
+
+    /// <summary>
+    /// There was nothing at that address to take off. Usually a comment already gone, but the
+    /// same answer covers a project or a work item the address cannot find, so it may equally
+    /// be standing somewhere this did not look.
+    /// </summary>
+    NotThere,
+}
+
 /// <summary>One entry in a work item's discussion.</summary>
 public sealed record WorkItemComment(
     int Id,

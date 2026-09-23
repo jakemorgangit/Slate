@@ -220,9 +220,25 @@
                         the comment does not stand over hours that are no longer there. The hours always come
                         off first: a comment Azure DevOps will not delete is reported on its own and never puts
                         the booking back. The tick is only offered where the comment can actually be removed —
-                        an entry from an older version of Slate, one whose note went to the discussion with
-                        another block of the same day, or hours booked against an organization you are not
-                        connected to now say so instead.</dd>
+                        an entry from an older version of Slate, one whose note never reached the discussion,
+                        or hours booked against an organization you are not connected to now say so instead.</dd>
+
+                    <dt>One note, several blocks</dt>
+                    <dd>Recording a whole day posts a work item's note <em>once</em> however many of its blocks
+                        are booked, and every one of those entries is written down as carrying that comment. So
+                        the note comes off with the <em>last</em> of the hours it covers: undo one of them while
+                        the others stand and the dialog names what the note still speaks for and leaves the tick
+                        off — you can still tick it, but it says what you are leaving behind.</dd>
+
+                    <dt>Dropping an entry without undoing</dt>
+                    <dd>An undo Azure DevOps never confirmed leaves the entry with two answers on the Time tab.
+                        <strong>The undo did go through</strong> drops the entry, so it asks the same question
+                        and offers the same tick — that entry is the only record of which comment the note was.
+                        <strong>It never went through</strong> changes nothing but the pin and asks nothing.
+                        There is one entry that goes without asking: when Slate settles an unconfirmed undo by
+                        itself in the background and finds the hours really did come off, the entry goes and the
+                        note stays. Nobody is there to ask, and nothing is claimed about the comment — remove it
+                        in Azure DevOps if it should not stand.</dd>
 
                     <dt>Which items?</dt>
                     <dd>Only ones that carry the scheduling fields — Tasks and Bugs in the stock process
