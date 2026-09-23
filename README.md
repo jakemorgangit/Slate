@@ -507,7 +507,10 @@ If anything gets in the way — something is still under way after 30 seconds, t
 written to, the file is locked, the checksum does not match, or the new version closes or has not
 shown its window within 90 seconds — the new version is stopped, the old `.exe` is put back where
 it was, the app carries on exactly as before, and the release page opens so you can download it by
-hand. If you sign out or shut down while the new version is still starting, it is stopped and the
+hand. Slate never leaves that path without a Slate at it, and in the rare case where it cannot put
+the old one back at all — something is holding the file open and will not let go — it says so and
+names the `.old` beside it to rename back, rather than reporting a rollback that did not happen.
+If you sign out or shut down while the new version is still starting, it is stopped and the
 old `.exe` put back before Windows is allowed to carry on, so the old version is the one that opens
 next time. A build made with plain `dotnet build` does not know which flavour it is, so it only
 ever offers the link.

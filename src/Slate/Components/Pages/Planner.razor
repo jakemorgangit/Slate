@@ -872,18 +872,23 @@
             return;
         }
 
-        if (await State.SyncOneAsync(id))
+        switch (await State.SyncOneAsync(id))
         {
-            Toasts.Success("Sent to Outlook");
-            await State.LoadEventsAsync();
-        }
-        else
-        {
-            // No error on the block means it was never tried: the only way SyncOneAsync
-            // turns one down without one is an update taking over, and that should say so
-            // rather than leave a bare red toast with nothing under it.
-            Toasts.Error("Could not send that block",
-                Plan.Find(id)?.LastError ?? AppState.RestartingForUpdate);
+            case AppState.SentOne.Sent:
+                Toasts.Success("Sent to Outlook");
+                await State.LoadEventsAsync();
+                break;
+
+            case AppState.SentOne.Refused:
+                Toasts.Error("Could not send that block", AppState.RestartingForUpdate);
+                break;
+
+            default:
+                // The block carries why it failed - unless it is no longer in the plan at all,
+                // which is the other way a send comes back with nothing to show for itself.
+                Toasts.Error("Could not send that block",
+                    Plan.Find(id)?.LastError ?? "That block is no longer in the plan.");
+                break;
         }
     }
 

@@ -52,14 +52,15 @@ public sealed class AppState(
     private void DropStaleCaches()
     {
         var stamp = ConnectionStamp;
+        bool hadError;
 
         // Held across the whole clearing, not just the stamp. Published on its own, the stamp
         // says "this connection's caches are dealt with" while they are still there to deal
         // with, so a second caller arriving in between goes on believing that - and the load
         // it then finishes puts a list where this one is about to wipe it, leaving "Nothing
-        // loaded yet" with no error to explain it. Nothing in here waits on anything: they are
-        // field assignments, ForgetPeople only nulls two of its own, and dismissing a toast
-        // raises a change the pages answer by queueing a render.
+        // loaded yet" with no error to explain it. Nothing in here waits on anything, and
+        // nothing in here raises a change either: they are field assignments, and ForgetPeople
+        // only nulls two of its own.
         lock (_connectionGate)
         {
             if (stamp == _cachedFor) return;
@@ -73,11 +74,10 @@ public sealed class AppState(
             Members = [];
             ado.ForgetPeople();
 
-            // The error on screen and the "could not load" toast behind it were about the old
-            // connection. Left up, they report the new one failing before anything has asked it.
-            var hadError = WorkItemError is not null;
+            // The error on screen was about the old connection. Left up, it reports the new one
+            // failing before anything has asked it. The toast behind it goes too, below.
+            hadError = WorkItemError is not null;
             WorkItemError = null;
-            ClearWorkItemErrorToast();
 
             // A cached list is only ever a stand-in for this same connection's own list - once
             // the connection has moved on, holding onto it would let a failed load for the new
@@ -94,6 +94,13 @@ public sealed class AppState(
                 WorkItemsAreCached = false;
             }
         }
+
+        // Out here with the change below rather than in among the clearing: dismissing a toast
+        // raises ToastService.Changed, and a page answering that on this very thread - which is
+        // the window's thread whenever a settings save is what noticed - would render off
+        // half-cleared state. Nothing else reads the toast, so it is no worse a moment later.
+        // Reached only when the clearing above actually happened; the early return leaves.
+        ClearWorkItemErrorToast();
 
         // Raised here, once, rather than left to each caller: a quiet poll or a background
         // lookup like EnsureMembersAsync can be the one to notice, and the UI still needs to
@@ -341,7 +348,25 @@ public sealed class AppState(
 
             if (cts.IsCancellationRequested) return;
 
-            if (stamp != ConnectionStamp)
+            // The check and the write are one step, under the gate the clearing is done under.
+            // Apart, CheckConnection can clear for a new connection in between the two, and
+            // this would then put the old connection's list straight back with the cached flag
+            // off - another organization's items on screen looking current, with neither the
+            // amber notice nor the red banner to say otherwise.
+            bool stale;
+            var loadedAt = DateTimeOffset.Now;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp;
+                if (!stale)
+                {
+                    WorkItems = items;
+                    WorkItemsLoadedAt = loadedAt;
+                    WorkItemsAreCached = false;
+                }
+            }
+
+            if (stale)
             {
                 // The connection moved on again between that last fetch starting and now - too
                 // late to judge this answer by it, and too late to just leave, since the old
@@ -353,12 +378,9 @@ public sealed class AppState(
                 return;
             }
 
-            WorkItems = items;
-            WorkItemsLoadedAt = DateTimeOffset.Now;
-            WorkItemsAreCached = false;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, loadedAt, items);
 
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
@@ -442,19 +464,30 @@ public sealed class AppState(
             // than being overwritten by this older answer. Either way, a cached list left
             // over from a connection nobody is looking at any more is not this poll's to keep:
             // drop it rather than leave it looking current with neither notice nor banner.
-            if (stamp != ConnectionStamp || IsLoadingWorkItems)
+            // Checked and written under the one gate, for the reason LoadWorkItemsAsync gives.
+            bool stale;
+            var loadedAt = DateTimeOffset.Now;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp || IsLoadingWorkItems;
+                if (!stale)
+                {
+                    WorkItems = items;
+                    WorkItemsLoadedAt = loadedAt;
+                    WorkItemsAreCached = false;
+                    WorkItemError = null;
+                }
+            }
+
+            if (stale)
             {
                 DropStaleCaches();
                 return;
             }
 
-            WorkItems = items;
-            WorkItemsLoadedAt = DateTimeOffset.Now;
-            WorkItemsAreCached = false;
-            WorkItemError = null;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, loadedAt, items);
             Changed?.Invoke();
         }
         catch (Exception)
@@ -848,18 +881,34 @@ public sealed class AppState(
         }
     }
 
+    /// <summary>What became of a single block that was sent on its own.</summary>
+    public enum SentOne
+    {
+        /// <summary>It reached Outlook.</summary>
+        Sent,
+
+        /// <summary>It was tried and did not get through. Why is on the block, if it is still there.</summary>
+        Failed,
+
+        /// <summary>It was never tried: an update is taking over and no write may start.</summary>
+        Refused,
+    }
+
     /// <summary>
     /// Sends a single block, for the inline "send to Outlook" action. Counted like the full
-    /// sync, because it too creates an event and only then writes down its id. False when it
-    /// did not go; the reason is on the block, unless an update is taking over.
+    /// sync, because it too creates an event and only then writes down its id.
+    ///
+    /// Three outcomes rather than two, because the caller has to tell the user which: a block
+    /// that was deleted between the click and the answer also comes back without an error on
+    /// it, and blaming an update for that names a restart that is not happening.
     /// </summary>
-    public async Task<bool> SyncOneAsync(Guid id)
+    public async Task<SentOne> SyncOneAsync(Guid id)
     {
-        if (!TryBeginWrite()) return false;
+        if (!TryBeginWrite()) return SentOne.Refused;
 
         try
         {
-            return await planner.SyncOneAsync(id);
+            return await planner.SyncOneAsync(id) ? SentOne.Sent : SentOne.Failed;
         }
         finally
         {
@@ -2289,11 +2338,16 @@ public sealed class AppState(
 
     /// <summary>
     /// Set from the moment this copy is brought to a standstill for an update until it is let
-    /// out of it again. What <see cref="ResumeAfterFailedHandover"/> goes by, rather than the
-    /// gate being closed: the resume now comes from two places - wherever the updater put the
-    /// update back, and the install's own way out - and reading the gate would have whichever
-    /// arrived second take an open gate for "nothing to do", which is only true if the first
-    /// also brought the timers back. This says what was actually stopped.
+    /// out of it again, and what <see cref="ResumeAfterFailedHandover"/> goes by.
+    ///
+    /// The gate being closed would serve as the test too - the resume comes from two places
+    /// now, wherever the updater put the update back and the install's own way out, and the
+    /// first to arrive reopens the gate and restores the timers under the one lock, so the
+    /// second finds it open and rightly does nothing. The flag is kept because it names what
+    /// is actually being undone: a standstill, of which the gate is only one part. Going by
+    /// the gate would tie this method to the gate staying the only thing the standstill closes,
+    /// and a later change to either side would quietly make the resume skip the timers or
+    /// restore them twice.
     /// </summary>
     private bool _preparedForHandover;
 
@@ -2305,17 +2359,25 @@ public sealed class AppState(
     /// </summary>
     public void ResumeAfterFailedHandover()
     {
-        // Before the gate reopens, and whether or not this copy got as far as closing it: an
-        // update that did not go ahead leaves the data folder this copy's again, and a gate
-        // open over a frozen folder would take every save and write none of them. The updater
-        // thaws it itself as it puts things back; this is the second pair of hands, since
-        // nothing else would ever notice.
-        DataFolder.Thaw();
+        // Never after the update went through. Nothing reaches here that way today - the one
+        // caller that could checks first - but this copy would be replaying its held plan,
+        // settings and cache writes over the files the new copy has already read and is now
+        // writing, which is the one thing the whole handover exists to prevent.
+        if (SelfUpdater.HasHandedOver) return;
 
         lock (_timers)
         {
             if (!_preparedForHandover) return;
             _preparedForHandover = false;
+
+            // Before the gate reopens: an update that did not go ahead leaves the data folder
+            // this copy's again, and a gate open over a frozen folder would take every save
+            // and write none of them. The updater thaws it itself as it puts things back; this
+            // is the second pair of hands, since nothing else would ever notice. Inside the
+            // guard, because a folder frozen at all means this copy was prepared for a
+            // handover - Freeze only ever runs after that - and outside it, a thaw is only
+            // ever a thaw of a folder somebody else is now using.
+            DataFolder.Thaw();
 
             writes.Open();
             ConfigurePolling();

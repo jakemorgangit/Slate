@@ -319,9 +319,13 @@
         }
         catch (SelfUpdateException ex)
         {
+            // The reassurance only where it is true: a failure that left the new version in
+            // place, or nothing at all, says so in its own message and must not be followed by
+            // "nothing was changed".
             Toasts.Error(
                 $"Could not install Slate {release.Version}",
-                $"{ex.Message} Nothing was changed. The release page is open so you can download it yourself.");
+                $"{ex.Message}{(ex.NothingChanged ? " Nothing was changed." : "")} " +
+                "The release page is open so you can download it yourself.");
             SystemShell.OpenUrl(release.Url);
         }
         finally
