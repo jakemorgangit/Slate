@@ -302,6 +302,14 @@
                         @foreach (var entry in _entries.Where(e => e.Date.Date == day.Date))
                         {
                             var live = Plan.Find(entry.AllocationId) is not null;
+
+                            // Worked out once for the row, so the explanation, the two answers
+                            // and the Undo button can never disagree about whose hours these
+                            // are: it is the test the write paths themselves refuse by.
+                            var elsewhere = !entry.BelongsTo(_organization);
+                            var undoTitle = elsewhere
+                                ? $"Booked against {AppState.BookedAgainst(entry)}, which Slate is not connected to now, so Undo would change a different work item. Say it is the same organization first."
+                                : "Take this time back off the work item";
                             <div class="ghost-entry" @key="entry.Id" style="--wi-color: @Ui.ColorFor(entry.WorkItemType)">
                                 <div class="ghost-time">
                                     <div class="range">@Ui.TimeRange(entry.Start, entry.End)</div>
@@ -354,7 +362,7 @@
                                             Azure DevOps never confirmed the undo sent @Ui.Ago(undo.SentAt),
                                             so those hours may or may not still be on the work item.
                                         </div>
-                                        @if (!undo.CouldStillLand && entry.BelongsTo(_organization))
+                                        @if (!undo.CouldStillLand && !elsewhere)
                                         {
                                             <div class="row" style="margin-top: 6px; gap: 6px">
                                                 <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
@@ -372,7 +380,7 @@
                                        different work item. Recoverable rather than a dead end,
                                        because an organization that was renamed or moved has no
                                        old address left to switch back to. *@
-                                    @if (!entry.BelongsTo(_organization))
+                                    @if (elsewhere)
                                     {
                                         <div style="margin-top: 4px; font-size: 11.5px; color: var(--text-3)">
                                             Booked against <span class="mono">@AppState.BookedAgainst(entry)</span>, which Slate is
@@ -401,8 +409,14 @@
                                         <span>@Ui.DecimalHours(entry.Minutes)h</span>
                                     </div>
 
-                                    <button class="btn btn-sm btn-danger" title="Take this time back off the work item"
-                                            disabled="@(_undoing == entry.Id)"
+                                    @* Off for hours booked against an organization Slate is not
+                                       connected to: #7 over here is a different work item, so
+                                       the undo would be refused the moment it was asked for.
+                                       Said in the button rather than found out by pressing it -
+                                       the explanation just above carries the way out, which is
+                                       to say the two addresses are the same organization. *@
+                                    <button class="btn btn-sm btn-danger" title="@undoTitle"
+                                            disabled="@(elsewhere || _undoing is not null)"
                                             @onclick="() => UndoAsync(entry)">
                                         @if (_undoing == entry.Id)
                                         {

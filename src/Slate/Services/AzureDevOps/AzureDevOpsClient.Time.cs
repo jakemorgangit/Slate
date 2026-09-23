@@ -398,11 +398,14 @@ public sealed partial class AzureDevOpsClient
         if (!revision.RemainingAgrees(plan))
             return Undecided(plan, now,
                 $"revision {plan.Rev + 1} of #{plan.WorkItemId} makes the change this one makes, but "
+                + (revision.RemainingChanged
+                    ? $"moved Remaining Work from {revision.RemainingOld ?? 0:0.##}h to "
+                      + $"{revision.RemainingNew ?? 0:0.##}h"
+                    : $"left Remaining Work at {plan.RemainingBefore:0.##}h")
                 + (plan.SetsRemaining
-                    ? $"left Remaining Work at {revision.RemainingNew ?? plan.RemainingBefore:0.##}h where this "
-                      + $"change sets it to {plan.RemainingAfter:0.##}h"
-                    : $"also moved Remaining Work to {revision.RemainingNew ?? 0:0.##}h, which this change "
-                      + "does not touch"));
+                    ? $", where this change moves it from {plan.RemainingBefore:0.##}h to "
+                      + $"{plan.RemainingAfter:0.##}h"
+                    : ", which this change does not touch"));
 
         // The same question the other way round, for a change that moves Remaining Work alone -
         // an undo whose Completed Work delta clamped to nothing, because the work item's
@@ -539,20 +542,21 @@ public sealed partial class AzureDevOpsClient
         /// <summary>
         /// True when this revision also left Remaining Work where the change would have.
         ///
-        /// A change that moves Remaining must be seen to have moved it, exactly; one that does
-        /// not move it must be seen not to have moved it at all - our patch either leaves the
-        /// field out or sets it to where it already was, so a revision that moved it is not
-        /// simply ours. Both directions matter because the applied amounts are what an Undo
-        /// puts back: an entry filed for a revision that moved Remaining Work by something
-        /// other than what the entry says would leave that field permanently out by the
-        /// difference.
+        /// Judged on where the field ended up rather than on whether the revision touched it.
+        /// Our patch carries Remaining Work whenever the change sets it at all - including when
+        /// what it sets is the value already there, which is what booking against a work item
+        /// that has never had a Remaining Work comes to, both ends being nothing - and Azure
+        /// DevOps records that as a change of the field. Asking whether the field was touched
+        /// therefore refused the very revision our own PATCH had made.
+        ///
+        /// Both directions still matter, because the applied amounts are what an Undo puts
+        /// back: an entry filed for a revision that moved Remaining Work by something other
+        /// than what the entry says would leave that field permanently out by the difference.
         /// </summary>
         public bool RemainingAgrees(TimeWritePlan plan) =>
-            plan.SetsRemaining && !Same(plan.RemainingBefore, plan.RemainingAfter)
-                ? RemainingChanged
-                  && Same(RemainingOld ?? 0, plan.RemainingBefore)
-                  && Same(RemainingNew ?? 0, plan.RemainingAfter)
-                : !RemainingChanged;
+            RemainingChanged
+                ? Same(RemainingOld ?? 0, plan.RemainingBefore) && Same(RemainingNew ?? 0, plan.RemainingAfter)
+                : Same(plan.RemainingBefore, plan.RemainingAfter);
 
         /// <summary>
         /// The same for Completed Work, which matters in the direction <see cref="Made"/>
@@ -560,10 +564,6 @@ public sealed partial class AzureDevOpsClient
         /// an item whose Completed Work is already nothing. Nothing there held Completed to
         /// account, so a revision that moved Remaining exactly as the change would and also
         /// moved Completed Work was claimed as ours, filed with an applied Completed of zero.
-        ///
-        /// Where Remaining is judged on whether the revision touched the field at all, this
-        /// asks where the field ended up: our patch always carries Completed Work, so a change
-        /// that leaves it where it found it may or may not be recorded as having changed it.
         /// </summary>
         public bool CompletedAgrees(TimeWritePlan plan) =>
             CompletedChanged

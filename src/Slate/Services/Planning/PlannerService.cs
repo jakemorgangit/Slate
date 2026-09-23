@@ -26,12 +26,6 @@ public sealed record SyncSummary(int Created, int Updated, int Deleted, int Fail
 /// </summary>
 public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, SettingsStore settings)
 {
-    /// <summary>
-    /// Event ids whose allocation was deleted but whose calendar event still needs removing.
-    /// Kept in the plan file, so closing the app before the next send does not strand them.
-    /// </summary>
-    private List<string> PendingDeletes => store.PendingDeletes;
-
     public event Action? Changed;
 
     /// <summary>
@@ -57,11 +51,27 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     public IEnumerable<Allocation> ForDay(DateTime day) => InRange(day.Date, day.Date.AddDays(1));
 
-    public int PendingCount => store.All.Count(a => a.State is SyncState.Draft or SyncState.Modified or SyncState.Failed)
-                               + PendingDeletes.Count;
+    /// <summary>
+    /// How much is waiting to go to Outlook: the blocks with unsent changes, and the events of
+    /// deleted blocks still to be removed.
+    ///
+    /// Counted under the store's lock, because this is asked off the UI thread as well as from
+    /// the header - the auto-sync timer's callback, and every Changed a Persist raises, which
+    /// includes the ones the calendar poll makes. Counting enumerates the blocks while the UI
+    /// thread can be taking one out of the same list, and what that throws - "Collection was
+    /// modified", or a torn read of the list - lands somewhere that swallows it: an auto-sync
+    /// round silently skipped, or the calendar load's catch, which clears the events already on
+    /// screen and shows an error for something that never went wrong.
+    /// </summary>
+    public int PendingCount => store.Edit(file =>
+        file.Allocations.Count(a => a.State is SyncState.Draft or SyncState.Modified or SyncState.Failed)
+        + file.PendingDeletes.Count);
 
-    /// <summary>Blocks whose Outlook event was deleted there and which need a decision.</summary>
-    public int MissingCount => store.All.Count(a => a.MissingInOutlook);
+    /// <summary>
+    /// Blocks whose Outlook event was deleted there and which need a decision. Counted under
+    /// the lock for the same reason as <see cref="PendingCount"/>.
+    /// </summary>
+    public int MissingCount => store.Edit(file => file.Allocations.Count(a => a.MissingInOutlook));
 
     // ---------------------------------------------------------------- mutations
 
@@ -181,7 +191,20 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         copy.SyncedFingerprint = null;
         copy.LastError = null;
 
-        // Cleared for the same reason as the four above, and with more reason: a newer Slate's
+        // Nothing has ever been booked from a block that did not exist a moment ago. These say
+        // the opposite - hours already recorded against this block somewhere else - and nothing
+        // refreshes them for the copy: its own event goes out with a recorded total of zero,
+        // read from the entries, which is where recording lives. Left on, Record day showed the
+        // copy as part-recorded and took that off what it would book, silently booking nothing
+        // at all for a copy of a fully recorded block, and the single dialog told the user hours
+        // had gone on it from another machine. The third is the running total old plans kept on
+        // the block: it is only ever read to migrate one, and a copy carrying it would be
+        // migrated into a time entry for hours nobody booked.
+        copy.RecordedElsewhereMinutes = 0;
+        copy.LastRecordedAt = null;
+        copy.RecordedMinutes = 0;
+
+        // Cleared for the same reason as the ones above, and with more reason: a newer Slate's
         // per-block members are exactly what this copy cannot read, so it cannot tell which of
         // them say what that one block is - an event, a send, hours already booked. Clearing
         // also gives the copy its own dictionary, which Clone does not: it copies the
@@ -923,12 +946,27 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         return stamped;
     }
 
+    /// <summary>
+    /// Writes the organization onto one entry, keeping whatever of its id is worth keeping.
+    ///
+    /// The address is the whole point of adopting and is simply replaced. The id is not: it is
+    /// the one part of an organization that a rename or a new address leaves alone, and it is
+    /// empty until connectionData has been read for the address Slate is pointed at now -
+    /// which is exactly the state just after an organization is switched, the switch that makes
+    /// these hours need adopting in the first place. Writing that emptiness over the id the
+    /// entry already carries would throw away the very thing the stamp exists to hold, and the
+    /// next rename would strand the entry all over again. So a known id is only ever replaced
+    /// by another known one; saying these hours are this organization's while it cannot say
+    /// which organization that is leaves the id they were booked with standing.
+    /// </summary>
     private static bool Stamp(TimeEntry entry, OrganizationRef organization)
     {
-        if (entry.Organization == organization.Url && entry.OrganizationId == organization.Id) return false;
+        var id = organization.Id.Length > 0 ? organization.Id : entry.OrganizationId;
+
+        if (entry.Organization == organization.Url && entry.OrganizationId == id) return false;
 
         entry.Organization = organization.Url;
-        entry.OrganizationId = organization.Id;
+        entry.OrganizationId = id;
         return true;
     }
 

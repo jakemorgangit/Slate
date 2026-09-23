@@ -2658,6 +2658,19 @@ public sealed class AppState(
     /// </summary>
     public async Task<bool> UndoTimeEntryAsync(TimeEntry entry)
     {
+        // Somebody else's #7, refused before anything is counted in: an undo that was never
+        // going to happen must not hold a handover open, nor claim the entry on its way to
+        // being turned away. The time view disables its Undo on this same test, because it is
+        // the one place that can also offer the way out; the plan's own menus offer it and are
+        // answered here, where the refusal names where to go. Read from the plan rather than
+        // trusting the caller's copy, and asked again below under the claim, where the entry
+        // cannot change underneath the write.
+        if (planner.FindTimeEntry(entry.Id) is { } shown && WrongConnection(shown) is { } wrongOrganization)
+        {
+            toasts.Error("Those hours are not this organization's to undo", wrongOrganization);
+            return false;
+        }
+
         // Counted for the same reason as recording: cut off between the write and dropping
         // the entry, the entry would survive to be undone a second time. The plan being
         // unwritable is that same gap held open for the whole session.
