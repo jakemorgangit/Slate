@@ -1,0 +1,144 @@
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+
+@* Undoing asks first, because one part of it cannot be put back: the note those hours left on
+   the work item's discussion either goes with them or stays, and a deleted comment is gone.
+   Every route to an undo - the Time tab, the block's menu, the inspector - comes through here. *@
+@if (State.UndoingPrompt is { } prompt)
+{
+    var entry = prompt.Entry;
+    var busy = State.UndoingEntry is not null;
+
+    <div class="modal-scrim" @onclick="Cancel" @onkeydown="OnKeyDown" tabindex="-1">
+        <div class="modal narrow" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span class="dot" style="background: @Ui.ColorFor(entry.WorkItemType); margin-top: 7px"></span>
+                <div class="grow">
+                    <h2>Undo @Ui.Hours(entry.Minutes)?</h2>
+                    <div class="sub">
+                        <span class="mono">#@entry.WorkItemId</span>
+                        <span>·</span>
+                        <span class="truncate">@Ui.Clip(entry.WorkItemTitle, 70)</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-body">
+                <p class="hint">
+                    This takes the booking back off the work item in Azure DevOps:
+                    <em>Completed Work</em> goes back down@(entry.ReducedRemaining
+                        ? ", and Remaining Work back up by the same amount" : ""). The entry only
+                    disappears from the Time tab once that write has actually gone through.
+                </p>
+
+                @* The same refusal the write itself would give, said before the button rather
+                   than after it - a work item number means nothing outside the organization it
+                   was booked in, so there is nothing here that could succeed. *@
+                @if (prompt.Refused is { } refused)
+                {
+                    <div class="banner error">
+                        <span>!</span>
+                        <div class="grow">@refused</div>
+                    </div>
+                }
+
+                @if (!string.IsNullOrWhiteSpace(entry.Comment))
+                {
+                    <div class="hint" style="margin-top: 10px; font-style: italic" title="@entry.Comment">
+                        “@Ui.Clip(entry.Comment, NoteLimit)”
+                    </div>
+                }
+
+                @* Offered only where it could actually be done: Slate knows which comment it
+                   posted, and these hours are this connection's. Anywhere else the tick is
+                   absent and the line below says why. *@
+                @if (prompt.CanRemoveNote)
+                {
+                    <label class="switch" style="margin-top: 10px">
+                        <input type="checkbox" checked="@_removeNote" disabled="@busy"
+                               @onchange="OnRemoveNoteChanged" />
+                        <span class="track"></span>
+                        <span class="label">Also remove the note from the work item's discussion</span>
+                    </label>
+                    <div class="hint" style="margin-top: 6px">
+                        The hours come off first. If the comment will not delete, the undo still stands
+                        and Slate says so.
+                    </div>
+                }
+                else if (prompt.NoteKept is { } kept)
+                {
+                    <div class="hint" style="margin-top: 10px">@kept</div>
+                }
+            </div>
+
+            <div class="modal-foot">
+                <span style="flex: 1"></span>
+                <button class="btn" disabled="@busy" @onclick="Cancel">Cancel</button>
+                <button class="btn btn-danger" disabled="@(busy || prompt.Refused is not null)"
+                        title="@(prompt.Refused ?? "Take these hours back off the work item")"
+                        @onclick="Confirm">
+                    @if (busy)
+                    {
+                        <span class="spinner"></span>
+                        <span>Undoing…</span>
+                    }
+                    else
+                    {
+                        <span>@(_removeNote && prompt.CanRemoveNote ? "Undo and remove the note" : "Undo")</span>
+                    }
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    /// <summary>How much of the note the dialog shows before the rest is left to the tooltip.</summary>
+    private const int NoteLimit = 160;
+
+    /// <summary>Whether the note goes with the hours. Ticked by default wherever it can be done.</summary>
+    private bool _removeNote;
+
+    /// <summary>
+    /// The entry the box was last set up for. A fresh prompt starts from the default rather
+    /// than from whatever the previous one was left on, including one for the same entry
+    /// opened again after a failed undo.
+    /// </summary>
+    private Guid? _askedAbout;
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    private void OnChanged()
+    {
+        if (State.UndoingPrompt is { } prompt)
+        {
+            if (_askedAbout != prompt.Entry.Id)
+            {
+                _askedAbout = prompt.Entry.Id;
+                _removeNote = prompt.CanRemoveNote;
+            }
+        }
+        else
+        {
+            _askedAbout = null;
+        }
+
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    private void OnRemoveNoteChanged(ChangeEventArgs e) => _removeNote = e.Value is true or "true" or "on";
+
+    private void Cancel() => State.CancelUndoTimeEntry();
+
+    private Task Confirm() => State.ConfirmUndoTimeEntryAsync(_removeNote);
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Cancel();
+    }
+}

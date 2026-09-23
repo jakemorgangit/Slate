@@ -582,6 +582,7 @@
 <ScheduleDialog />
 <SpawnTaskDialog />
 <PriorityDialog />
+<UndoTimeDialog />
 <NewWorkItemDialog OnSchedule="BookNextFree" />
 
 @code {
@@ -951,10 +952,12 @@
                 // first and only reaches Record day once nothing covers it - its edits intact.
                 var recordDayCovered = State.DetailWorkItemId is not null
                                        || State.SchedulingFor is not null
-                                       || State.PriorityPrompt is not null;
+                                       || State.PriorityPrompt is not null
+                                       || State.UndoingPrompt is not null;
                 CloseMenu();
                 State.CloseWorkItem();
                 State.CancelRecordTime();
+                State.CancelUndoTimeEntry();
                 if (!recordDayCovered) State.CancelRecordDay();
                 State.CancelSchedule();
                 State.SelectAllocation(null);
@@ -1033,16 +1036,21 @@
         State.BeginRecordTime(allocation);
     }
 
-    private async Task UndoRecordedTime(TimeEntry entry)
+    /// <summary>
+    /// Asks about the undo rather than doing it: the note these hours put on the discussion
+    /// goes with them or stays, and the dialog is where that is answered - the same one the
+    /// Time tab opens, so an undo is asked the same way wherever it starts.
+    /// </summary>
+    private void UndoRecordedTime(TimeEntry entry)
     {
         CloseMenu();
-        await State.UndoTimeEntryAsync(entry);
+        State.BeginUndoTimeEntry(entry);
     }
 
-    private async Task UndoLatestFor(Allocation allocation)
+    private void UndoLatestFor(Allocation allocation)
     {
         if (Plan.LatestEntryForBlock(allocation.Id) is not { } entry) return;
-        await State.UndoTimeEntryAsync(entry);
+        State.BeginUndoTimeEntry(entry);
     }
 
     private void ShowTimeView()

@@ -647,6 +647,31 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         };
     }
 
+    /// <summary>
+    /// Writes down which comment a booking's note was posted as, so undoing those hours can
+    /// offer to take the note off with them. The project goes down beside the id because that
+    /// is how the comment is addressed, and the project selected here can move on afterwards.
+    ///
+    /// Only the entry that actually posted one gets an id: a day booked in one pass posts a
+    /// work item's note once while every entry of it keeps the text, and a second entry
+    /// claiming that comment would have two undos both trying to remove it.
+    /// </summary>
+    public void SetTimeNote(Guid entryId, int commentId, string project)
+    {
+        // Through the store, under the lock a save holds - this follows a time write, which
+        // can be going on while a polling timer saves the plan on another thread.
+        var set = store.Edit(file =>
+        {
+            if (file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is not { } entry) return false;
+
+            entry.CommentId = commentId;
+            entry.CommentProject = project;
+            return true;
+        });
+
+        if (set) Persist();
+    }
+
     // ---------------------------------------------------------------- unconfirmed bookings
 
     /// <summary>

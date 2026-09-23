@@ -204,8 +204,8 @@
                     <dd>The dialog has an optional <strong>Note</strong>. Anything you write there is posted to
                         the work item's <strong>discussion</strong>, in Plain or Markdown just like the comment
                         box. Leave it empty and nothing is posted. If the hours go through but the note does
-                        not, the booking still stands and the app says so — undoing the entry later does not
-                        retract the comment.</dd>
+                        not, the booking still stands and the app says so. Slate remembers which comment it
+                        posted, so undoing those hours can offer to take the note off with them.</dd>
 
                     <dt>Seeing it</dt>
                     <dd>Blocks with time booked get a <span style="color: var(--danger)"><ClockIcon Size="12" /></span>
@@ -215,7 +215,14 @@
 
                     <dt>Undoing it</dt>
                     <dd>Right-click the block → <strong>Undo recorded time</strong>, or press Undo on any entry
-                        in the Time tab. It takes that exact booking back off the work item.</dd>
+                        in the Time tab. It takes that exact booking back off the work item, and asks first —
+                        with <strong>Also remove the note from the work item's discussion</strong> ticked, so
+                        the comment does not stand over hours that are no longer there. The hours always come
+                        off first: a comment Azure DevOps will not delete is reported on its own and never puts
+                        the booking back. The tick is only offered where the comment can actually be removed —
+                        an entry from an older version of Slate, one whose note went to the discussion with
+                        another block of the same day, or hours booked against an organization you are not
+                        connected to now say so instead.</dd>
 
                     <dt>Which items?</dt>
                     <dd>Only ones that carry the scheduling fields — Tasks and Bugs in the stock process

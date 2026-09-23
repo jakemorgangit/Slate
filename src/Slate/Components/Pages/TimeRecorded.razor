@@ -184,16 +184,16 @@
                                 }
                                 @if (!entry.BelongsTo(_organization))
                                 {
-                                    <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                    <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
                                             title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps."
                                             @onclick="() => AdoptEntry(entry)">Same organization</button>
                                 }
                                 else if (!undo.CouldStillLand)
                                 {
-                                    <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                    <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
                                             title="Only once you have looked at the work item and those hours are no longer on it. Nothing is written to Azure DevOps; the entry is simply dropped, as the undo would have."
                                             @onclick="() => AnswerUndo(entry, wentThrough: true)">The undo did go through</button>
-                                    <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                    <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
                                             title="Only once you have looked at the work item and those hours are still on it. Nothing is written to Azure DevOps; the entry stands and Undo works on it again."
                                             @onclick="() => AnswerUndo(entry, wentThrough: false)">It never went through</button>
                                 }
@@ -365,10 +365,10 @@
                                         @if (!undo.CouldStillLand && !elsewhere)
                                         {
                                             <div class="row" style="margin-top: 6px; gap: 6px">
-                                                <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                                <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
                                                         title="Only once you have looked at the work item and those hours are no longer on it. Nothing is written to Azure DevOps; the entry is simply dropped, as the undo would have."
                                                         @onclick="() => AnswerUndo(entry, wentThrough: true)">The undo did go through</button>
-                                                <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                                <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
                                                         title="Only once you have looked at the work item and those hours are still on it. Nothing is written to Azure DevOps; the entry stands and Undo works on it again."
                                                         @onclick="() => AnswerUndo(entry, wentThrough: false)">It never went through</button>
                                             </div>
@@ -386,7 +386,7 @@
                                             Booked against <span class="mono">@AppState.BookedAgainst(entry)</span>, which Slate is
                                             not connected to now, so Undo would change a different work item.
                                             <button class="btn btn-sm btn-ghost" style="margin-left: 6px"
-                                                    disabled="@(_undoing is not null)"
+                                                    disabled="@(State.UndoingEntry is not null)"
                                                     title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps."
                                                     @onclick="() => AdoptEntry(entry)">Same organization</button>
                                         </div>
@@ -416,9 +416,9 @@
                                        the explanation just above carries the way out, which is
                                        to say the two addresses are the same organization. *@
                                     <button class="btn btn-sm btn-danger" title="@undoTitle"
-                                            disabled="@(elsewhere || _undoing is not null)"
-                                            @onclick="() => UndoAsync(entry)">
-                                        @if (_undoing == entry.Id)
+                                            disabled="@(elsewhere || State.UndoingEntry is not null)"
+                                            @onclick="() => Undo(entry)">
+                                        @if (State.UndoingEntry == entry.Id)
                                         {
                                             <span class="spinner"></span>
                                         }
@@ -436,6 +436,7 @@
 
 <WorkItemModal />
 <PriorityDialog />
+<UndoTimeDialog />
 
 @code {
     private List<TimeEntry> _entries = [];
@@ -449,7 +450,6 @@
     /// pin a second time would find it gone.
     /// </summary>
     private List<(TimeEntry Entry, TimeWritePlan Undo)> _stuckUndos = [];
-    private Guid? _undoing;
     private Guid? _busy;
 
     /// <summary>The organization Slate is connected to, as of the last rebuild of this page.</summary>
@@ -597,7 +597,7 @@
     /// <summary>The same for one filed entry, so its Undo stops being refused.</summary>
     private void AdoptEntry(TimeEntry entry)
     {
-        if (_undoing is not null) return;
+        if (State.UndoingEntry is not null) return;
 
         State.AdoptOrganizationForEntry(entry.Id);
         Recompute();
@@ -609,24 +609,16 @@
     /// </summary>
     private void AnswerUndo(TimeEntry entry, bool wentThrough)
     {
-        if (_undoing is not null) return;
+        if (State.UndoingEntry is not null) return;
 
         State.AnswerUnconfirmedUndo(entry.Id, wentThrough);
         Recompute();
     }
 
-    private async Task UndoAsync(TimeEntry entry)
-    {
-        if (_undoing is not null) return;
-
-        _undoing = entry.Id;
-        try
-        {
-            await State.UndoTimeEntryAsync(entry);
-        }
-        finally
-        {
-            _undoing = null;
-        }
-    }
+    /// <summary>
+    /// Asks about the undo rather than doing it: the note that went to the discussion with
+    /// these hours comes off with them or stays, and that is a question only the user can
+    /// answer. The dialog carries out whichever it is.
+    /// </summary>
+    private void Undo(TimeEntry entry) => State.BeginUndoTimeEntry(entry);
 }

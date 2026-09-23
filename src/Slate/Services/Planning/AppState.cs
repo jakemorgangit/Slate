@@ -1663,7 +1663,8 @@ public sealed class AppState(
     {
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordDayFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
-            || PriorityPrompt is not null || Creating is not null || SpawnFor is not null) return;
+            || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
+            || UndoingPrompt is not null) return;
 
         RecordingFor = allocation;
         Changed?.Invoke();
@@ -1685,7 +1686,8 @@ public sealed class AppState(
     {
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordingFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
-            || PriorityPrompt is not null || Creating is not null || SpawnFor is not null) return;
+            || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
+            || UndoingPrompt is not null) return;
 
         RecordDayFor = day.Date;
         Changed?.Invoke();
@@ -1729,8 +1731,8 @@ public sealed class AppState(
 
         try
         {
-            var result = await WriteTimeAsync(allocation, hours, reduceRemaining, note);
-            var noted = await PostTimeNoteAsync(allocation, note, noteFormat);
+            var (result, entry) = await WriteTimeAsync(allocation, hours, reduceRemaining, note);
+            var noted = await PostTimeNoteAsync(allocation, note, noteFormat, entry.Id);
 
             toasts.Success($"Recorded {hours:0.##}h on #{allocation.WorkItemId}",
                 $"Completed Work is now {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h."
@@ -1780,7 +1782,9 @@ public sealed class AppState(
     ///
     /// The note is kept on the time entry every time, but <paramref name="postNote"/> decides
     /// whether it also goes to the discussion: a day with two blocks of the same item books
-    /// both, and the item should still get the comment once.
+    /// both, and the item should still get the comment once. Only the entry that posts it is
+    /// given the comment's id, so undoing that one offers to take the note off and undoing
+    /// the other says plainly that there is no comment of its own to remove.
     /// </summary>
     public async Task<(TimeWriteOutcome Outcome, string? Error)> RecordTimeSilentAsync(
         Allocation allocation, double hours, bool reduceRemaining,
@@ -1792,8 +1796,8 @@ public sealed class AppState(
 
         try
         {
-            await WriteTimeAsync(allocation, hours, reduceRemaining, note);
-            if (postNote) await PostTimeNoteAsync(allocation, note, noteFormat);
+            var (_, entry) = await WriteTimeAsync(allocation, hours, reduceRemaining, note);
+            if (postNote) await PostTimeNoteAsync(allocation, note, noteFormat, entry.Id);
 
             Changed?.Invoke();
             _ = RefreshWorkItemAsync(allocation.WorkItemId);
@@ -1915,8 +1919,12 @@ public sealed class AppState(
     /// The booking is written to the plan before each send rather than once the answer is
     /// back, so the gap the claim cannot cover - a copy that dies with the PATCH already on
     /// its way - leaves the next one something it can settle against the work item.
+    ///
+    /// The entry comes back beside the result so the note posted afterwards can be written
+    /// onto the very entry these hours made, which is what lets an undo of them offer to
+    /// take the note off too.
     /// </summary>
-    private async Task<TimeRecordResult> WriteTimeAsync(
+    private async Task<(TimeRecordResult Result, TimeEntry Entry)> WriteTimeAsync(
         Allocation allocation, double hours, bool reduceRemaining, string note)
     {
         // A booking from this block that nothing has settled may be on the work item already,
@@ -1969,7 +1977,7 @@ public sealed class AppState(
         // The hours are on the work item by now, so a plan file that will not take the entry
         // must not be reported as a failure: that is a one-click retry of hours already booked.
         PinQuietly(() => planner.Confirm(pending, result), allocation.WorkItemId);
-        return result;
+        return (result, pending.Entry);
     }
 
     /// <summary>
@@ -2622,17 +2630,34 @@ public sealed class AppState(
     /// Adds the note that came with a time booking to the work item's discussion. Returns
     /// whether anything was posted: an empty note is the normal case, not a failure.
     ///
+    /// The comment it becomes is written onto the entry those hours made, so an undo of them
+    /// can offer to take the note back off. Written down quietly, the way everything else
+    /// around a time write is: the comment is on the work item by then, and a plan file that
+    /// will not take the id must not turn a posted note into a reported failure. All that is
+    /// lost is the offer to remove it.
+    ///
     /// If the work item on show is the one being booked against, the new comment is folded
     /// into the loaded discussion so the open modal does not have to be reopened to see it.
     /// </summary>
-    private async Task<bool> PostTimeNoteAsync(Allocation allocation, string note, TextFormat format)
+    private async Task<bool> PostTimeNoteAsync(
+        Allocation allocation, string note, TextFormat format, Guid entryId)
     {
         if (string.IsNullOrWhiteSpace(note)) return false;
+
+        // Resolved here rather than left to the client's own fallback, because the project a
+        // comment was posted under is what addresses it afterwards, and the selected one can
+        // have moved on by the time the entry is undone.
+        var project = string.IsNullOrWhiteSpace(allocation.Project)
+            ? Settings.Ado.Project
+            : allocation.Project;
 
         try
         {
             var comment = await ado.AddCommentAsync(
-                allocation.WorkItemId, allocation.Project, Html.ToCommentHtml(note, format, Members));
+                allocation.WorkItemId, project, Html.ToCommentHtml(note, format, Members));
+
+            if (comment.Id > 0)
+                PinQuietly(() => planner.SetTimeNote(entryId, comment.Id, project), allocation.WorkItemId);
 
             if (DetailWorkItemId == allocation.WorkItemId) Comments = [.. Comments, comment];
             return true;
@@ -2644,8 +2669,141 @@ public sealed class AppState(
         }
     }
 
+    /// <summary>
+    /// Takes the note a booking posted back off the work item's discussion, once those hours
+    /// are off it. Returns whether a comment was actually removed.
+    ///
+    /// Shaped like <see cref="PostTimeNoteAsync"/> and for the same reason: the hours are the
+    /// point of an undo and they are already reversed by the time this runs, so a discussion
+    /// that will not give the comment up says so and leaves the undo standing. It is never
+    /// allowed to put the hours back.
+    ///
+    /// If the work item on show is the one being undone, the comment is taken out of the
+    /// loaded discussion too, so the open modal does not go on showing a note for hours that
+    /// are no longer there.
+    /// </summary>
+    private async Task<bool> RemoveTimeNoteAsync(TimeEntry entry)
+    {
+        if (entry.CommentId <= 0) return false;
+
+        try
+        {
+            await ado.DeleteCommentAsync(entry.WorkItemId, entry.CommentProject, entry.CommentId);
+
+            if (DetailWorkItemId == entry.WorkItemId)
+                Comments = [.. Comments.Where(c => c.Id != entry.CommentId)];
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            toasts.Warning($"The time came off #{entry.WorkItemId}, but its note is still on the discussion",
+                ex.Message + " Remove the comment in Azure DevOps if it should not stand.");
+            return false;
+        }
+    }
+
     /// <summary>Entries being taken back off at this moment, so a second Undo cannot take them off twice.</summary>
     private readonly HashSet<Guid> _undoingEntries = [];
+
+    /// <summary>
+    /// An undo waiting to be confirmed, and what can be done about the note those hours put on
+    /// the work item's discussion.
+    ///
+    /// <see cref="Refused"/> is why the undo itself cannot go ahead at all, from the one test
+    /// the write path refuses by, so the dialog can say so instead of offering a button that
+    /// could only be turned down.
+    ///
+    /// <see cref="CanRemoveNote"/> holds when Slate knows which comment it posted and the undo
+    /// is not refused. Anything else and the offer is not made rather than made and then
+    /// refused - <see cref="NoteKept"/> then says why, for the case where there is plainly a
+    /// note and somebody would otherwise expect the offer.
+    /// </summary>
+    public sealed record UndoPrompt(TimeEntry Entry, bool CanRemoveNote, string? NoteKept, string? Refused);
+
+    /// <summary>The undo being confirmed, or null while nothing is being asked about.</summary>
+    public UndoPrompt? UndoingPrompt { get; private set; }
+
+    /// <summary>The entry whose undo is going to Azure DevOps at this moment, for the spinners.</summary>
+    public Guid? UndoingEntry { get; private set; }
+
+    /// <summary>
+    /// Asks before taking a booking back off, because the answer decides something the undo
+    /// cannot take back afterwards: whether the note those hours left on the discussion goes
+    /// with them. Every route to an undo comes through here - the Time tab, the block's menu
+    /// and the inspector - so the question is asked the same way wherever it starts.
+    ///
+    /// Hours from another organization are shown with the refusal the write path would give,
+    /// rather than an Undo that could only be turned down: the block's menu has no way of its
+    /// own to say so, and the refusal carries the way out with it.
+    /// </summary>
+    public void BeginUndoTimeEntry(TimeEntry entry)
+    {
+        if (UndoingPrompt is not null || UndoingEntry is not null) return;
+
+        // Read from the plan, so the question is asked about the entry as it stands rather
+        // than a copy a page has been holding since it last rendered.
+        var current = planner.FindTimeEntry(entry.Id) ?? entry;
+        var refused = WrongConnection(current);
+        var canRemoveNote = current.CommentId > 0 && refused is null;
+
+        // Nothing to explain when the offer is there, and nothing worth explaining when the
+        // undo itself is refused - that refusal is about the whole entry, note and all.
+        var noteKept = canRemoveNote || refused is not null ? null : WhyNoteKept(current);
+
+        UndoingPrompt = new UndoPrompt(current, canRemoveNote, noteKept, refused);
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Why the note cannot come off with the hours, when there is one and the offer is
+    /// therefore missing from the dialog. Null when there was no note at all: nothing was
+    /// posted, so there is nothing to explain.
+    /// </summary>
+    private static string? WhyNoteKept(TimeEntry entry) =>
+        entry.Comment.Length == 0
+            ? null
+            : "Slate did not record which comment this note was posted as, so it cannot take it off: "
+              + "the entry was recorded by an older version of Slate, the note went on with another "
+              + "block of the same day, or it never reached the discussion. Remove the comment in "
+              + "Azure DevOps if it should not stand.";
+
+    public void CancelUndoTimeEntry()
+    {
+        if (UndoingPrompt is null || UndoingEntry is not null) return;
+
+        UndoingPrompt = null;
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Carries out the undo that was asked about, with or without its note.
+    ///
+    /// The tick is only honoured where the prompt said it could be: what is offered and what
+    /// is done are the one decision, so a stale tick from a dialog left open across a change
+    /// of organization cannot turn into a delete against somebody else's work item.
+    /// </summary>
+    public async Task<bool> ConfirmUndoTimeEntryAsync(bool removeNote)
+    {
+        if (UndoingPrompt is not { } prompt || UndoingEntry is not null) return false;
+
+        UndoingEntry = prompt.Entry.Id;
+        Changed?.Invoke();
+
+        try
+        {
+            return await UndoTimeEntryAsync(prompt.Entry, removeNote && prompt.CanRemoveNote);
+        }
+        finally
+        {
+            UndoingEntry = null;
+
+            // Closed however it went: what happened is in the toast, and the entry is still
+            // there to try again on when it failed. Only this very prompt, by identity.
+            if (ReferenceEquals(UndoingPrompt, prompt)) UndoingPrompt = null;
+            Changed?.Invoke();
+        }
+    }
 
     /// <summary>
     /// Takes a booking back off the work item in Azure DevOps and drops the entry. Only
@@ -2655,8 +2813,14 @@ public sealed class AppState(
     /// a copy that dies mid-write leaves it behind too - and the next Undo looks for it before
     /// doing anything: taking the hours off again when the first one had gone through would
     /// hand back work that was never there.
+    ///
+    /// <paramref name="removeNote"/> also takes the note these hours posted off the work
+    /// item's discussion, and only ever after the hours themselves are off: the hours are what
+    /// this is for, and a comment that will not be deleted is reported on its own rather than
+    /// unwinding a good undo. An undo Azure DevOps could not confirm removes nothing - those
+    /// hours may still be on the work item, which is exactly when the note should still stand.
     /// </summary>
-    public async Task<bool> UndoTimeEntryAsync(TimeEntry entry)
+    public async Task<bool> UndoTimeEntryAsync(TimeEntry entry, bool removeNote = false)
     {
         // Somebody else's #7, refused before anything is counted in: an undo that was never
         // going to happen must not hold a handover open, nor claim the entry on its way to
@@ -2726,8 +2890,13 @@ public sealed class AppState(
                 // out - and that says this one did not land, whatever the check saw.
                 if (landed.Value && planner.SettleUnconfirmedUndo(entry.Id, earlier, landed: true))
                 {
+                    // The hours came off when that undo landed after all, so the note goes now
+                    // as it would have then - after the entry, like every other undo here.
+                    var noteGone = removeNote && await RemoveTimeNoteAsync(current);
+
                     toasts.Success($"Undid {entry.Hours:0.##}h on #{entry.WorkItemId}",
-                        "The earlier undo had gone through after all, so nothing more was taken off.");
+                        "The earlier undo had gone through after all, so nothing more was taken off."
+                        + (noteGone ? " Its note has been taken off the discussion." : ""));
                     Changed?.Invoke();
                     _ = RefreshWorkItemAsync(entry.WorkItemId);
                     return true;
@@ -2763,8 +2932,14 @@ public sealed class AppState(
 
             planner.RemoveTimeEntry(entry.Id, result.Plan);
 
+            // The hours are off the work item and the entry is gone; only now is the note
+            // worth taking back. A discussion that will not give it up says so on its own and
+            // changes nothing else - the undo has already happened and must stay happened.
+            var noteRemoved = removeNote && await RemoveTimeNoteAsync(current);
+
             toasts.Success($"Undid {entry.Hours:0.##}h on #{entry.WorkItemId}",
-                $"Completed Work is back to {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h.");
+                $"Completed Work is back to {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h."
+                + (noteRemoved ? " Its note has been taken off the discussion." : ""));
 
             Changed?.Invoke();
             _ = RefreshWorkItemAsync(entry.WorkItemId);

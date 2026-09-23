@@ -70,11 +70,30 @@ public sealed class TimeEntry
 
     /// <summary>
     /// The note posted to the work item's discussion when this time was booked, as it was
-    /// typed. Kept so the entry can say what the hours went on. Undoing the entry does not
-    /// retract the comment - a discussion is a record of what was said at the time, and
-    /// quietly deleting from it would lose somebody else's reply along with it.
+    /// typed. Kept so the entry can say what the hours went on.
     /// </summary>
     public string Comment { get; set; } = "";
+
+    /// <summary>
+    /// The id Azure DevOps gave that note in the work item's discussion, so undoing these
+    /// hours can offer to take the comment off with them: hours reversed while the note that
+    /// went with them still stands reads as work that was done.
+    ///
+    /// Zero whenever Slate did not post one, and that is not the same as there being no note:
+    /// an entry written before this was kept has the text and no id, and so does the second
+    /// block of a day booked in one pass, where one comment is posted for the work item and
+    /// every entry keeps the text. Only the entry that posted a comment may remove it.
+    /// </summary>
+    public int CommentId { get; set; }
+
+    /// <summary>
+    /// The project the comment was posted under. The comments API is project-scoped and the
+    /// project used is not always the one on the block - an empty one falls back to whatever
+    /// project is selected - so it is kept as it was used rather than worked out again at the
+    /// undo, by which time the selection may have moved on and the address would name a
+    /// project the comment was never in.
+    /// </summary>
+    public string CommentProject { get; set; } = "";
 
     /// <summary>
     /// An undo of this entry that Azure DevOps never confirmed, kept with what was sent so the
