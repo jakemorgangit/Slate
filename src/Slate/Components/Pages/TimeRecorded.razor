@@ -74,12 +74,13 @@
                                     <span class="badge badge-muted" title="The calendar block it came from has gone">Block deleted</span>
                                 }
                             </div>
-                            @* Booked against an organization Slate is not connected to now.
-                               Nothing here can be settled against it - #7 over here is a
-                               different work item - and a renamed or moved organization has no
-                               old address left to switch back to, so the only way out is the
-                               user saying it is the same one. Said of the bookings it is true
-                               of: a block can hold one from either side of a switch. *@
+                            @* Booked against an organization Slate is not on now. Nothing here
+                               can be settled against it - #7 over here is a different work
+                               item - and a renamed or moved organization has no old address
+                               left to switch back to, so the way out is the user saying it is
+                               the same one, where Azure DevOps' own ids leave that open. Said
+                               of the bookings it is true of: a block can hold one from either
+                               side of a switch. *@
                             @if (block.Elsewhere is { } where)
                             {
                                 <div>
@@ -114,11 +115,14 @@
                                     <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
                                             @onclick="() => SystemShell.OpenUrl(url)">Open #@block.First.WorkItemId ↗</button>
                                 }
-                                @if (block.Elsewhere is not null)
+                                @* Offered only while the claim is one Azure DevOps has not
+                                   already refused: where it has, the press could do nothing
+                                   but come back refused. *@
+                                @if (block.CanAdopt)
                                 {
                                     <button class="btn btn-sm btn-ghost" disabled="@(_busy is not null)"
-                                            title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps; the booking simply becomes one this connection can check and answer for."
-                                            @onclick="() => Adopt(block)">Same organization - settle it here</button>
+                                            title="@AppState.AdoptBookingTitle"
+                                            @onclick="() => AdoptAsync(block)">Same organization - settle it here</button>
                                 }
                                 @if (block.CanBeLetGo)
                                 {
@@ -184,9 +188,16 @@
                                 }
                                 @if (!entry.BelongsTo(_organization))
                                 {
-                                    <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
-                                            title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps."
-                                            @onclick="() => AdoptEntry(entry)">Same organization</button>
+                                    @* The two answers stay off for these whatever happens
+                                       next - they rest on a work item this connection cannot
+                                       show - and "same organization" is offered only while it
+                                       is a claim Azure DevOps has not already refused. *@
+                                    @if (entry.CouldBelongTo(_organization))
+                                    {
+                                        <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
+                                                title="@AppState.AdoptEntryTitle"
+                                                @onclick="() => AdoptEntryAsync(entry)">Same organization</button>
+                                    }
                                 }
                                 else if (!undo.CouldStillLand)
                                 {
@@ -307,8 +318,9 @@
                             // and the Undo button can never disagree about whose hours these
                             // are: it is the test the write paths themselves refuse by.
                             var elsewhere = !entry.BelongsTo(_organization);
+                            var canAdopt = elsewhere && entry.CouldBelongTo(_organization);
                             var undoTitle = elsewhere
-                                ? $"Booked against {AppState.BookedAgainst(entry)}, {AppState.WhyNotOurs(entry, _organization)}, so Undo would change a different work item. Say it is the same organization first."
+                                ? AppState.WhyUndoIsOff(entry, _organization, onTimeTab: true)
                                 : "Take this time back off the work item";
                             <div class="ghost-entry" @key="entry.Id" style="--wi-color: @Ui.ColorFor(entry.WorkItemType)">
                                 <div class="ghost-time">
@@ -375,20 +387,30 @@
                                         }
                                     }
 
-                                    @* Hours booked against an organization this connection is
-                                       not on cannot be undone from here: #7 over there is a
-                                       different work item. Recoverable rather than a dead end,
-                                       because an organization that was renamed or moved has no
-                                       old address left to switch back to. *@
+                                    @* Hours booked against an organization Slate is not on
+                                       cannot be undone from here: #7 over there is a different
+                                       work item. What can be done about it depends on the
+                                       refusal - an organization that was renamed or moved is
+                                       a claim only the user can answer, while one Azure DevOps
+                                       has already answered by giving the two different ids is
+                                       not - so the button appears only where a press could
+                                       work, and the clause says what is left where it cannot. *@
                                     @if (elsewhere)
                                     {
                                         <div style="margin-top: 4px; font-size: 11.5px; color: var(--text-3)">
                                             Booked against <span class="mono">@AppState.BookedAgainst(entry)</span>,
                                             @AppState.WhyNotOurs(entry, _organization), so Undo would change a different work item.
-                                            <button class="btn btn-sm btn-ghost" style="margin-left: 6px"
-                                                    disabled="@(_undoing is not null)"
-                                                    title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps."
-                                                    @onclick="() => AdoptEntry(entry)">Same organization</button>
+                                            @if (canAdopt)
+                                            {
+                                                <button class="btn btn-sm btn-ghost" style="margin-left: 6px"
+                                                        disabled="@(_undoing is not null)"
+                                                        title="@AppState.AdoptEntryTitle"
+                                                        @onclick="() => AdoptEntryAsync(entry)">Same organization</button>
+                                            }
+                                            else
+                                            {
+                                                @AppState.WayOut(entry, _organization, onTimeTab: true)
+                                            }
                                         </div>
                                     }
                                     @if (!string.IsNullOrWhiteSpace(entry.Comment))
@@ -410,11 +432,13 @@
                                     </div>
 
                                     @* Off for hours booked against an organization Slate is not
-                                       connected to: #7 over here is a different work item, so
-                                       the undo would be refused the moment it was asked for.
-                                       Said in the button rather than found out by pressing it -
-                                       the explanation just above carries the way out, which is
-                                       to say the two addresses are the same organization. *@
+                                       on: #7 over here is a different work item, so the undo
+                                       would be refused the moment it was asked for. Said in
+                                       the button rather than found out by pressing it, and the
+                                       title carries whatever way out there is - telling Slate
+                                       the two are one organization where that could still be
+                                       true, and where its ids say otherwise, going back to the
+                                       organization the hours went to, or nothing at all. *@
                                     <button class="btn btn-sm btn-danger" title="@undoTitle"
                                             disabled="@(elsewhere || _undoing is not null)"
                                             @onclick="() => UndoAsync(entry)">
@@ -585,21 +609,25 @@
         Recompute();
     }
 
-    /// <summary>Takes a block's bookings as this organization's, when the user says they are.</summary>
-    private void Adopt(AppState.UnsettledBlock block)
+    /// <summary>
+    /// Takes a block's bookings as this organization's, when the user says they are. Awaited
+    /// because the claim is put to Azure DevOps first where its id is not already known, and
+    /// refused there rather than here if the service has already answered it.
+    /// </summary>
+    private async Task AdoptAsync(AppState.UnsettledBlock block)
     {
         if (_busy is not null) return;
 
-        State.AdoptOrganizationForBlock(block.AllocationId);
+        await State.AdoptOrganizationForBlockAsync(block.AllocationId);
         Recompute();
     }
 
     /// <summary>The same for one filed entry, so its Undo stops being refused.</summary>
-    private void AdoptEntry(TimeEntry entry)
+    private async Task AdoptEntryAsync(TimeEntry entry)
     {
         if (_undoing is not null) return;
 
-        State.AdoptOrganizationForEntry(entry.Id);
+        await State.AdoptOrganizationForEntryAsync(entry.Id);
         Recompute();
     }
 

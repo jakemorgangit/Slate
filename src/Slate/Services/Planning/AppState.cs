@@ -2069,11 +2069,13 @@ public sealed class AppState(
     /// Work item numbers only mean anything within one organization, so an undo or a check
     /// run after switching would otherwise read, and change, a different item altogether.
     ///
-    /// The way out is named as well as the refusal: an organization can be renamed or moved,
-    /// and after that there is no switching back to what no longer exists. Someone who knows
-    /// it is the same organization can say so from the Time tab, and everything works again.
-    /// Switching back is only offered when there is somewhere to switch back to, which is not
-    /// every refusal - see <see cref="SameAddressAs"/>.
+    /// The way out is named as well as the refusal, and only where one exists. An organization
+    /// that was renamed or moved has no old address left to switch back to, so someone who
+    /// knows it is the same organization can say so from the Time tab instead. Neither way out
+    /// fits every refusal: there is nowhere to switch back to when the hours were booked at
+    /// this very address - see <see cref="SameAddressAs"/> - and nothing to say when Azure
+    /// DevOps' own ids have already answered the question, which is what
+    /// <see cref="TimeEntry.CouldBelongTo"/> tests.
     /// </summary>
     private string? WrongConnection(TimeEntry entry)
     {
@@ -2083,24 +2085,29 @@ public sealed class AppState(
         var where = BookedAgainst(entry);
 
         // Refused on the organization's own id while the address is the one Slate is pointed
-        // at. Two things lead here: a Server collection rebuilt where another one used to
-        // answer, and "same organization" said while connectionData had not been read yet,
-        // which writes this address onto the entry and leaves the id it was booked with
-        // standing - so a claim that turns out to be wrong comes back here with both halves
-        // naming the same address. Telling the user to switch back would be telling them to
-        // switch to where they already are, so only the way out that exists is offered.
+        // at, which a Server collection rebuilt where another one used to answer produces.
+        // Reached only when both ids are known and differ - an entry whose id is unknown is
+        // judged on the address, and this address matches - so "same organization" is a claim
+        // the service has already refused, and neither way out is offered here. Nothing is
+        // said about where the hours went, either: the address on the entry is the one Slate
+        // is on, and the id is all that is actually known about the difference.
         if (SameAddressAs(entry, organization))
-            return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" was booked against a different Azure " +
-                   $"DevOps organization at this same address, {where}, where #{entry.WorkItemId} is a " +
-                   "different work item. If it is that same organization after all, say so from the Time " +
-                   "tab and Slate will settle it here.";
+            return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" carries a different Azure DevOps " +
+                   $"organization id from the one the service gives {where}, which Slate is on now, so " +
+                   $"#{entry.WorkItemId} here is a different work item. An id is the one part of an " +
+                   "organization that a rename or a new address leaves alone, so these are two " +
+                   "organizations however alike the addresses look, and nothing here can settle those hours.";
 
         var here = organization.Url is { Length: > 0 } url ? url : "somewhere else";
 
         return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" was booked against {where}, and Slate is " +
                $"connected to {here} now, where #{entry.WorkItemId} is a different work item. Switch back " +
-               "to settle it - or, if this is that same organization under a new address, say so from the " +
-               "Time tab and Slate will settle it here.";
+               "to settle it"
+               + (entry.CouldBelongTo(organization)
+                   ? " - or, if this is that same organization under a new address, say so from the Time " +
+                     "tab and Slate will settle it here."
+                   : ". Azure DevOps gives the two addresses different organization ids, so saying they " +
+                     "are one organization is not open here.");
     }
 
     /// <summary>
@@ -2111,6 +2118,10 @@ public sealed class AppState(
     /// Everything that explains such a refusal has to know: the usual wordings - "which Slate
     /// is not connected to now", "switch back" - would name the address Slate is plainly
     /// connected to and send the user somewhere they already are.
+    ///
+    /// A refusal that gets here always has two known ids that differ, because an entry with no
+    /// id of its own - or a connection with none - is judged on the address alone, and this
+    /// address is the same one. So this is also the case "same organization" can never mend.
     /// </summary>
     private static bool SameAddressAs(TimeEntry entry, OrganizationRef organization) =>
         organization.Url.Length > 0
@@ -2149,7 +2160,7 @@ public sealed class AppState(
     /// can offer an action the answer paths will then refuse - and none of them can hide one
     /// that would work. A block can hold a booking made before an organization was switched
     /// and one made after: the check and the two answers are for <see cref="Mine"/>, and
-    /// "same organization" is the way out for the others.
+    /// "same organization" is the way out for the others - where it is a way out at all.
     /// </summary>
     /// <param name="Elsewhere">
     /// The address the bookings that were left out were booked against, or null when none were.
@@ -2159,12 +2170,19 @@ public sealed class AppState(
     /// is not always that Slate is somewhere else. Carried beside the address so the two are
     /// worked out from the one booking and cannot describe different ones.
     /// </param>
+    /// <param name="CanAdopt">
+    /// Whether "same organization" could move any of the left-out bookings over: true while at
+    /// least one of them is a claim Azure DevOps has not already refused - see
+    /// <see cref="TimeEntry.CouldBelongTo"/>. False leaves the button off rather than offering
+    /// a press that could only come back refused.
+    /// </param>
     public sealed record UnsettledBlock(
         Guid AllocationId,
         IReadOnlyList<UnconfirmedBooking> Bookings,
         IReadOnlyList<UnconfirmedBooking> Mine,
         string? Elsewhere,
-        string ElsewhereWhy = "")
+        string ElsewhereWhy = "",
+        bool CanAdopt = false)
     {
         /// <summary>The oldest booking of the block, which names the work item for all of them.</summary>
         public TimeEntry First => Bookings[0].Entry;
@@ -2200,6 +2218,7 @@ public sealed class AppState(
         var mine = new List<UnconfirmedBooking>(bookings.Count);
         string? elsewhere = null;
         var elsewhereWhy = "";
+        var canAdopt = false;
         var organization = CurrentOrganization;
 
         // The same test the answers themselves are refused by, so what is offered and what is
@@ -2207,15 +2226,26 @@ public sealed class AppState(
         // address is rather than why it is a refusal.
         foreach (var booking in bookings)
         {
-            if (WrongConnection(booking.Entry) is null) mine.Add(booking);
-            else if (elsewhere is null)
+            if (WrongConnection(booking.Entry) is null)
+            {
+                mine.Add(booking);
+                continue;
+            }
+
+            // The address and its clause are the first refused booking's, so the two always
+            // describe one booking. Whether the button appears is asked of all of them,
+            // because AdoptOrganizationForBlockAsync moves every one it is allowed to and a
+            // press is worth offering while any of them would move.
+            if (elsewhere is null)
             {
                 elsewhere = BookedAgainst(booking.Entry);
                 elsewhereWhy = WhyNotOurs(booking.Entry, organization);
             }
+
+            canAdopt |= booking.Entry.CouldBelongTo(organization);
         }
 
-        return new UnsettledBlock(allocationId, bookings, mine, elsewhere, elsewhereWhy);
+        return new UnsettledBlock(allocationId, bookings, mine, elsewhere, elsewhereWhy, canAdopt);
     }
 
     /// <summary>Where a set of hours says it was booked, however little it was stamped with.</summary>
@@ -2240,6 +2270,61 @@ public sealed class AppState(
         SameAddressAs(entry, organization)
             ? "which Azure DevOps now reports as a different organization at the same address"
             : "which Slate is not connected to now";
+
+    /// <summary>
+    /// What can be done about hours this connection has refused, as the clause that closes
+    /// every explanation of one. Worked out here rather than written into each opening,
+    /// because an opening whose remedy has drifted from what the write paths accept either
+    /// offers a press that can only be refused or hides one that would work.
+    ///
+    /// Three remedies, for the three shapes a refusal takes. Where the claim is one nothing
+    /// can disprove - see <see cref="TimeEntry.CouldBelongTo"/> - saying it is the same
+    /// organization settles it. Where Azure DevOps' own ids have already refused it, that
+    /// leaves only going back to the organization the hours went to, and nothing at all when
+    /// the hours were booked at this very address and there is nowhere to go back to.
+    /// </summary>
+    /// <param name="onTimeTab">
+    /// True where "same organization" is on the page the clause is being shown on, which
+    /// changes only whether the user is sent to the Time tab to find it.
+    /// </param>
+    public static string WayOut(TimeEntry entry, OrganizationRef organization, bool onTimeTab) =>
+        entry.CouldBelongTo(organization)
+            ? onTimeTab
+                ? "Say it is the same organization first."
+                : "Say it is the same organization on the Time tab first."
+            : SameAddressAs(entry, organization)
+                ? "Nothing here can undo them."
+                : "Connect to that organization again to undo them.";
+
+    /// <summary>
+    /// Why a refused entry's Undo is off, as the button's own tooltip says it. One builder for
+    /// all three openings onto that button - the Time tab's rows, the plan's block menu and
+    /// the inspector - so the reason, the remedy and the button carrying them cannot drift.
+    /// </summary>
+    public static string WhyUndoIsOff(TimeEntry entry, OrganizationRef organization, bool onTimeTab) =>
+        $"Booked against {BookedAgainst(entry)}, {WhyNotOurs(entry, organization)}, so Undo would change " +
+        $"a different work item. {WayOut(entry, organization, onTimeTab)}";
+
+    /// <summary>
+    /// What "same organization" promises, in the one wording all five openings onto it use -
+    /// the Time tab's block cards, stuck undos and entry rows, and the two record dialogs.
+    /// Five copies of a sentence this particular drifted apart once already.
+    ///
+    /// It promises no more than the adopt paths deliver: the three things that move an
+    /// organization without changing which organization it is, and the check that refuses the
+    /// claim outright when Azure DevOps gives the two different ids.
+    /// </summary>
+    private const string SameOrganizationWhen =
+        "Only if that address and this one are the same organization - renamed, moved to dev.azure.com, " +
+        "or reached by a new server name. Slate refuses it if Azure DevOps gives the two different " +
+        "organization ids. Nothing is written to Azure DevOps";
+
+    /// <summary>The tooltip on a booking's button, which becomes checkable rather than undoable.</summary>
+    public const string AdoptBookingTitle =
+        SameOrganizationWhen + "; the booking simply becomes one this connection can check and answer for.";
+
+    /// <summary>The tooltip on a filed entry's button, whose undo is what the stamp refuses.</summary>
+    public const string AdoptEntryTitle = SameOrganizationWhen + ".";
 
     /// <summary>
     /// Lets go of a block's unconfirmed bookings without asking Azure DevOps again: the user
@@ -2376,17 +2461,72 @@ public sealed class AppState(
     }
 
     /// <summary>
+    /// The organization a "same organization" claim is judged by, with the id read first when
+    /// it is not known yet.
+    ///
+    /// <see cref="CurrentOrganization"/>'s id is empty until connectionData has been read for
+    /// the address in settings, which is exactly the state just after an organization is
+    /// switched - the switch that makes these hours need claiming in the first place. Judged
+    /// in that window the claim is taken on the address alone, this address is stamped on, and
+    /// the Undo it re-enables writes against this organization's #7 for hours that went to
+    /// another one. The moment the id arrives the very same claim is refused, which is the
+    /// proof it should never have been taken: one cheap GET settles it, and it is made here
+    /// before anything is written down.
+    ///
+    /// A connection whose connectionData genuinely cannot be read comes back with the id still
+    /// empty, and the claim is taken on trust exactly as it was before - that escape hatch for
+    /// a renamed or moved organization is what claiming one exists for.
+    /// </summary>
+    private async Task<OrganizationRef> IdentifiedOrganizationAsync()
+    {
+        if (CurrentOrganization.Id.Length > 0) return CurrentOrganization;
+
+        // Reads connectionData for the address in settings and holds what it says; the name it
+        // returns is not what is wanted here, the identity it fills in on the way is.
+        try
+        {
+            await ado.GetAuthenticatedUserAsync();
+        }
+        catch (Exception ex)
+        {
+            CrashLog.WriteLine($"Could not read which organization this is before a claim: {ex.Message}");
+        }
+
+        return CurrentOrganization;
+    }
+
+    /// <summary>
+    /// Why a "same organization" claim cannot be taken at its word: Azure DevOps has already
+    /// answered the question itself, and its answer is no.
+    ///
+    /// Said at the press rather than acted on and taken back later. Accepting it would stamp
+    /// this organization onto hours that went to another one, and the Undo that comes back
+    /// with it would take time off a work item that never had it.
+    /// </summary>
+    private static string NotTheSameOrganization(TimeEntry entry) =>
+        $"Azure DevOps gives this organization a different id from the one #{entry.WorkItemId} " +
+        $"\"{entry.WorkItemTitle}\" was booked under, and an id is the one part of an organization that a " +
+        "rename, a move to dev.azure.com or a new server name leaves alone. They really are two " +
+        "organizations, so those hours cannot be moved over - undoing them here would take time off a " +
+        "work item that never had it.";
+
+    /// <summary>
     /// Takes a block's unsettled bookings as this organization's after all, when the user says
     /// so. The way out of the one refusal there is otherwise no way out of: an organization
     /// that was renamed or moved has no old address left to switch back to, so without this
     /// those hours could never be checked, answered for or undone again.
+    ///
+    /// The claim is put to Azure DevOps before it is written down. The id is read first when
+    /// it is not known - see <see cref="IdentifiedOrganizationAsync"/> - and a booking whose
+    /// own id the service contradicts is refused here, with the reason, rather than accepted
+    /// and quietly taken back the moment the id arrives.
     ///
     /// It only re-stamps them, and only the ones that are actually refused: a block can hold a
     /// booking made before the switch and one made after, and the second was never in question.
     /// Nothing is written to Azure DevOps and nothing is settled - the check and the two
     /// answers simply become available again, and they still decide.
     /// </summary>
-    public bool AdoptOrganizationForBlock(Guid allocationId)
+    public async Task<bool> AdoptOrganizationForBlockAsync(Guid allocationId)
     {
         if (TryClaimBlock(allocationId) is { } refused)
         {
@@ -2399,11 +2539,30 @@ public sealed class AppState(
             var bookings = planner.UnconfirmedForBlock(allocationId);
             if (bookings.Count == 0) return false;
 
+            var organization = await IdentifiedOrganizationAsync();
+
+            var inQuestion = bookings.Where(b => !b.Entry.BelongsTo(organization)).ToList();
+            if (inQuestion.Count == 0) return false;
+
+            // Refused only when nothing on the block can be moved. One the service has ruled
+            // on beside one it has not is still worth the press for the second, the same way
+            // only the refused bookings are re-stamped at all.
+            var stuck = inQuestion.Where(b => !b.Entry.CouldBelongTo(organization)).ToList();
+            if (stuck.Count == inQuestion.Count)
+            {
+                toasts.Error("That booking is not this organization's", NotTheSameOrganization(stuck[0].Entry));
+                return false;
+            }
+
             var workItemId = bookings[0].Entry.WorkItemId;
-            if (planner.AdoptOrganization(allocationId, CurrentOrganization) == 0) return false;
+            if (planner.AdoptOrganization(allocationId, organization) == 0) return false;
 
             toasts.Info($"That booking on #{workItemId} is this organization's now",
-                "Nothing was written to Azure DevOps. Check it, or answer for it, as usual.");
+                "Nothing was written to Azure DevOps. Check it, or answer for it, as usual."
+                + (stuck.Count > 0
+                    ? " Another booking on that block carries an id Azure DevOps gives a different" +
+                      " organization, and that one stays where it is."
+                    : ""));
 
             Changed?.Invoke();
             return true;
@@ -2416,9 +2575,11 @@ public sealed class AppState(
 
     /// <summary>
     /// The same for a filed entry, whose undo is what the organization stamp is refusing.
-    /// Claimed the way an undo of it is, so it cannot run beside one.
+    /// Claimed the way an undo of it is, so it cannot run beside one - and the claim is put to
+    /// Azure DevOps first for the same reason the block's is: what a press re-enables here is
+    /// a write against a work item.
     /// </summary>
-    public bool AdoptOrganizationForEntry(Guid entryId)
+    public async Task<bool> AdoptOrganizationForEntryAsync(Guid entryId)
     {
         if (TryBeginTimeWrite() is { } refused)
         {
@@ -2438,7 +2599,15 @@ public sealed class AppState(
         try
         {
             if (planner.FindTimeEntry(entryId) is not { } entry) return false;
-            if (!planner.AdoptOrganizationForEntry(entryId, CurrentOrganization)) return false;
+
+            var organization = await IdentifiedOrganizationAsync();
+            if (!entry.CouldBelongTo(organization))
+            {
+                toasts.Error("Those hours are not this organization's", NotTheSameOrganization(entry));
+                return false;
+            }
+
+            if (!planner.AdoptOrganizationForEntry(entryId, organization)) return false;
 
             toasts.Info($"Those hours on #{entry.WorkItemId} are this organization's now",
                 "Nothing was written to Azure DevOps. Undo works on them again.");

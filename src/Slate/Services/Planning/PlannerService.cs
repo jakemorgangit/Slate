@@ -67,12 +67,6 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         file.Allocations.Count(a => a.State is SyncState.Draft or SyncState.Modified or SyncState.Failed)
         + file.PendingDeletes.Count);
 
-    /// <summary>
-    /// Blocks whose Outlook event was deleted there and which need a decision. Counted under
-    /// the lock for the same reason as <see cref="PendingCount"/>.
-    /// </summary>
-    public int MissingCount => store.Edit(file => file.Allocations.Count(a => a.MissingInOutlook));
-
     // ---------------------------------------------------------------- mutations
 
     public Allocation Add(WorkItem item, DateTime start, int durationMinutes)
@@ -925,10 +919,11 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// settled than it was - it can simply be checked and answered for again. Returns how many
     /// were brought over.
     ///
-    /// Only the bookings that are actually refused. A block can hold one made before an
-    /// organization was switched and one made after, and the user saying that the old address
-    /// is this organization says nothing about the one that was already here - re-stamping
-    /// that one too would quietly move a booking nobody asked about.
+    /// Only the bookings that are actually refused, and of those only the ones the service has
+    /// not already ruled on. A block can hold one made before an organization was switched and
+    /// one made after, and the user saying that the old address is this organization says
+    /// nothing about the one that was already here - re-stamping that one too would quietly
+    /// move a booking nobody asked about.
     /// </summary>
     public int AdoptOrganization(Guid allocationId, OrganizationRef organization)
     {
@@ -939,6 +934,13 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             {
                 if (booking.Entry.AllocationId != allocationId) continue;
                 if (booking.Entry.BelongsTo(organization)) continue;
+
+                // Never over Azure DevOps' own word. The callers refuse such a claim with a
+                // reason before they get here; this is the ledger itself keeping the rule, so
+                // no future opening onto it can write an organization onto hours the service
+                // has already placed elsewhere.
+                if (!booking.Entry.CouldBelongTo(organization)) continue;
+
                 if (Stamp(booking.Entry, organization)) count++;
             }
 
@@ -949,11 +951,16 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         return stamped;
     }
 
-    /// <summary>The same for one filed entry, whose undo is the thing being refused.</summary>
+    /// <summary>
+    /// The same for one filed entry, whose undo is the thing being refused - and held to the
+    /// same rule, that an entry Azure DevOps has already placed elsewhere is not moved.
+    /// </summary>
     public bool AdoptOrganizationForEntry(Guid entryId, OrganizationRef organization)
     {
         var stamped = store.Edit(file =>
-            file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is { } entry && Stamp(entry, organization));
+            file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is { } entry
+            && entry.CouldBelongTo(organization)
+            && Stamp(entry, organization));
 
         if (stamped) Persist();
         return stamped;
@@ -964,13 +971,13 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     ///
     /// The address is the whole point of adopting and is simply replaced. The id is not: it is
     /// the one part of an organization that a rename or a new address leaves alone, and it is
-    /// empty until connectionData has been read for the address Slate is pointed at now -
-    /// which is exactly the state just after an organization is switched, the switch that makes
-    /// these hours need adopting in the first place. Writing that emptiness over the id the
-    /// entry already carries would throw away the very thing the stamp exists to hold, and the
-    /// next rename would strand the entry all over again. So a known id is only ever replaced
-    /// by another known one; saying these hours are this organization's while it cannot say
-    /// which organization that is leaves the id they were booked with standing.
+    /// empty until connectionData has been read for the address Slate is pointed at now. The
+    /// callers read it first where they can, so what is left here is a connection that will
+    /// not say who it is at all. Writing that emptiness over the id the entry already carries
+    /// would throw away the very thing the stamp exists to hold, and the next rename would
+    /// strand the entry all over again. So a known id is only ever replaced by another known
+    /// one; saying these hours are this organization's while it cannot say which organization
+    /// that is leaves the id they were booked with standing.
     /// </summary>
     private static bool Stamp(TimeEntry entry, OrganizationRef organization)
     {

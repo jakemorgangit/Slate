@@ -83,8 +83,8 @@
                        caller. Off for hours booked against an organization Slate is not on,
                        the way the plan's own menu and the Time tab are - #7 over there is a
                        different work item, so the undo is refused the moment it is asked for.
-                       The way out, saying the two are one organization, is on the Time tab,
-                       which is where the title sends the user. *@
+                       Whatever way out there is comes from the same place theirs does, so no
+                       two of them can disagree about whether there is one. *@
                     @if (State.Planner.LatestEntryForBlock(Allocation.Id) is { } lastEntry)
                     {
                         var organization = State.CurrentOrganization;
@@ -92,7 +92,7 @@
                         <button class="btn btn-sm btn-ghost" style="margin-left: 6px" disabled="@(!canUndo)"
                                 title="@(canUndo
                                          ? "Take the last booking back off the work item"
-                                         : $"Booked against {AppState.BookedAgainst(lastEntry)}, {AppState.WhyNotOurs(lastEntry, organization)}, so Undo would change a different work item. Say it is the same organization on the Time tab first.")"
+                                         : AppState.WhyUndoIsOff(lastEntry, organization, onTimeTab: false))"
                                 @onclick="OnUndoTime">Undo last</button>
                     }
                 </div>

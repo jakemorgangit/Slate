@@ -124,6 +124,27 @@ public sealed class TimeEntry
     }
 
     /// <summary>
+    /// Whether these hours could still turn out to be the organization given - that is,
+    /// whether someone saying they are is a claim this app has no way to disprove.
+    ///
+    /// False in one case only: both sides carry the id Azure DevOps gives the organization
+    /// itself and the two differ. An id is the one part of an organization that a rename,
+    /// Microsoft's move to dev.azure.com or a new server name leaves alone - see
+    /// <see cref="OrganizationId"/> - so two ids are two organizations, and no amount of
+    /// certainty makes them one. Everything else is a claim only the user can answer: hours
+    /// stamped before an id could be read, or a connection whose own id will not come.
+    ///
+    /// What "same organization" is offered on and refused by. Writing this organization onto
+    /// hours the service has already placed elsewhere would arm an undo against a work item
+    /// that never had them, which is the one write on that path that can land on the wrong
+    /// item altogether.
+    /// </summary>
+    public bool CouldBelongTo(OrganizationRef organization) =>
+        OrganizationId.Length == 0
+        || organization.Id.Length == 0
+        || string.Equals(OrganizationId, organization.Id, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// One spelling of an organization URL, so the same organization reached by another
     /// address still matches. The scheme, any credential in front of the host and the case
     /// are dropped, as is everything past the organization itself - a project left in the URL,

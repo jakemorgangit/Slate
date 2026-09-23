@@ -134,7 +134,8 @@
                                                        Offered against the bookings this connection may act on, the
                                                        way the Time tab does it: hours booked before an organization
                                                        was switched cannot be checked or answered from here at all,
-                                                       and "same organization" is the only way forward for those. *@
+                                                       and "same organization" is the way forward for those - where
+                                                       Azure DevOps' own ids have not already refused the claim. *@
                                                     <div style="color: var(--danger); font-size: 11.5px" title="@row.Error">May be booked</div>
                                                     @if (pending is { Elsewhere: { } where })
                                                     {
@@ -149,11 +150,11 @@
                                                             <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
                                                                     @onclick="() => CheckAsync(row)">Check</button>
                                                         }
-                                                        @if (pending is { Elsewhere: not null })
+                                                        @if (pending is { CanAdopt: true })
                                                         {
                                                             <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
-                                                                    title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps; the booking simply becomes one this connection can check and answer for."
-                                                                    @onclick="() => Adopt(row)">Same organization</button>
+                                                                    title="@AppState.AdoptBookingTitle"
+                                                                    @onclick="() => AdoptAsync(row)">Same organization</button>
                                                         }
                                                         @if (pending is { CanBeLetGo: true })
                                                         {
@@ -702,11 +703,14 @@
     ///
     /// Only re-stamps them, and only the ones actually refused. The row stays as it is -
     /// nothing has been settled - and the actions that were hidden appear.
+    ///
+    /// Awaited because the claim is put to Azure DevOps first where its id is not already
+    /// known, and refused there if the service has already answered it.
     /// </summary>
-    private void Adopt(RowVm row)
+    private async Task AdoptAsync(RowVm row)
     {
         if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
-        State.AdoptOrganizationForBlock(row.AllocationId);
+        await State.AdoptOrganizationForBlockAsync(row.AllocationId);
     }
 
     /// <summary>Puts a row back where an unbooked one starts: offered, ticked and editable.</summary>

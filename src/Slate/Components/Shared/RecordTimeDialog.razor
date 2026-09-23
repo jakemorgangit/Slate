@@ -83,12 +83,14 @@
                                 @* The one way out of a booking made against an organization this
                                    connection is not on: it cannot be checked or answered for
                                    here, and a renamed or moved organization has no old address
-                                   to switch back to. Only re-stamps the ones that are refused. *@
-                                @if (unconfirmed.Elsewhere is not null)
+                                   to switch back to. Only re-stamps the ones that are refused,
+                                   and only while Azure DevOps' own ids leave the claim open -
+                                   where they do not, the press could only come back refused. *@
+                                @if (unconfirmed.CanAdopt)
                                 {
                                     <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
-                                            title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps; the booking simply becomes one this connection can check and answer for."
-                                            @onclick="Adopt">Same organization - settle it here</button>
+                                            title="@AppState.AdoptBookingTitle"
+                                            @onclick="AdoptAsync">Same organization - settle it here</button>
                                 }
                                 @* The way out of a booking Azure DevOps will never settle, in both
                                    directions: whichever way the work item reads, the user can say so
@@ -514,11 +516,14 @@
     /// Only re-stamps them, and only the ones actually refused. Nothing is sent and nothing
     /// is settled, so the banner stays and the check and the two answers - which still decide
     /// - simply become available for them.
+    ///
+    /// Awaited because the claim is put to Azure DevOps first where its id is not already
+    /// known, and refused there if the service has already answered it.
     /// </summary>
-    private void Adopt()
+    private async Task AdoptAsync()
     {
         if (_saving || _checking || Shown is not { } allocation) return;
-        State.AdoptOrganizationForBlock(allocation.Id);
+        await State.AdoptOrganizationForBlockAsync(allocation.Id);
     }
 
     /// <summary>
