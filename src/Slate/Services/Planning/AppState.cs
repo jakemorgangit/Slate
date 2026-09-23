@@ -52,44 +52,53 @@ public sealed class AppState(
     private void DropStaleCaches()
     {
         var stamp = ConnectionStamp;
+
+        // Held across the whole clearing, not just the stamp. Published on its own, the stamp
+        // says "this connection's caches are dealt with" while they are still there to deal
+        // with, so a second caller arriving in between goes on believing that - and the load
+        // it then finishes puts a list where this one is about to wipe it, leaving "Nothing
+        // loaded yet" with no error to explain it. Nothing in here waits on anything: they are
+        // field assignments, ForgetPeople only nulls two of its own, and dismissing a toast
+        // raises a change the pages answer by queueing a render.
         lock (_connectionGate)
         {
             if (stamp == _cachedFor) return;
             _cachedFor = stamp;
-        }
 
-        Identity = "";
-        Projects = [];
-        CreatableTypes = [];
-        AreaTree = null;
-        AreaTreeError = null;
-        Members = [];
-        ado.ForgetPeople();
+            Identity = "";
+            Projects = [];
+            CreatableTypes = [];
+            AreaTree = null;
+            AreaTreeError = null;
+            Members = [];
+            ado.ForgetPeople();
 
-        // The error on screen and the "could not load" toast behind it were about the old
-        // connection. Left up, they report the new one failing before anything has asked it.
-        var hadError = WorkItemError is not null;
-        WorkItemError = null;
-        ClearWorkItemErrorToast();
+            // The error on screen and the "could not load" toast behind it were about the old
+            // connection. Left up, they report the new one failing before anything has asked it.
+            var hadError = WorkItemError is not null;
+            WorkItemError = null;
+            ClearWorkItemErrorToast();
 
-        // A cached list is only ever a stand-in for this same connection's own list - once
-        // the connection has moved on, holding onto it would let a failed load for the new
-        // one keep showing the old one as if it were current, with the red banner suppressed
-        // to make room for the (now wrong) "showing a cached list" notice. A list the error
-        // banner was covering goes for the same reason: taking the banner away must not bring
-        // another connection's list back into view looking current. One on screen with no
-        // error over it stays until the new connection's own list replaces it, as it always
-        // has.
-        if (WorkItemsAreCached || hadError)
-        {
-            WorkItems = [];
-            WorkItemsLoadedAt = null;
-            WorkItemsAreCached = false;
+            // A cached list is only ever a stand-in for this same connection's own list - once
+            // the connection has moved on, holding onto it would let a failed load for the new
+            // one keep showing the old one as if it were current, with the red banner suppressed
+            // to make room for the (now wrong) "showing a cached list" notice. A list the error
+            // banner was covering goes for the same reason: taking the banner away must not bring
+            // another connection's list back into view looking current. One on screen with no
+            // error over it stays until the new connection's own list replaces it, as it always
+            // has.
+            if (WorkItemsAreCached || hadError)
+            {
+                WorkItems = [];
+                WorkItemsLoadedAt = null;
+                WorkItemsAreCached = false;
+            }
         }
 
         // Raised here, once, rather than left to each caller: a quiet poll or a background
         // lookup like EnsureMembersAsync can be the one to notice, and the UI still needs to
         // hear about it even though neither of those otherwise has a reason to call Changed.
+        // Outside the gate, so a render it sets off never reads these while they are half done.
         Changed?.Invoke();
     }
     public PlannerService Planner => planner;
@@ -764,11 +773,12 @@ public sealed class AppState(
         if (IsSyncing || !CanUseOutlook || planner.PendingCount == 0) return;
         if (!TryBeginWrite()) return;
 
-        IsSyncing = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSyncing = true;
+            Changed?.Invoke();
+
             var summary = await planner.SyncAsync();
             _autoSyncFailed = summary.Failed > 0;
 
@@ -809,11 +819,12 @@ public sealed class AppState(
 
         if (!TryBeginWrite()) return;
 
-        IsSyncing = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSyncing = true;
+            Changed?.Invoke();
+
             var summary = await planner.SyncAsync();
             _autoSyncFailed = summary.Failed > 0;
 
@@ -1084,7 +1095,14 @@ public sealed class AppState(
 
         var draft = settingsStore.CreateDraft();
         draft.Ui.Mode = mode;
-        if (!settingsStore.Save(draft)) return;
+        if (!settingsStore.Save(draft))
+        {
+            // Said out loud, and the change raised all the same, so the switch goes back to
+            // the mode actually in force rather than sitting on one nothing was saved for.
+            toasts.Error("Could not change mode", RestartingForUpdate);
+            Changed?.Invoke();
+            return;
+        }
 
         // Basic has no Time tab; being left standing on it would show an empty page.
         Changed?.Invoke();
@@ -1177,11 +1195,14 @@ public sealed class AppState(
             return false;
         }
 
-        IsSavingPriority = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try, like every other repaint here: a subscriber that throws on the
+            // way out would otherwise leave this write counted in for the rest of the session,
+            // and every later update stuck behind a count that never reaches zero.
+            IsSavingPriority = true;
+            Changed?.Invoke();
+
             var updated = await ado.SetAdoPriorityAsync(prompt.WorkItemId, prompt.To);
 
             if (updated is not null)
@@ -1288,11 +1309,12 @@ public sealed class AppState(
             return false;
         }
 
-        SavingStateFor = workItemId;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            SavingStateFor = workItemId;
+            Changed?.Invoke();
+
             var updated = await ado.SetStateAsync(workItemId, state);
 
             if (updated is not null)
@@ -1533,11 +1555,12 @@ public sealed class AppState(
             return null;
         }
 
-        IsCreating = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsCreating = true;
+            Changed?.Invoke();
+
             var created = await ado.CreateWorkItemAsync(request);
 
             // Put it on screen straight away rather than waiting for the next poll.
@@ -1652,11 +1675,12 @@ public sealed class AppState(
             return false;
         }
 
-        setBusy(true);
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            setBusy(true);
+            Changed?.Invoke();
+
             Detail = await ado.UpdateFieldsAsync(
                 id, detail.Rev, new Dictionary<string, object?> { [field] = value });
 
@@ -1736,11 +1760,12 @@ public sealed class AppState(
             return false;
         }
 
-        IsPostingComment = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsPostingComment = true;
+            Changed?.Invoke();
+
             var comment = await ado.AddCommentAsync(id, detail.Project, Html.ToCommentHtml(text, format, mentioned));
             Comments = [.. Comments, comment];
             CommentError = null;
@@ -2068,11 +2093,12 @@ public sealed class AppState(
             return false;
         }
 
-        IsSpawning = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSpawning = true;
+            Changed?.Invoke();
+
             var created = await ado.CreateChildAsync(parent, title, description, type, remainingHours);
 
             // Make it visible in the sidebar straight away; the query behind the list may
@@ -2250,11 +2276,26 @@ public sealed class AppState(
         // made under: a ConfigurePolling or NudgeAutoSync racing this either finished first,
         // so what it made is stopped here, or finds the gate closed and makes nothing.
         writes.Close();
-        lock (_timers) StopTimers();
+        lock (_timers)
+        {
+            _preparedForHandover = true;
+            StopTimers();
+        }
+
         Changed?.Invoke();
 
         return await writes.WaitForWritesAsync(timeout);
     }
+
+    /// <summary>
+    /// Set from the moment this copy is brought to a standstill for an update until it is let
+    /// out of it again. What <see cref="ResumeAfterFailedHandover"/> goes by, rather than the
+    /// gate being closed: the resume now comes from two places - wherever the updater put the
+    /// update back, and the install's own way out - and reading the gate would have whichever
+    /// arrived second take an open gate for "nothing to do", which is only true if the first
+    /// also brought the timers back. This says what was actually stopped.
+    /// </summary>
+    private bool _preparedForHandover;
 
     /// <summary>
     /// Picks up where <see cref="PrepareForHandoverAsync"/> left off when the update did not
@@ -2273,7 +2314,8 @@ public sealed class AppState(
 
         lock (_timers)
         {
-            if (!writes.IsClosed) return;
+            if (!_preparedForHandover) return;
+            _preparedForHandover = false;
 
             writes.Open();
             ConfigurePolling();

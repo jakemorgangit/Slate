@@ -879,7 +879,11 @@
         }
         else
         {
-            Toasts.Error("Could not send that block", Plan.Find(id)?.LastError);
+            // No error on the block means it was never tried: the only way SyncOneAsync
+            // turns one down without one is an update taking over, and that should say so
+            // rather than leave a bare red toast with nothing under it.
+            Toasts.Error("Could not send that block",
+                Plan.Find(id)?.LastError ?? AppState.RestartingForUpdate);
         }
     }
 
@@ -934,10 +938,14 @@
         });
 
         if (saved) _ = State.LoadEventsAsync();
+        else Toasts.Error("Could not change what the calendar shows", AppState.RestartingForUpdate);
     }
 
-    private void ToggleDensity() =>
-        Settings.Update(settings => settings.Ui.CompactDensity = !settings.Ui.CompactDensity);
+    private void ToggleDensity()
+    {
+        if (!Settings.Update(settings => settings.Ui.CompactDensity = !settings.Ui.CompactDensity))
+            Toasts.Error("Could not change the density", AppState.RestartingForUpdate);
+    }
 
     private void ClearWeek()
     {

@@ -40,6 +40,16 @@ public sealed class TokenCacheStore(SecretProtector protector)
     /// write itself carries the bytes already encrypted and takes no lock of this class's:
     /// this class's lock is held while waiting for the data folder's gate, so a held write
     /// made under that gate when an update is undone must never wait for it in turn.
+    ///
+    /// Which means that on an update that goes ahead, a refresh that lands after the freeze is
+    /// dropped and the new copy starts from the tokens the refresh before it left - the one
+    /// thing dropped there that the new copy cannot simply work out again. That is on purpose.
+    /// A refresh token for a desktop public client is not spent by being used, so the older one
+    /// still works; the worst of it is an extra silent refresh, or at the very worst the
+    /// re-login this class already treats as the price of losing this file. Writing it out
+    /// anyway would be the dangerous half: there is nothing to say the new copy has not already
+    /// read this file and written its own, and landing on top of that would take away tokens
+    /// the copy that is actually running is using.
     /// </summary>
     private void OnAfterAccess(TokenCacheNotificationArgs args)
     {
@@ -70,7 +80,10 @@ public sealed class TokenCacheStore(SecretProtector protector)
                     if (File.Exists(AppPaths.TokenCacheFile)) File.Delete(AppPaths.TokenCacheFile);
                 });
             }
-            catch (IOException) { }
+            // The same two as the write above: a cache file left read-only, or one whose
+            // permissions no longer let this account delete it, refuses this as surely as
+            // something holding it open - and signing out has no try of its own to land in.
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
     }
 }

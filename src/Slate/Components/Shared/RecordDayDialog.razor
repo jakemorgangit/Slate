@@ -219,7 +219,14 @@
     private TextFormat NoteFormat
     {
         get => Settings.Current.Ui.CommentFormat;
-        set => Settings.Update(s => s.Ui.CommentFormat = value);
+
+        // Refused while an update takes over, the picker is already back where it was by the
+        // next render; this is so that reads as an answer rather than a misclick.
+        set
+        {
+            if (!Settings.Update(s => s.Ui.CommentFormat = value))
+                Toasts.Error("Could not change the format", AppState.RestartingForUpdate);
+        }
     }
 
     private string NoteHint => NoteFormat switch

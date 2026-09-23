@@ -63,7 +63,7 @@ public static class DataFolder
     public static void Replace(string path, byte[] contents) =>
         Replace(path, temp => File.WriteAllBytes(temp, contents));
 
-    /// <summary>About a second and a half in all, backing off.</summary>
+    /// <summary>Eight tries at it, however long each wait between them is.</summary>
     private const int ReplaceAttempts = 8;
 
     private static void Replace(string path, Action<string> writeTemp)
@@ -71,21 +71,44 @@ public static class DataFolder
         AppPaths.EnsureCreated();
 
         var temp = path + ".tmp";
-        writeTemp(temp);
 
+        var onWindowThread = System.Windows.Application.Current?.Dispatcher.CheckAccess() == true;
+        var written = false;
         for (var attempt = 1; ; attempt++)
         {
             try
             {
+                // Retried alongside the rename, not once before it: a leftover .tmp from an
+                // interrupted write that a scanner or a backup is holding stops the write just
+                // as surely as something holding the file itself, and this was the one step
+                // here that got no second chance. Kept once it is written, so a rename that
+                // fails does not have the file serialized out again behind it.
+                if (!written)
+                {
+                    writeTemp(temp);
+                    written = true;
+                }
+
                 File.Move(temp, path, overwrite: true);
                 return;
             }
             catch (Exception ex) when (attempt < ReplaceAttempts && ex is IOException or UnauthorizedAccessException)
             {
-                Thread.Sleep(50 * attempt);
+                Thread.Sleep(Pause(attempt, onWindowThread));
             }
         }
     }
+
+    /// <summary>
+    /// How long to wait before trying again. Backing off to about a second and a half in all,
+    /// which is long enough for a scan of the file to finish - except on the window's own
+    /// thread, where a save holds that thread and with it the gate above for the whole of it:
+    /// a second and a half there is a frozen window with the MSAL token write queued behind it.
+    /// So that waits flat and briefly instead, about a fifth of a second in all, which still
+    /// covers the usual case of a scanner opening the file just written; what it does not cover
+    /// is reported as the failure it is rather than waited out with the window stopped.
+    /// </summary>
+    private static int Pause(int attempt, bool onWindowThread) => onWindowThread ? 30 : 50 * attempt;
 
     /// <summary>
     /// Stops every write from here on. Returns only once any write already under way has

@@ -71,7 +71,10 @@ public partial class App : Application
             CrashLog.Write(args.ExceptionObject as Exception);
             SelfUpdater.SettleBeforeExit("Slate crashed");
         };
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => SelfUpdater.SettleBeforeExit("Slate was exiting");
+        // Deliberately not ProcessExit as well. The three above reach every way this copy ends
+        // that runs any code at all - signing out, shutting down, and a crash - and ProcessExit
+        // is the one the runtime may cut short part way through, which for an update being put
+        // back means part way through renaming the .exe.
         TaskScheduler.UnobservedTaskException += (_, args) =>
         {
             CrashLog.Write(args.Exception);
@@ -86,10 +89,16 @@ public partial class App : Application
     /// straight after this returns, ignoring a refused close, and Windows may end the process
     /// the moment it has answered. An update still waiting on its new copy is settled here and
     /// now, before answering, rather than on the way out when there may be no time left.
+    ///
+    /// Windows is counting the seconds this takes - it offers to end an app that has not
+    /// answered in about five - so the settling is told to be quick about it, which is what
+    /// keeps it well inside that and out of being ended part way through putting the .exe back.
     /// </summary>
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
     {
-        SelfUpdater.SettleBeforeExit($"Windows began {(e.ReasonSessionEnding == ReasonSessionEnding.Shutdown ? "shutting down" : "signing out")}");
+        SelfUpdater.SettleBeforeExit(
+            $"Windows began {(e.ReasonSessionEnding == ReasonSessionEnding.Shutdown ? "shutting down" : "signing out")}",
+            pressed: true);
         base.OnSessionEnding(e);
     }
 

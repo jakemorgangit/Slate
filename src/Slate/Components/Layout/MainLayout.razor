@@ -299,20 +299,39 @@
     {
         try
         {
-            await Updater.InstallAsync(release, () => State.PrepareForHandoverAsync(HandoverWait));
+            await Updater.InstallAsync(
+                release,
+                beforeSwap: () => State.PrepareForHandoverAsync(HandoverWait),
+                // A rollback after the files have moved can happen on a thread this await is
+                // no longer waiting on, so it undoes the standstill where it happens rather
+                // than leaving it to the finally below.
+                onRolledBack: State.ResumeAfterFailedHandover);
+        }
+        catch (UpdateInterruptedException ex)
+        {
+            // It says what stopped it and that the old version is back; the wording below
+            // would throw that away and leave the user guessing.
+            Toasts.Info("Update stopped", ex.Message);
         }
         catch (OperationCanceledException)
         {
-            State.ResumeAfterFailedHandover();
             Toasts.Info("Update cancelled", $"Still on {AppInfo.Version}.");
         }
         catch (SelfUpdateException ex)
         {
-            State.ResumeAfterFailedHandover();
             Toasts.Error(
                 $"Could not install Slate {release.Version}",
                 $"{ex.Message} Nothing was changed. The release page is open so you can download it yourself.");
             SystemShell.OpenUrl(release.Url);
+        }
+        finally
+        {
+            // Whatever came back, including an exception none of the catches above name - the
+            // renderer being torn down under the progress bar raises one - this copy must not
+            // be left with every write, sync and timer refused for the rest of the session
+            // behind a scrim that has gone. Not once it has handed over: there the standstill
+            // is the whole point, and it holds until this copy exits.
+            if (!SelfUpdater.IsHandingOver) State.ResumeAfterFailedHandover();
         }
     }
 
@@ -325,13 +344,16 @@
     private async Task ToggleThemeAsync()
     {
         // Update rather than editing the live settings and saving them: while an update takes
-        // over the save is refused, and Update refuses before anything has changed.
-        Settings.Update(settings => settings.Ui.Theme = settings.Ui.Theme switch
+        // over the save is refused, and Update refuses before anything has changed. Said out
+        // loud when it is refused, rather than leaving the button looking like it missed.
+        var saved = Settings.Update(settings => settings.Ui.Theme = settings.Ui.Theme switch
         {
             ThemeMode.Dark => ThemeMode.Light,
             ThemeMode.Light => ThemeMode.System,
             _ => ThemeMode.Dark,
         });
+
+        if (!saved) Toasts.Error("Could not change the theme", AppState.RestartingForUpdate);
         await ApplyThemeAsync();
     }
 

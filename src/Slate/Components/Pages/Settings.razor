@@ -815,12 +815,22 @@
     ///
     /// The draft is rebuilt from what was stored rather than kept: Save normalises as it
     /// goes, so re-reading is what puts a clamped value back in front of the person who
-    /// typed it.
+    /// typed it. Not when the save was refused, though - rebuilding then would take what was
+    /// just typed off the screen without a word, and it is a save that can be made again in a
+    /// moment rather than a value that was wrong.
     /// </summary>
     private void Set(Action mutate)
     {
         mutate();
-        Store.Save(_draft);
+
+        // Reachable even while an update hands over: the scrim over the page stops clicks,
+        // not keys, so a figure typed into a box before it went up still arrives on Enter.
+        if (!Store.Save(_draft))
+        {
+            Toasts.Error("Could not save that setting", AppState.RestartingForUpdate);
+            return;
+        }
+
         _draft = Store.CreateDraft();
     }
 
@@ -998,6 +1008,14 @@
     private bool CanConnect =>
         _draft.Entra.IsConfigured && !string.IsNullOrWhiteSpace(_draft.Ado.OrganizationUrl);
 
+    /// <summary>
+    /// How long an interactive sign-in may sit at the browser before Slate stops waiting for
+    /// it. Far longer than signing in takes, even through a password reset and a first run at
+    /// multi-factor, and short of leaving an abandoned browser window counted as a write in
+    /// flight for the rest of the session. Pressing Connect again starts a fresh one.
+    /// </summary>
+    private static readonly TimeSpan SignInPatience = TimeSpan.FromMinutes(5);
+
     private string ConnectionColour => State.SignIn.IsSignedIn && _adoOk ? "var(--ok)" : "var(--warn)";
 
     /// <summary>
@@ -1027,7 +1045,12 @@
             {
                 // Counted like any other write, since it writes the sign-in cache: an update
                 // waits for it rather than restarting with the sign-in half done and lost.
-                if (!await State.TryWriteAsync(() => Auth.SignInAsync()))
+                // Given up on in the end, though: it waits on a browser window Slate does not
+                // own, and somebody who starts one and wanders off would otherwise hold that
+                // count above zero for the rest of the session - every later update freezing
+                // behind the handover's scrim for its full wait and then being refused.
+                using var patience = new CancellationTokenSource(SignInPatience);
+                if (!await State.TryWriteAsync(() => Auth.SignInAsync(patience.Token)))
                 {
                     _connectResult = AppState.RestartingForUpdate;
                     Toasts.Error("Could not sign in", AppState.RestartingForUpdate);
@@ -1086,6 +1109,13 @@
 
             if (_connectOk) Toasts.Success("Connected", _connectResult);
             else Toasts.Warning("Partly connected", _connectResult);
+        }
+        catch (OperationCanceledException)
+        {
+            _connectOk = false;
+            _connectResult = $"Signing in was given up on after {SignInPatience.TotalMinutes:0} minutes. "
+                             + "Press Connect to start again.";
+            Toasts.Error("Signing in took too long", _connectResult);
         }
         catch (Exception ex) when (ex is Microsoft.Identity.Client.MsalException or InvalidOperationException)
         {
