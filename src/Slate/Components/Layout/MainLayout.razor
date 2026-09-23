@@ -292,8 +292,10 @@
     private static readonly TimeSpan HandoverWait = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Anything that stops the install leaves this copy exactly as it was, so the fallback is
-    /// the same as before in-app updates existed: the release page, to download it by hand.
+    /// Almost anything that stops the install leaves this copy exactly as it was, so the
+    /// fallback is the same as before in-app updates existed: the release page, to download it
+    /// by hand. The few failures that could not put everything back say what they left where
+    /// Slate runs from, and the catches below pass that on rather than reassuring over it.
     /// </summary>
     private async Task InstallUpdateAsync(ReleaseInfo release)
     {
@@ -311,8 +313,9 @@
         {
             // It says what stopped it and what that left behind; the wording below would throw
             // that away and leave the user guessing. The level goes by what it left rather than
-            // by which exception came back: the old version going back is an aside, while the
-            // same message can instead name an .exe to rename by hand, which is not. The
+            // by which exception came back: the old version back with nothing beside it is an
+            // aside, while the same message can instead name an .exe to rename by hand or a
+            // leftover copy to clear away by restarting, and neither of those is. The
             // release page stays shut either way - this is a copy on its way out, and opening a
             // browser while Windows signs out is what the interruption exists to avoid.
             if (ex.NothingChanged) Toasts.Info("Update stopped", ex.Message);
@@ -325,8 +328,8 @@
         catch (SelfUpdateException ex)
         {
             // The reassurance only where it is true: a failure that left the new version in
-            // place, or nothing at all, says so in its own message and must not be followed by
-            // "nothing was changed".
+            // place, nothing at all, or the old version back beside the copy it was made from
+            // says so in its own message and must not be followed by "nothing was changed".
             Toasts.Error(
                 $"Could not install Slate {release.Version}",
                 $"{ex.Message}{(ex.NothingChanged ? " Nothing was changed." : "")} " +

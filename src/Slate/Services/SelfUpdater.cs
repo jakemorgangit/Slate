@@ -15,8 +15,13 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
 {
     /// <summary>
     /// False when the failure left something behind that the message already explains - the new
-    /// version still standing where Slate runs from, or nothing there at all. The reassuring
-    /// "nothing was changed" a caller otherwise adds would flatly contradict it.
+    /// version still standing where Slate runs from, nothing there at all, or the old version
+    /// back under its own name with the copy it was made from still beside it as .old, which
+    /// the message tells the user to clear away by restarting. The reassuring "nothing was
+    /// changed" a caller otherwise adds would flatly contradict any of the three.
+    /// SelfUpdater.NothingLeftBehind is where those three are defined, and what every throw it
+    /// builds takes this from; Swap's copy-back failure is in the third of them and, since it
+    /// words its own message rather than being built there, marks itself the same way by hand.
     /// </summary>
     public bool NothingChanged { get; init; } = true;
 }
@@ -30,8 +35,10 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
 public sealed class UpdateInterruptedException(string message) : OperationCanceledException(message)
 {
     /// <summary>
-    /// The same thing <see cref="SelfUpdateException.NothingChanged"/> means: false when the
-    /// old version could not be put back, so the message names an .exe to rename by hand. An
+    /// The same thing <see cref="SelfUpdateException.NothingChanged"/> means, and false in the
+    /// same three states SelfUpdater.NothingLeftBehind defines: the new version standing where
+    /// Slate runs from, nothing there at all, or the old version back with the copy it was made
+    /// from still beside it as .old. An interruption before anything moved leaves it true. An
     /// interruption usually is an aside - the old version went back and this copy is ending
     /// anyway - but not always, and the two read very differently to the person told them.
     /// </summary>
@@ -164,9 +171,13 @@ public sealed class SelfUpdater
     /// <summary>
     /// Downloads, verifies and swaps in <paramref name="release"/>, starts it, and shuts this
     /// copy down once the new one is up. Throws <see cref="SelfUpdateException"/> with
-    /// something to tell the user when it cannot, having put everything back as it was, or
-    /// <see cref="OperationCanceledException"/> after <see cref="Cancel"/> - or once
-    /// <see cref="SettleBeforeExit"/> has put everything back because this copy is ending.
+    /// something to tell the user when it cannot; one thrown past the swap says what was
+    /// actually left where Slate runs from, which is not always everything put back - the new,
+    /// unproven version may be standing there, nothing may be, or the old version may be back
+    /// beside the copy it was made from. Or <see cref="OperationCanceledException"/> after
+    /// <see cref="Cancel"/>, and <see cref="UpdateInterruptedException"/> because this copy is
+    /// ending, by which point the settling has either happened here or been left to the thread
+    /// already doing it (<see cref="SettleBeforeExit"/>).
     /// </summary>
     /// <param name="beforeSwap">
     /// Runs once the download has checked out and before any file moves: brings the rest of
@@ -1503,9 +1514,12 @@ public sealed class SelfUpdater
     /// A cancellation rather than a failure: this copy is on its way out, and the failure path
     /// would open the release page in a browser while Windows is signing out. Its own wording,
     /// not the generic "cancelled", is what should reach the user - hence the type. Marked with
-    /// what it left behind for the same reason <see cref="Failed"/> is: two of the three things
-    /// <see cref="Describe"/> can say are an .exe to rename by hand, which is not an aside.
-    /// Only called under <see cref="HandoverLock"/>, which is what Restored is written under.
+    /// what it left behind for the same reason <see cref="Failed"/> is: of the four things
+    /// <see cref="Describe"/> can say, three leave the user something to do - two an .exe to
+    /// rename by hand, one a leftover to clear away by restarting - and none of those three is
+    /// an aside, which is why the flag comes from <see cref="NothingLeftBehind"/> rather than
+    /// from Restored alone. Only called under <see cref="HandoverLock"/>, which is what Restored
+    /// is written under.
     /// </summary>
     private static UpdateInterruptedException Interrupted(Handover handover) =>
         new($"{handover.Interruption ?? "Slate was closing"} before Slate {handover.Version} had started, {Describe(handover)}")
@@ -1515,17 +1529,20 @@ public sealed class SelfUpdater
 
     /// <summary>
     /// How a rollback ended, in the words the person using Slate sees. It has to be what
-    /// actually happened: two of the three leave them with something to do by hand, and a
-    /// "Slate put the old version back" that is not true is how someone ends up starting a
-    /// version that has already failed once, over the only working copy they had.
+    /// actually happened: of the four things it can say, three leave them something to do - two
+    /// an .exe to rename by hand, one a leftover to clear away by restarting - and only the
+    /// plain "so Slate put the old version back." asks nothing of them at all. A "put the old
+    /// version back" that is not true is how someone ends up starting a version that has
+    /// already failed once, over the only working copy they had.
     /// </summary>
     private static string Describe(Handover handover) => handover.Restored switch
     {
         // The .old surviving a rollback that got the old version back means one thing only:
         // it went back by being copied, since every rename that could have put it back would
-        // have taken the .old with it. That copy is the running image, so nothing can delete
-        // it until this copy exits - and it is the reason the next install of this session
-        // would stop at "an earlier copy is still in use" with nothing the user could act on.
+        // have taken the .old with it. That copy is the running image, so nothing can delete it
+        // until this copy exits, which is why the next install of this session stops at Swap's
+        // opening step - where the same remedy, a restart, is named again. Said here so the user
+        // hears about the leftover when it is left behind, rather than only if they try again.
         Restored.OldVersion when File.Exists(handover.Old) =>
             "so Slate put the old version back - by copying it, since Windows would not let it be renamed. " +
             $"The copy it was made from is beside it as {Path.GetFileName(handover.Old)}, and cannot be " +

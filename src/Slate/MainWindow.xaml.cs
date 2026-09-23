@@ -21,8 +21,9 @@ public partial class MainWindow : Window
         // closing before the new copy is up would leave nothing to put the old one back if
         // the new one fails. Both are over within the update's own time limit, and the
         // update bar says Slate is restarting by itself, so the close is simply refused.
-        // Signing out or shutting down ignores a refused close, so App settles the update
-        // itself before those go ahead (SelfUpdater.SettleBeforeExit).
+        // Signing out or shutting down ignores a refused close, so App settles the update itself
+        // before those go ahead, or leaves it to the thread already settling it rather than hold
+        // Windows up (SelfUpdater.SettleBeforeExit).
         Closing += (_, e) => e.Cancel |= SelfUpdater.IsSwapping || SelfUpdater.IsHandingOver;
     }
 
