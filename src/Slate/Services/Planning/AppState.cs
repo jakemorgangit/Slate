@@ -391,7 +391,19 @@ public sealed class AppState(
         }
         catch (Exception ex)
         {
-            if (stamp != ConnectionStamp)
+            // The check and the write are one step, under the same gate and for the same reason
+            // as the success path above: apart, CheckConnection can clear for a new connection
+            // in between the two, and this would then put the old connection's failure up as
+            // the new one's - the red banner over an organization nothing has asked yet, which
+            // is precisely what the clearing is there to prevent.
+            bool stale;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp;
+                if (!stale) WorkItemError = ex.Message;
+            }
+
+            if (stale)
             {
                 // Same reasoning as above: this failure was for a connection that is no longer
                 // current, so it is not this connection's error to show, and it is not this
@@ -401,7 +413,8 @@ public sealed class AppState(
                 return;
             }
 
-            WorkItemError = ex.Message;
+            // Outside the gate, like the clearing's own toast work: raising one tells the page
+            // to render, and rendering from in there would read this half written.
             ClearWorkItemErrorToast();
             _workItemErrorToast = toasts.Error("Could not load work items", ex.Message);
         }

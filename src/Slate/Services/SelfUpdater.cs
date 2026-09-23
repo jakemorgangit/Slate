@@ -22,12 +22,21 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
 }
 
 /// <summary>
-/// An install stopped part way because this copy of Slate was on its way out, with everything
-/// put back. A cancellation rather than a failure - the failure path would open the release
-/// page in a browser while Windows is signing out - but one with something of its own to say
-/// about what stopped it, which is why it is not a plain <see cref="OperationCanceledException"/>.
+/// An install stopped part way because this copy of Slate was on its way out. A cancellation
+/// rather than a failure - the failure path would open the release page in a browser while
+/// Windows is signing out - but one with something of its own to say about what stopped it,
+/// which is why it is not a plain <see cref="OperationCanceledException"/>.
 /// </summary>
-public sealed class UpdateInterruptedException(string message) : OperationCanceledException(message);
+public sealed class UpdateInterruptedException(string message) : OperationCanceledException(message)
+{
+    /// <summary>
+    /// The same thing <see cref="SelfUpdateException.NothingChanged"/> means: false when the
+    /// old version could not be put back, so the message names an .exe to rename by hand. An
+    /// interruption usually is an aside - the old version went back and this copy is ending
+    /// anyway - but not always, and the two read very differently to the person told them.
+    /// </summary>
+    public bool NothingChanged { get; init; } = true;
+}
 
 /// <summary>
 /// Replaces the running .exe with the release GitHub reports as newer, then restarts into it.
@@ -42,8 +51,9 @@ public sealed class UpdateInterruptedException(string message) : OperationCancel
 /// Every step that can fail before the old copy exits is undone if it does - including the old
 /// copy being ended from outside, by Windows signing out, while the new one is still starting -
 /// so the original path holds a working Slate again. Nothing is ever waited out while that path
-/// stands empty, and where putting the old copy back turns out to be impossible the new one is
-/// left there instead and said so, rather than reported as a rollback that happened. Ended
+/// stands empty. Where putting the old copy back turns out to be impossible the new one is left
+/// there instead, and, rarest of all, nothing can be put there at all: both are said plainly,
+/// with the .old named to rename back, rather than reported as a rollback that happened. Ended
 /// before the swap, the install stops there instead and moves nothing at all.
 ///
 /// Settings and the plan live in the data
@@ -488,10 +498,20 @@ public sealed class SelfUpdater
     /// Volatile rather than held under <see cref="HandoverLock"/>, because it has to be
     /// recorded before that lock is so much as asked for - a rollback already running on a
     /// pool thread holds it, and is exactly the case this has to reach. Kept at the first
-    /// reason given, and lifted again only by <see cref="SessionEndAbandoned"/>, for the one
-    /// way a copy told it is ending does not end after all.
+    /// reason given, and lifted again only by <see cref="SessionEndAbandoned"/>, and only when
+    /// the reason it is holding is the sign-out's own: that is the one way a copy told it is
+    /// ending does not end after all.
     /// </summary>
     private static volatile string? _exitingBecause;
+
+    /// <summary>
+    /// The reason a sign-out or shutdown Windows asked about put into <see cref="_exitingBecause"/>,
+    /// when it was the one that got there first. It is what lets
+    /// <see cref="SessionEndAbandoned"/> lift that latch without lifting one a crash or a
+    /// shutdown had already set: those are not questions Windows can go back on, and the same
+    /// instance being still in place is the only proof that the sign-out's is what is there.
+    /// </summary>
+    private static volatile string? _sessionEndReason;
 
     /// <summary>
     /// True while Windows is waiting on this copy's answer to a sign-out or shutdown before it
@@ -562,7 +582,10 @@ public sealed class SelfUpdater
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
                     // Nothing has moved, so there is nothing to put back: the copy that is
-                    // running is still at its own path.
+                    // running is still at its own path. True of a later round as well as the
+                    // first, because the only way back here is a round whose FillEmptyPath got
+                    // the old copy back by renaming the .old over the .exe - which takes the
+                    // .old with it. One that had to copy instead stops where it noticed.
                     if (attempt >= RenameAttempts || _pressedToExit)
                         throw new SelfUpdateException("Windows would not let Slate move its own file aside.", ex);
                     Thread.Sleep(150 * attempt);
@@ -589,6 +612,21 @@ public sealed class SelfUpdater
                     // here that leaves the user with something to do by hand.
                     if (filled == Restored.Nothing)
                         throw Failed(handover, "Windows would not let the new version take Slate's place", ex);
+
+                    // The old version is back, but by the copy rather than the rename - the .old
+                    // is still there, because it is this copy's own running image and Windows
+                    // will not delete one of those. So there is nowhere left to set the .exe
+                    // aside to, and another round would fail on that instead of on the download,
+                    // which is a different failure told in the same words. Stopped here and said
+                    // as it is: a copy went in and a file was left beside it, which is not the
+                    // "nothing was changed" the throw below would have the caller add.
+                    if (File.Exists(old))
+                        throw new SelfUpdateException(
+                            "Windows would not let the new version take Slate's place. Something may be scanning it. " +
+                            $"Slate {AppInfo.Version} is still what runs, with a spare copy of it beside as " +
+                            $"{Path.GetFileName(old)} - restart Slate before trying again, so that copy can be cleared away.",
+                            ex)
+                        { NothingChanged = false };
 
                     if (attempt >= RenameAttempts || _pressedToExit)
                         throw new SelfUpdateException("Windows would not let the new version take Slate's place. Something may be scanning it.", ex);
@@ -802,11 +840,19 @@ public sealed class SelfUpdater
             // out again for each one is seconds of disk apiece - with the handover held, the
             // data folder frozen and every write in the app refused for the whole of it. The
             // same shape as DataFolder.Replace, and for the same reason.
+            //
+            // Made again only if the scratch file has gone since: a second Slate started from
+            // this folder clears strays like it away as it starts and cannot tell this one from
+            // a leftover. Never reused after a copy that threw, though - what that leaves is a
+            // part-written build, and renaming one of those over the .exe is the very thing the
+            // scratch file is here to prevent - which is what the flag, rather than the file
+            // merely existing, is for.
             var copied = false;
             Retry(() =>
             {
-                if (!copied)
+                if (!copied || !File.Exists(scratch))
                 {
+                    copied = false;
                     File.Copy(old, scratch, overwrite: true);
                     copied = true;
                 }
@@ -814,11 +860,12 @@ public sealed class SelfUpdater
                 File.Move(scratch, exe, overwrite: true);
             }, attempts);
 
-            // The .old is now a duplicate of what is at the path, and leaving it there is the
-            // difference between this and the rename it stood in for: a swap that tries again
-            // would find nowhere to move the .exe aside to. Best effort, since whatever was
-            // holding it may still be.
-            TryDelete(old);
+            // The .old is left where it is. It is this copy's own running image - the .exe was
+            // renamed to it moments ago - and Windows lets one of those be renamed but never
+            // deleted, which is the difference between this and the rename it stood in for: the
+            // name it holds is not free again until this copy exits. Swap's own opening step
+            // clears it before the next update, and the caller in Swap stops rather than
+            // retrying into a move that now has nowhere to go.
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1005,6 +1052,12 @@ public sealed class SelfUpdater
         if (pressed) _pressedToExit = true;
         _exitingBecause ??= why;
 
+        // Only when this call is what recorded it. A sign-out arriving after a crash handler
+        // or a shutdown has already latched leaves theirs standing, and must not hand
+        // SessionEndAbandoned the right to lift it; the reference is what says which it is,
+        // since each caller builds its reason afresh.
+        if (pressed && ReferenceEquals(_exitingBecause, why)) _sessionEndReason = why;
+
         if (!pressed)
         {
             lock (HandoverLock) Settle(why, pressed: false);
@@ -1059,9 +1112,11 @@ public sealed class SelfUpdater
     /// <see cref="SettleBeforeExit"/> set is lifted again. Left standing it would refuse every
     /// later "Install and restart" for the rest of this copy's life, each one downloading the
     /// whole release and checking it before saying it was stopped by a sign-out that never
-    /// happened. Only a session end's own latch is lifted, which is what the guard below is:
-    /// <see cref="_pressedToExit"/> is set by nothing else, and the other ways the latch goes
-    /// on - the app being shut down, a crash - are not questions Windows can go back on.
+    /// happened. Only a session end's own latch is lifted, which is what the two guards below
+    /// are: <see cref="_pressedToExit"/> is set by nothing else, and <see cref="_exitingBecause"/>
+    /// is put back only while it still holds the reason the sign-out itself gave. The other
+    /// ways it goes on - the app being shut down, a crash - are not questions Windows can go
+    /// back on, so one of those that got there first is left exactly where it is.
     ///
     /// Usually there is nothing left to lift: WPF answers the question by shutting the app
     /// down whether or not the session end goes ahead, and this copy is gone a fraction of a
@@ -1081,9 +1136,18 @@ public sealed class SelfUpdater
         if (!_pressedToExit) return;
 
         _pressedToExit = false;
-        _exitingBecause = null;
 
-        CrashLog.WriteLine("Windows did not sign out after all, so Slate can install updates again.");
+        // The reason is put back only if it is still the sign-out's own. A crash handler or a
+        // shutdown that latched first left its own reason there, and SettleBeforeExit keeps the
+        // first one given, so clearing it blind would tell a copy that really is on its way out
+        // that it may start an install.
+        var lifted = _sessionEndReason is { } why && ReferenceEquals(_exitingBecause, why);
+        if (lifted) _exitingBecause = null;
+        _sessionEndReason = null;
+
+        CrashLog.WriteLine(lifted
+            ? "Windows did not sign out after all, so Slate can install updates again."
+            : $"Windows did not sign out after all, but Slate is on its way out anyway: {_exitingBecause}.");
     }
 
     /// <summary>
@@ -1292,10 +1356,16 @@ public sealed class SelfUpdater
     /// <summary>
     /// A cancellation rather than a failure: this copy is on its way out, and the failure path
     /// would open the release page in a browser while Windows is signing out. Its own wording,
-    /// not the generic "cancelled", is what should reach the user - hence the type.
+    /// not the generic "cancelled", is what should reach the user - hence the type. Marked with
+    /// what it left behind for the same reason <see cref="Failed"/> is: two of the three things
+    /// <see cref="Describe"/> can say are an .exe to rename by hand, which is not an aside.
+    /// Only called under <see cref="HandoverLock"/>, which is what Restored is written under.
     /// </summary>
     private static UpdateInterruptedException Interrupted(Handover handover) =>
-        new($"{handover.Interruption ?? "Slate was closing"} before Slate {handover.Version} had started, {Describe(handover)}");
+        new($"{handover.Interruption ?? "Slate was closing"} before Slate {handover.Version} had started, {Describe(handover)}")
+        {
+            NothingChanged = handover.Restored == Restored.OldVersion,
+        };
 
     /// <summary>
     /// How a rollback ended, in the words the person using Slate sees. It has to be what
@@ -1423,9 +1493,12 @@ public sealed class SelfUpdater
     private static async Task CleanUpAfterUpdateAsync(string exe, bool startedByUpdate)
     {
         // Unconditional, unlike the .old: a stray download, or the scratch file a copy back
-        // into place is made through, is only ever left by something that was cut short - and
-        // this copy started from the .exe beside them, so they are nothing but files taking up
-        // room. Neither is ever the Slate to go back to; the .old is.
+        // into place is made through, is all but always left by something that was cut short -
+        // and this copy started from the .exe beside them, so they are nothing but files taking
+        // up room. Neither is ever the Slate to go back to; the .old is. The one time that is
+        // not so is another copy in this folder making a scratch file at this very moment, and
+        // nothing here can tell that from a leftover - which is why CopyOldBack makes its own
+        // again if it finds it gone rather than trusting that it is still there.
         TryDelete(exe + ".download");
         TryDelete(exe + ".restoring");
 

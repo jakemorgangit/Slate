@@ -309,9 +309,14 @@
         }
         catch (UpdateInterruptedException ex)
         {
-            // It says what stopped it and that the old version is back; the wording below
-            // would throw that away and leave the user guessing.
-            Toasts.Info("Update stopped", ex.Message);
+            // It says what stopped it and what that left behind; the wording below would throw
+            // that away and leave the user guessing. The level goes by what it left rather than
+            // by which exception came back: the old version going back is an aside, while the
+            // same message can instead name an .exe to rename by hand, which is not. The
+            // release page stays shut either way - this is a copy on its way out, and opening a
+            // browser while Windows signs out is what the interruption exists to avoid.
+            if (ex.NothingChanged) Toasts.Info("Update stopped", ex.Message);
+            else Toasts.Error("Update stopped", ex.Message);
         }
         catch (OperationCanceledException)
         {
