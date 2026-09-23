@@ -640,8 +640,11 @@ public sealed class SelfUpdater
     ///
     /// Waiting happens only while something is at the original path: a scanner holding the
     /// file is gone a moment later, and the new copy standing there is at least a Slate. The
-    /// instant the path is empty that stops - see <see cref="FillEmptyPath"/> - and the slow
-    /// last resort below is skipped outright when Windows is waiting on this copy.
+    /// instant the path is empty that stops - <see cref="FillEmptyPath"/> fills it again
+    /// without waiting for anything - and the tries here carry on afterwards only because the
+    /// path is filled: all that method could put back is often the new copy, and getting the
+    /// old one back is what the tries are for. The slow last resort at the end is skipped
+    /// outright when Windows is waiting on this copy.
     /// </summary>
     /// <param name="attempts">
     /// How many tries the rename gets. Small when this copy is being ended by Windows and
@@ -651,7 +654,17 @@ public sealed class SelfUpdater
     {
         // Nothing at the path to begin with - a swap caught between its own two renames. There
         // is no time to spend on attempts and back-offs while that is true.
-        if (!File.Exists(exe)) return FillEmptyPath(exe, old, displaced);
+        //
+        // Two of the three answers end it here: the old version is back, or nothing will go
+        // there at all and no amount of trying changes that. The third - all that could be put
+        // back was the new copy - is the ordinary one, and the path holding a Slate again is
+        // what makes waiting allowed once more, so the tries below go on from there and are
+        // what actually get the old version back.
+        if (!File.Exists(exe))
+        {
+            var filled = FillEmptyPath(exe, old, displaced);
+            if (filled != Restored.NewVersion) return filled;
+        }
 
         for (var attempt = 1; ; attempt++)
         {
@@ -665,8 +678,14 @@ public sealed class SelfUpdater
             {
                 // Before anything else and before any waiting: if the new copy was moved out
                 // of the way and the old one would not go back, the path every shortcut and
-                // pin points at is empty at this instant.
-                if (!File.Exists(exe)) return FillEmptyPath(exe, old, displaced);
+                // pin points at is empty at this instant. Filled the same way, and treated the
+                // same way, as on the way in above - stopping on the new copy going back would
+                // be giving up on the rename after a single try.
+                if (!File.Exists(exe))
+                {
+                    var filled = FillEmptyPath(exe, old, displaced);
+                    if (filled != Restored.NewVersion) return filled;
+                }
 
                 if (attempt >= attempts || _pressedToExit)
                 {
@@ -682,7 +701,9 @@ public sealed class SelfUpdater
         // The path is not empty - the new copy is still standing at it - so there is time for
         // the one thing left that is not a rename. Not while Windows is waiting on this copy,
         // though: copying the standalone build takes seconds, and a newer Slate at the path
-        // beats being ended part way through writing one.
+        // beats being ended part way through writing one over it. FillEmptyPath copies even
+        // then, and for the same reasoning turned round: there the path is empty, so a copy
+        // cut short costs a stray file rather than the Slate that was standing there.
         if (_pressedToExit) return Restored.NewVersion;
 
         return CopyOldBack(exe, old, attempts) ? Restored.OldVersion : Restored.NewVersion;
@@ -698,8 +719,9 @@ public sealed class SelfUpdater
     /// backed off: the tenth of a moment between rounds is there so this does not spin the
     /// disk, not to wait anything out, which is what has whichever file was being held land
     /// the instant it is let go rather than at the next attempt after that. Failing both
-    /// inside <see cref="EmptyPathBudget"/>, a copy of the old one goes in instead - by the
-    /// same rename as everything else here, so the path is filled in one step.
+    /// inside <see cref="EmptyPathBudget"/>, one copy of the old one is tried instead - put in
+    /// by the same rename as everything else here, so the path is filled in one step - and
+    /// that gets no second try either, for the same reason nothing above does.
     /// </summary>
     private static Restored FillEmptyPath(string exe, string old, string? newCopy)
     {
@@ -716,10 +738,17 @@ public sealed class SelfUpdater
         CrashLog.WriteLine($"Neither copy could be renamed to {exe} within {since.ElapsedMilliseconds} ms.");
 
         // A file something else is holding open can still be read, even when it cannot be
-        // renamed, so the copy is the one thing left that might work. Not while Windows is
-        // waiting on this copy: copying the standalone build takes seconds it does not have,
-        // and the honest report is then the better answer.
-        if (!_pressedToExit && CopyOldBack(exe, old, RenameAttempts)) return Restored.OldVersion;
+        // renamed, so the copy is the one thing left that might work. One try at it, unlike
+        // Restore's six: every wait between tries would be spent with this path empty, which
+        // is the one thing this method exists to prevent, and the budget above has already
+        // covered a file held for a moment - a copy that will not start at all now was not
+        // going to start 150 ms later either.
+        //
+        // Tried even while Windows is waiting on this copy. The scratch file CopyOldBack goes
+        // through is what makes that safe: being ended part way through the copy leaves this
+        // path empty and a stray file to clear away, which is exactly what not trying leaves,
+        // minus the chance that it finishes.
+        if (CopyOldBack(exe, old, attempts: 1)) return Restored.OldVersion;
 
         // Only a rename or a copy that actually went through may be claimed. Anything else at
         // the path - there should be nothing, since only Slate writes there - is not something
@@ -768,9 +797,20 @@ public sealed class SelfUpdater
         var scratch = exe + ".restoring";
         try
         {
+            // Copied once, however many tries the rename over the .exe takes. The .old does not
+            // change between attempts and the rename is what fails, so writing the whole build
+            // out again for each one is seconds of disk apiece - with the handover held, the
+            // data folder frozen and every write in the app refused for the whole of it. The
+            // same shape as DataFolder.Replace, and for the same reason.
+            var copied = false;
             Retry(() =>
             {
-                File.Copy(old, scratch, overwrite: true);
+                if (!copied)
+                {
+                    File.Copy(old, scratch, overwrite: true);
+                    copied = true;
+                }
+
                 File.Move(scratch, exe, overwrite: true);
             }, attempts);
 
@@ -847,6 +887,20 @@ public sealed class SelfUpdater
             // Windows may have begun signing out while the files were being swapped, in which
             // case they are back where they were and there is nothing left to start.
             if (handover.Outcome != HandoverOutcome.Pending) throw Interrupted(handover);
+
+            // Or it began while they were and SettleBeforeExit could not take this lock inside
+            // the moment it had - the swap itself was holding it - so it answered Windows and
+            // left the settling to whoever did. That is here. The same latch SwapIn reads
+            // before it moves anything, read again at the other end of the stretch SwapIn's
+            // check opens: what would otherwise happen next is a brand-new copy started while
+            // Windows signs out, with nothing left to notice it never got as far as its window
+            // and the version that works only beside it as .old.
+            if (_exitingBecause is { } why)
+            {
+                handover.Interruption = why;
+                RollBack(handover, exiting: true, pressed: _pressedToExit);
+                throw Interrupted(handover);
+            }
 
             // From here until this copy exits or takes back over, the data folder is the new
             // copy's: it reads the plan and the settings as it starts, and anything written
@@ -1005,8 +1059,9 @@ public sealed class SelfUpdater
     /// <see cref="SettleBeforeExit"/> set is lifted again. Left standing it would refuse every
     /// later "Install and restart" for the rest of this copy's life, each one downloading the
     /// whole release and checking it before saying it was stopped by a sign-out that never
-    /// happened. The latch set on the way out or by a crash is never lifted: those really are
-    /// the end.
+    /// happened. Only a session end's own latch is lifted, which is what the guard below is:
+    /// <see cref="_pressedToExit"/> is set by nothing else, and the other ways the latch goes
+    /// on - the app being shut down, a crash - are not questions Windows can go back on.
     ///
     /// Usually there is nothing left to lift: WPF answers the question by shutting the app
     /// down whether or not the session end goes ahead, and this copy is gone a fraction of a
@@ -1014,23 +1069,19 @@ public sealed class SelfUpdater
     /// on it finishing - so for as long as this copy is still running, the truth about whether
     /// it is ending is kept up to date.
     ///
-    /// Asked for under <see cref="HandoverLock"/> so it cannot land in the middle of
-    /// <see cref="SwapIn"/> reading the latch, but only asked for, since this runs on the
-    /// window's thread - and lifted either way, because a session that is not ending is never
-    /// a reason to go on refusing an install.
+    /// No lock: both fields are volatile precisely so they can be written without one, and
+    /// this runs on the window's thread from inside a window message, where waiting on a lock
+    /// an install is holding is the one thing that must not happen. Nothing is gained by
+    /// taking it either. Landing in the middle of <see cref="SwapIn"/> reading the latch only
+    /// decides whether an install begun in that instant is refused, and refusing one over a
+    /// sign-out that was abandoned is the thing being undone here in the first place.
     /// </summary>
     public static void SessionEndAbandoned()
     {
-        var taken = HandoverLock.TryEnter(PressedLockWait);
-        try
-        {
-            _pressedToExit = false;
-            _exitingBecause = null;
-        }
-        finally
-        {
-            if (taken) HandoverLock.Exit();
-        }
+        if (!_pressedToExit) return;
+
+        _pressedToExit = false;
+        _exitingBecause = null;
 
         CrashLog.WriteLine("Windows did not sign out after all, so Slate can install updates again.");
     }
@@ -1103,9 +1154,11 @@ public sealed class SelfUpdater
     /// <param name="pressed">
     /// Windows is waiting on this before it signs out, so nothing here may take more than a
     /// moment: the new copy gets a quarter of a second to go rather than ten, each rename a
-    /// couple of tries rather than six, and the copy that is the last resort is not made at
-    /// all. A sign-out that arrives after this began sets <see cref="_pressedToExit"/>, which
-    /// the same steps read, so it is cut short from wherever it had got to.
+    /// couple of tries rather than six, and the copy that is the last resort is not made over
+    /// a new version already standing at the path. The one time it is still made is the path
+    /// being empty, where it is the only thing left that might fill it and there is no Slate
+    /// there to lose. A sign-out that arrives after this began sets <see cref="_pressedToExit"/>,
+    /// which the same steps read, so it is cut short from wherever it had got to.
     /// </param>
     private static void RollBack(Handover handover, bool exiting = false, bool pressed = false)
     {

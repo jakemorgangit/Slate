@@ -37,7 +37,8 @@ public partial class MainWindow : Window
     /// the answer is what tells this copy it is not ending after all; see
     /// <see cref="SelfUpdater.SessionEndAbandoned"/> for what turns on knowing that. Hooked
     /// here because this is the window with a handle of its own to hook, and because the
-    /// handler does nothing that can hold up the message loop.
+    /// handler takes no lock and waits on nothing: WM_ENDSESSION is sent rather than posted,
+    /// so whatever it does is done with the message loop stopped.
     /// </summary>
     private void WatchForAbandonedSessionEnd()
     {

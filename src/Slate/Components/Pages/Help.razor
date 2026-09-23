@@ -453,11 +453,13 @@
                     <dd>If something is still under way after 30 seconds, the folder the .exe is in cannot
                         be written to, the file is locked, the download does not match its checksum, or the
                         new version closes or has not shown its window within 90 seconds, the new version is
-                        stopped and the old one put back exactly as it was. It carries on running, and the
-                        release page opens so you can download the update by hand. If you sign out or shut
-                        down while the new version is still starting, it is stopped and the old one put back
-                        before Windows carries on, so the old version is the one that opens next time. A copy
-                        built with <code>dotnet build</code> only ever offers the link.</dd>
+                        stopped and the old one put back exactly as it was — or, if something is holding a
+                        file open and will not let go, Slate says so and names the <code>.old</code> beside
+                        it to rename back. It carries on running either way, and the release page opens so
+                        you can download the update by hand. If you sign out or shut down while the new
+                        version is still starting, it is stopped and the old one put back before Windows
+                        carries on, so the old version is the one that opens next time. A copy built with
+                        <code>dotnet build</code> only ever offers the link.</dd>
 
                     <dt>Something else</dt>
                     <dd>Anything unexpected is written to <code>crash.log</code> in the data folder below.</dd>
