@@ -93,6 +93,9 @@ public partial class App : Application
     /// Windows is counting the seconds this takes - it offers to end an app that has not
     /// answered in about five - so the settling is told to be quick about it, which is what
     /// keeps it well inside that and out of being ended part way through putting the .exe back.
+    /// Quick about it includes giving up on a settling another thread is already doing rather
+    /// than queueing behind it, so this returning does not by itself mean the old .exe is back;
+    /// see <see cref="SelfUpdater.SettleBeforeExit"/>.
     ///
     /// Known and left as it is: Windows only asking is enough to close Slate. WPF answers the
     /// question by shutting the app down before it returns, whether or not the sign-out then
@@ -101,9 +104,15 @@ public partial class App : Application
     /// nothing Slate hooks gets to the question first; taking it over means answering Windows
     /// in Slate's own right and with it everything WPF then stops doing for the shutdown.
     /// Nothing is lost when it happens - settings and the plan are written as they change, and
-    /// an update in flight is settled above before the answer goes back - so it costs the user
-    /// a restart. <see cref="SelfUpdater.SessionEndAbandoned"/> is what keeps this copy honest
-    /// for the moments it is still running afterwards.
+    /// an update in flight is settled above, or left to the thread already settling it - so it
+    /// costs the user a restart.
+    ///
+    /// The consequence for whoever picks this up: nothing in Slate acts on a sign-out being
+    /// abandoned, because this copy is already shutting down by the time Windows says so.
+    /// <see cref="SelfUpdater.SessionEndAbandoned"/> exists and is wired up to the message
+    /// (MainWindow.WatchForAbandonedSessionEnd), but all it can do today is tidy a latch in a
+    /// copy that has moments to live, so nothing may be built on it until the question above is
+    /// answered in Slate's own right.
     /// </summary>
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
     {

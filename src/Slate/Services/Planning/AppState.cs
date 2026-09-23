@@ -52,7 +52,6 @@ public sealed class AppState(
     private void DropStaleCaches()
     {
         var stamp = ConnectionStamp;
-        bool hadError;
 
         // Held across the whole clearing, not just the stamp. Published on its own, the stamp
         // says "this connection's caches are dealt with" while they are still there to deal
@@ -76,7 +75,7 @@ public sealed class AppState(
 
             // The error on screen was about the old connection. Left up, it reports the new one
             // failing before anything has asked it. The toast behind it goes too, below.
-            hadError = WorkItemError is not null;
+            var hadError = WorkItemError is not null;
             WorkItemError = null;
 
             // A cached list is only ever a stand-in for this same connection's own list - once

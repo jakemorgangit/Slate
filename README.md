@@ -510,10 +510,21 @@ it was, the app carries on exactly as before, and the release page opens so you 
 hand. What Slate then tells you is what actually happened rather than a rollback that did not: it
 puts the old `.exe` back, or — something is holding a file open and will not let go — leaves the
 new version there and names the `.old` beside it to rename over it, or, rarest of all, can put
-nothing there at all and names the `.old` to rename to `Slate.exe`. If you sign out or shut down
-while the new version is still starting, it is stopped and the old `.exe` put back before Windows
-is allowed to carry on, so the old version is the one that opens next time. A build made with plain
-`dotnet build` does not know which flavour it is, so it only ever offers the link.
+nothing there at all and names the `.old` to rename to `Slate.exe`. Where the old `.exe` could
+only be put back by copying it, the `.old` it was copied from stays until you restart Slate, and
+the message says so.
+
+If you sign out or shut down while the new version is still starting, Slate stops it and puts the
+old `.exe` back there and then, with every step cut to what fits in a moment: Windows offers to
+end an app that has not answered in about five seconds, and being ended halfway through moving
+the files is worse than any failed update. That is normally enough, and the old version is the
+one that opens next time — but it is not a promise. If Windows will not let the files move in
+that moment, or they were already being moved when the sign-out arrived — in which case Slate
+answers Windows rather than hold the sign-out up, and leaves the work already under way to finish
+as the app closes — then what is where Slate runs from is the new, unproven version, or, if it was
+ended between two renames, nothing at all. The version you were on is beside it as `Slate.exe.old`
+either way, to rename back. `crash.log` in the data folder says which of those happened. A build
+made with plain `dotnet build` does not know which flavour it is, so it only ever offers the link.
 
 ## Carrying your setup around
 

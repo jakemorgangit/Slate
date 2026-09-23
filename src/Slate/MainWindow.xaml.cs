@@ -34,11 +34,13 @@ public partial class MainWindow : Window
     /// about was abandoned, because another app refused it or the user pressed Cancel.
     ///
     /// WPF raises SessionEnding for the question but has nothing to say about the answer, and
-    /// the answer is what tells this copy it is not ending after all; see
-    /// <see cref="SelfUpdater.SessionEndAbandoned"/> for what turns on knowing that. Hooked
-    /// here because this is the window with a handle of its own to hook, and because the
-    /// handler takes no lock and waits on nothing: WM_ENDSESSION is sent rather than posted,
-    /// so whatever it does is done with the message loop stopped.
+    /// the answer is what would tell this copy it is not ending after all. It cannot act on
+    /// that today - WPF shuts the app down over the question itself, so the answer reaches a
+    /// copy that is already going; see <see cref="SelfUpdater.SessionEndAbandoned"/>, which says
+    /// what it is still good for and what it is not. Hooked here because this is the window with
+    /// a handle of its own to hook, and because the handler takes no lock and waits on nothing:
+    /// WM_ENDSESSION is sent rather than posted, so whatever it does is done with the message
+    /// loop stopped.
     /// </summary>
     private void WatchForAbandonedSessionEnd()
     {

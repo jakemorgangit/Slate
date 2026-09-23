@@ -455,11 +455,19 @@
                         new version closes or has not shown its window within 90 seconds, the new version is
                         stopped and the old one put back exactly as it was — or, if something is holding a
                         file open and will not let go, Slate says so and names the <code>.old</code> beside
-                        it to rename back. It carries on running either way, and the release page opens so
+                        it to rename back. Where the old one could only be put back by copying it, the
+                        <code>.old</code> it was copied from stays until you restart Slate, and the message
+                        says so. It carries on running either way, and the release page opens so
                         you can download the update by hand. If you sign out or shut down while the new
-                        version is still starting, it is stopped and the old one put back before Windows
-                        carries on, so the old version is the one that opens next time. A copy built with
-                        <code>dotnet build</code> only ever offers the link.</dd>
+                        version is still starting, Slate stops it and puts the old one back there and then,
+                        with every step cut to a moment — Windows offers to end an app that has not
+                        answered in about five seconds. That is normally enough, and the old version is the
+                        one that opens next time, but it is not a promise: if Windows will not let the files
+                        move in that moment, or they were already moving when the sign-out arrived — Slate
+                        answers Windows rather than hold it up, and leaves the work under way to finish as
+                        the app closes — the new version is left where Slate runs from, with the one you
+                        were on beside it as <code>.old</code> to rename back. <code>crash.log</code> says
+                        which. A copy built with <code>dotnet build</code> only ever offers the link.</dd>
 
                     <dt>Something else</dt>
                     <dd>Anything unexpected is written to <code>crash.log</code> in the data folder below.</dd>
