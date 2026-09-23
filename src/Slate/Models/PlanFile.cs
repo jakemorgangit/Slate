@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 namespace Slate.Models;
 
 /// <summary>On-disk shape of the plan. Versioned so the format can move without losing data.</summary>
@@ -30,4 +33,13 @@ public sealed class PlanFile
     /// and the thing the user just got rid of would walk straight back onto the grid.
     /// </summary>
     public List<string> Disowned { get; set; } = [];
+
+    /// <summary>
+    /// Anything in the saved plan this copy does not know about, kept so it survives a save.
+    /// The update can put an older exe back after a failed handover, and without this that
+    /// copy's first save would drop whatever a newer one had added - bookings and undos it
+    /// never confirmed among them, which is how the same hours end up on a work item twice.
+    /// </summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement> Extra { get; set; } = [];
 }

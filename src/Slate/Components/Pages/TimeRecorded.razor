@@ -43,6 +43,70 @@
         </div>
     </div>
 
+    @* Bookings Azure DevOps never confirmed. Shown here whatever week is on screen, and
+       whether or not their block still exists: one from a block deleted since cannot be
+       reached from the plan at all, and without somewhere like this it would sit in the
+       file for ever with no way to settle it. *@
+    @if (_unsettled.Count > 0)
+    {
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Not confirmed by Azure DevOps</h2>
+                    <div class="sub">
+                        Sent, with no answer either way. They count towards nothing above until one of them is settled.
+                    </div>
+                </div>
+            </div>
+            <div class="card-body">
+                @foreach (var block in _unsettled)
+                {
+                    <div class="banner error" @key="block.AllocationId">
+                        <span>!</span>
+                        <div class="grow">
+                            <div>
+                                <strong>@Ui.Hours(block.Minutes)</strong> for
+                                <span class="mono">#@block.First.WorkItemId</span>
+                                <span>@Ui.Clip(block.First.WorkItemTitle, NoteLimit)</span>,
+                                sent @Ui.Ago(block.First.RecordedAt).
+                                @if (Plan.Find(block.AllocationId) is null)
+                                {
+                                    <span class="badge badge-muted" title="The calendar block it came from has gone">Block deleted</span>
+                                }
+                            </div>
+                            <div>It may already be on the work item - look there before recording those hours again.</div>
+                            <div class="row" style="margin-top: 8px; gap: 6px">
+                                <button class="btn btn-sm" disabled="@(_busy is not null)"
+                                        @onclick="() => CheckAsync(block)">
+                                    @if (_busy == block.AllocationId)
+                                    {
+                                        <span class="spinner"></span>
+                                        <span>Checking…</span>
+                                    }
+                                    else
+                                    {
+                                        <span>Check</span>
+                                    }
+                                </button>
+                                @if (block.First.WorkItemUrl is { Length: > 0 } url)
+                                {
+                                    <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
+                                            @onclick="() => SystemShell.OpenUrl(url)">Open #@block.First.WorkItemId ↗</button>
+                                }
+                                @if (block.CanBeLetGo)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_busy is not null)"
+                                            title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting."
+                                            @onclick="() => LetGo(block)">Never went on</button>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
     @if (_entries.Count == 0)
     {
         <div class="empty-state">
@@ -209,10 +273,23 @@
     private List<TimeEntry> _entries = [];
     private List<DateTime> _days = [];
     private List<Row> _rows = [];
+    private List<Unsettled> _unsettled = [];
     private Guid? _undoing;
+    private Guid? _busy;
 
     /// <summary>How much of a note the row shows before the rest is left to the tooltip.</summary>
     private const int NoteLimit = 110;
+
+    /// <summary>One block's worth of bookings Azure DevOps never confirmed, oldest first.</summary>
+    private sealed record Unsettled(Guid AllocationId, IReadOnlyList<UnconfirmedBooking> Bookings)
+    {
+        public TimeEntry First => Bookings[0].Entry;
+
+        public int Minutes => Bookings.Sum(b => b.Entry.Minutes);
+
+        /// <summary>Only once none of them could still be arriving.</summary>
+        public bool CanBeLetGo => Bookings.All(b => b.CanBeLetGo);
+    }
 
     /// <summary>One work item's week: its per-day totals.</summary>
     private sealed record Row(int WorkItemId, string Title, string WorkItemType, Dictionary<DateTime, int> ByDay)
@@ -273,6 +350,43 @@
                 g.GroupBy(e => e.Date.Date).ToDictionary(d => d.Key, d => d.Sum(e => e.Minutes))))
             .OrderByDescending(r => r.TotalMinutes)
             .ThenBy(r => r.WorkItemId)];
+
+        // Not filtered to the week on screen: these are outstanding, not history, and the one
+        // whose block was deleted has nowhere else at all to be settled from.
+        _unsettled = [.. Plan.UnconfirmedBookings
+            .GroupBy(b => b.Entry.AllocationId)
+            .Select(g => new Unsettled(g.Key, [.. g.OrderBy(b => b.Entry.RecordedAt)]))
+            .OrderBy(u => u.First.RecordedAt)];
+    }
+
+    /// <summary>
+    /// Looks at the work item for one block's unconfirmed bookings, without writing anything.
+    /// The list rebuilds itself from the plan afterwards, so whatever it settled simply drops
+    /// off - filed above as an entry, or let go.
+    /// </summary>
+    private async Task CheckAsync(Unsettled block)
+    {
+        if (_busy is not null) return;
+
+        _busy = block.AllocationId;
+        try
+        {
+            await State.CheckUnconfirmedAsync(block.AllocationId);
+        }
+        finally
+        {
+            _busy = null;
+            Recompute();
+        }
+    }
+
+    /// <summary>Stops waiting on bookings the user has checked and found are not on the item.</summary>
+    private void LetGo(Unsettled block)
+    {
+        if (_busy is not null) return;
+
+        State.LetGoUnconfirmed(block.AllocationId);
+        Recompute();
     }
 
     private async Task UndoAsync(TimeEntry entry)

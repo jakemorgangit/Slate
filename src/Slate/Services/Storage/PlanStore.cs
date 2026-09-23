@@ -84,9 +84,22 @@ public sealed class PlanStore
     /// <summary>
     /// Plans written before time entries existed carried a running total on the block. Turn
     /// each one into a single entry so nothing already recorded disappears from the new view.
+    ///
+    /// Also squares up anything a hand-edited or older file left null where a list belongs.
     /// </summary>
     private static void Migrate(PlanFile file)
     {
+        // An explicit null in the file comes straight back as null, whatever the property's
+        // own default was - and every reader below would then throw on a plan that merely
+        // says "UnconfirmedBookings": null.
+        file.Allocations ??= [];
+        file.TimeEntries ??= [];
+        file.UnconfirmedBookings ??= [];
+        file.Priorities ??= [];
+        file.PendingDeletes ??= [];
+        file.Disowned ??= [];
+        file.Extra ??= [];
+
         foreach (var allocation in file.Allocations)
         {
             if (allocation.RecordedMinutes <= 0) continue;
@@ -120,14 +133,19 @@ public sealed class PlanStore
         lock (_gate)
         {
             var current = Cached;
+            // Version and Extra come from what was read rather than from this copy's own
+            // defaults: a plan a newer Slate wrote must not come back from here looking older
+            // than it is, nor lose the members that version added.
             var snapshot = new PlanFile
             {
+                Version = current.Version,
                 Allocations = [.. current.Allocations],
                 TimeEntries = [.. current.TimeEntries],
                 UnconfirmedBookings = [.. current.UnconfirmedBookings],
                 Priorities = new Dictionary<int, int>(current.Priorities),
                 PendingDeletes = [.. current.PendingDeletes],
                 Disowned = [.. current.Disowned],
+                Extra = current.Extra,
             };
 
             // Serializing inside the lock as well, so two threads cannot both be writing the

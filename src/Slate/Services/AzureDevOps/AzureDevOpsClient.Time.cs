@@ -28,13 +28,6 @@ public sealed partial class AzureDevOpsClient
     /// </summary>
     private const int MaxTimeSends = 3;
 
-    /// <summary>
-    /// How long a change that has not shown up on the work item is still given to arrive
-    /// before a later check calls it lost - well past this client's own timeout, and past
-    /// anything a gateway would sit on a request for.
-    /// </summary>
-    private static readonly TimeSpan LandingWindow = TimeSpan.FromMinutes(5);
-
     /// <summary>The pause before reading the item a second time, when the first read after a lost answer failed too.</summary>
     private static readonly TimeSpan RereadPause = TimeSpan.FromSeconds(2);
 
@@ -45,12 +38,19 @@ public sealed partial class AzureDevOpsClient
     /// </summary>
     private readonly ConcurrentDictionary<int, SemaphoreSlim> _timeGates = new();
 
+    /// <summary>
+    /// Told what is about to go out, just before each send of it. The caller writes the change
+    /// down before it can land, so a copy that dies between the send and the answer still
+    /// leaves the next one something it can settle against the work item.
+    /// </summary>
+    public delegate void PinnedHandler(TimeWritePlan pinned);
+
     /// <summary>Books time against a work item.</summary>
     public Task<TimeRecordResult> RecordTimeAsync(
-        int id, double hours, bool reduceRemaining, CancellationToken ct = default)
+        int id, double hours, bool reduceRemaining, PinnedHandler? pinning = null, CancellationToken ct = default)
     {
         if (hours <= 0) throw new AzureDevOpsException("Enter a number of hours greater than zero.");
-        return AdjustTimeAsync(id, hours, reduceRemaining ? -hours : 0, ct);
+        return AdjustTimeAsync(id, hours, reduceRemaining ? -hours : 0, pinning, ct);
     }
 
     /// <summary>
@@ -59,12 +59,13 @@ public sealed partial class AzureDevOpsClient
     /// zero, so undoing by the asked-for hours hands back work that was never there.
     /// </summary>
     public Task<TimeRecordResult> UndoTimeAsync(
-        int id, double appliedCompleted, double appliedRemaining, CancellationToken ct = default)
+        int id, double appliedCompleted, double appliedRemaining,
+        PinnedHandler? pinning = null, CancellationToken ct = default)
     {
         if (appliedCompleted == 0 && appliedRemaining == 0)
             throw new AzureDevOpsException("Nothing to undo.");
 
-        return AdjustTimeAsync(id, -appliedCompleted, -appliedRemaining, ct);
+        return AdjustTimeAsync(id, -appliedCompleted, -appliedRemaining, pinning, ct);
     }
 
     /// <summary>
@@ -80,12 +81,12 @@ public sealed partial class AzureDevOpsClient
         await gate.WaitAsync(ct);
         try
         {
-            var (landing, now) = await SettleAsync(plan, ct);
+            var (landing, now, _) = await SettleAsync(plan, ct);
             return landing switch
             {
                 Landing.Landed => (true, ResultFrom(plan, now!)),
                 Landing.Lost => (false, null),
-                Landing.NotYet when DateTimeOffset.Now - plan.SentAt >= LandingWindow => (false, null),
+                Landing.NotYet when !plan.CouldStillLand => (false, null),
                 _ => (null, null),
             };
         }
@@ -106,13 +107,13 @@ public sealed partial class AzureDevOpsClient
     /// <see cref="TimeWriteUnconfirmedException"/>, when that could not be told.
     /// </summary>
     private async Task<TimeRecordResult> AdjustTimeAsync(
-        int id, double completedDelta, double remainingDelta, CancellationToken ct)
+        int id, double completedDelta, double remainingDelta, PinnedHandler? pinning, CancellationToken ct)
     {
         var gate = _timeGates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
         try
         {
-            return await AdjustTimeLockedAsync(id, completedDelta, remainingDelta, ct);
+            return await AdjustTimeLockedAsync(id, completedDelta, remainingDelta, pinning, ct);
         }
         finally
         {
@@ -121,7 +122,7 @@ public sealed partial class AzureDevOpsClient
     }
 
     private async Task<TimeRecordResult> AdjustTimeLockedAsync(
-        int id, double completedDelta, double remainingDelta, CancellationToken ct)
+        int id, double completedDelta, double remainingDelta, PinnedHandler? pinning, CancellationToken ct)
     {
         // Nothing has gone out yet, so a failure to read is an ordinary failure.
         var now = await ReadTimeFieldsAsync(id, ct);
@@ -146,6 +147,11 @@ public sealed partial class AzureDevOpsClient
 
             pinned = pinned with { SentAt = DateTimeOffset.Now };
             AzureDevOpsException? refused = null;
+
+            // Written down before it can possibly land, never after: a copy that goes away
+            // between this send and its answer would otherwise leave hours on the work item
+            // with nothing here pointing at them, and the block offered again as unrecorded.
+            pinning?.Invoke(pinned);
 
             try
             {
@@ -173,7 +179,7 @@ public sealed partial class AzureDevOpsClient
                 lastFailure = refused = ex as AzureDevOpsException ?? new AzureDevOpsException(ex.Message, ex);
             }
 
-            var (landing, current) = await SettleAsync(pinned, ct);
+            var (landing, current, why) = await SettleAsync(pinned, ct);
             now = current ?? now;
 
             switch (landing)
@@ -182,7 +188,7 @@ public sealed partial class AzureDevOpsClient
                     return ResultFrom(pinned, now);
 
                 case Landing.Unknown:
-                    throw Unconfirmed(pinned, lastFailure);
+                    throw Unconfirmed(pinned, lastFailure, why);
 
                 case Landing.Lost:
                     // Nothing of it went on, and nothing of it can now: the item has moved past
@@ -204,7 +210,9 @@ public sealed partial class AzureDevOpsClient
             }
 
             if (sends >= MaxTimeSends)
-                throw outstanding ? Unconfirmed(pinned!, lastFailure) : lastFailure!;
+                throw outstanding
+                    ? Unconfirmed(pinned!, lastFailure, "it was still not on the work item after the last send")
+                    : lastFailure!;
         }
     }
 
@@ -226,8 +234,13 @@ public sealed partial class AzureDevOpsClient
     /// <summary>
     /// Works out from the work item whether a change sent without an answer landed. Reads the
     /// item, and when it has moved on, the one revision the change could have made.
+    ///
+    /// Anything it cannot settle comes back with the reason why, which goes to the log and
+    /// into what the user is told: an identity that never matches looks exactly like an
+    /// outage from the outside, and one of those is worth diagnosing rather than living with.
     /// </summary>
-    private async Task<(Landing Landing, TimeFields? Now)> SettleAsync(TimeWritePlan plan, CancellationToken ct)
+    private async Task<(Landing Landing, TimeFields? Now, string? Why)> SettleAsync(
+        TimeWritePlan plan, CancellationToken ct)
     {
         TimeFields now;
         try
@@ -244,30 +257,46 @@ public sealed partial class AzureDevOpsClient
             }
             catch (Exception again) when (again is not OperationCanceledException)
             {
-                return (Landing.Unknown, null);
+                return Undecided(plan, null, $"#{plan.WorkItemId} could not be read: {again.Message}");
             }
         }
 
-        if (now.Rev == plan.Rev) return (Landing.NotYet, now);
+        if (now.Rev == plan.Rev) return (Landing.NotYet, now, null);
 
         // Behind the pin - restored from the recycle bin, perhaps. Nothing to reason from.
-        if (now.Rev < plan.Rev) return (Landing.Unknown, now);
+        if (now.Rev < plan.Rev)
+            return Undecided(plan, now,
+                $"#{plan.WorkItemId} is at revision {now.Rev}, behind the {plan.Rev} this was pinned to");
 
         // Pinned to plan.Rev, so the next revision is the only one this change can have made.
         if (await ReadRevisionAsync(plan.WorkItemId, plan.Rev + 1, ct) is not { } revision)
-            return (Landing.Unknown, now);
+            return Undecided(plan, now, $"revision {plan.Rev + 1} of #{plan.WorkItemId} could not be read");
 
-        if (!revision.Made(plan)) return (Landing.Lost, now);
+        if (!revision.Made(plan)) return (Landing.Lost, now, null);
 
         // The right change at the right revision. Someone else making exactly this change as
         // the very next edit is far-fetched, but when the service names who made it and that
         // is plainly not this account, it is not claimed. Unknown rather than lost, so that a
         // mismatch in how the two name the same person can never lead to booking it again.
-        if (revision.RevisedBy is { Length: > 0 } by && await TryReadMyIdAsync(ct) is { Length: > 0 } me
-            && !string.Equals(by, me, StringComparison.OrdinalIgnoreCase))
-            return (Landing.Unknown, now);
+        var mine = await TryReadMyNamesAsync(ct);
+        if (mine.Count > 0 && revision.Names.Count > 0 && !revision.Names.Overlaps(mine))
+            return Undecided(plan, now,
+                $"revision {plan.Rev + 1} of #{plan.WorkItemId} made the change, but Azure DevOps says it was made by "
+                + $"[{string.Join(", ", revision.Names)}] and this sign-in answers to [{string.Join(", ", mine)}]");
 
-        return (Landing.Landed, now);
+        return (Landing.Landed, now, null);
+    }
+
+    /// <summary>
+    /// Could not be told either way, with the reason kept for the log and for what is shown.
+    /// </summary>
+    private static (Landing, TimeFields?, string?) Undecided(TimeWritePlan plan, TimeFields? now, string why)
+    {
+        CrashLog.WriteLine(
+            $"Could not settle the time change on #{plan.WorkItemId} pinned to revision {plan.Rev} " +
+            $"({plan.CompletedBefore:0.##}h to {plan.CompletedAfter:0.##}h completed): {why}.");
+
+        return (Landing.Unknown, now, why);
     }
 
     /// <summary>The revision number and time fields of a work item as it stands.</summary>
@@ -289,11 +318,16 @@ public sealed partial class AzureDevOpsClient
             Num(fields, RemainingWorkField) ?? 0);
     }
 
-    /// <summary>What one revision did to the time fields, and whose hand it was.</summary>
+    /// <summary>
+    /// What one revision did to the time fields, and every name the service gave for whose
+    /// hand it was. More than one, because the same person is named differently depending on
+    /// where you ask - and matching on any of them is what keeps an ordinary booking from
+    /// reading as somebody else's work.
+    /// </summary>
     private sealed record RevisionChange(
         double? CompletedOld, double? CompletedNew, bool CompletedChanged,
         double? RemainingOld, double? RemainingNew, bool RemainingChanged,
-        string? RevisedBy)
+        HashSet<string> Names)
     {
         /// <summary>
         /// True when this revision moved the field the change moves, from exactly where the
@@ -376,15 +410,29 @@ public sealed partial class AzureDevOpsClient
         var completed = Field(CompletedWorkField);
         var remaining = Field(RemainingWorkField);
 
-        var by = update.TryGetProperty("revisedBy", out var who) && who.ValueKind == JsonValueKind.Object
-                 && who.TryGetProperty("id", out var whoId) && whoId.ValueKind == JsonValueKind.String
-            ? whoId.GetString()
-            : null;
+        var by = NewNameSet();
+        if (update.TryGetProperty("revisedBy", out var who))
+            AddNames(by, who, "id", "uniqueName", "descriptor", "subjectDescriptor");
 
         return new RevisionChange(
             completed.Old, completed.New, completed.Changed,
             remaining.Old, remaining.New, remaining.Changed,
             by);
+    }
+
+    private static HashSet<string> NewNameSet() => new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Collects whichever of the named string properties an identity object carries.</summary>
+    private static void AddNames(HashSet<string> into, JsonElement identity, params string[] properties)
+    {
+        if (identity.ValueKind != JsonValueKind.Object) return;
+
+        foreach (var property in properties)
+        {
+            if (identity.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+                && value.GetString() is { Length: > 0 } text)
+                into.Add(text);
+        }
     }
 
     /// <summary>A number, whether it came as one or as text.</summary>
@@ -401,25 +449,62 @@ public sealed partial class AzureDevOpsClient
         };
     }
 
-    /// <summary>The identity id of the account this client works as, or null when it cannot be read.</summary>
-    private async Task<string?> TryReadMyIdAsync(CancellationToken ct)
+    /// <summary>
+    /// Every name the account this client works as answers to, remembered for as long as the
+    /// connection stays the same. Empty when it could not be read, which simply means the
+    /// identity has no say in whether a change was ours.
+    /// </summary>
+    private (string Connection, HashSet<string> Names) _myNames = ("", NewNameSet());
+
+    /// <summary>
+    /// The two identities connectionData names. They are often different people on paper -
+    /// the credential and the account it acts for - and which of them a work item's history
+    /// names is not something a client gets to know, so both count as us.
+    /// </summary>
+    private static readonly string[] ConnectionIdentities = ["authenticatedUser", "authorizedUser"];
+
+    /// <summary>
+    /// Reads who this client is from connectionData, keeping every form of the answer.
+    ///
+    /// authenticatedUser is not the one that matches a work item's identity references on an
+    /// AAD-backed organization - authorizedUser usually is - and either can be named by
+    /// descriptor or sign-in address rather than by id. Taking all of them and matching on any
+    /// is what stops an ordinary booking looking like somebody else's edit for ever.
+    /// </summary>
+    private async Task<HashSet<string>> TryReadMyNamesAsync(CancellationToken ct)
     {
+        // The organization decides which identity ids mean anything, and the way of signing in
+        // decides who we are; either moving makes what is held here somebody else's answer.
+        var connection = $"{OrgUrl}|{settings.Current.Ado.AuthMode}";
+        if (_myNames.Connection == connection && _myNames.Names.Count > 0) return _myNames.Names;
+
+        var names = NewNameSet();
         try
         {
             using var doc = await SendAsync(HttpMethod.Get,
                 $"{OrgUrl}/_apis/connectionData?api-version={ApiVersion}-preview", null, ct);
 
-            return doc.RootElement.ValueKind == JsonValueKind.Object
-                   && doc.RootElement.TryGetProperty("authenticatedUser", out var user)
-                   && user.ValueKind == JsonValueKind.Object
-                   && user.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String
-                ? id.GetString()
-                : null;
+            foreach (var which in ConnectionIdentities)
+            {
+                if (!doc.RootElement.TryGetProperty(which, out var user)) continue;
+
+                AddNames(names, user, "id", "descriptor", "subjectDescriptor", "uniqueName");
+
+                // The sign-in address lives under properties.Account as a typed value.
+                if (user.TryGetProperty("properties", out var properties)
+                    && properties.ValueKind == JsonValueKind.Object
+                    && properties.TryGetProperty("Account", out var account))
+                    AddNames(names, account, "$value");
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return null;
+            CrashLog.WriteLine($"Could not read who this sign-in is from {OrgUrl}: {ex.Message}");
+            return names;
         }
+
+        if (names.Count > 0) _myNames = (connection, names);
+        return names;
     }
 
     private static TimeWritePlan PlanTimeWrite(int id, TimeFields now, double completedDelta, double remainingDelta)
@@ -487,9 +572,11 @@ public sealed partial class AzureDevOpsClient
         || (ex.ErrorKey?.Contains("TestPatchOperationFailed", StringComparison.OrdinalIgnoreCase) ?? false)
         || ex.Message.Contains("TF26071", StringComparison.Ordinal);
 
-    private static TimeWriteUnconfirmedException Unconfirmed(TimeWritePlan plan, Exception? cause) =>
+    private static TimeWriteUnconfirmedException Unconfirmed(TimeWritePlan plan, Exception? cause, string? why) =>
         new($"Azure DevOps did not confirm the change to #{plan.WorkItemId}, and a look at the work item " +
-            "afterwards could not settle whether it went through. Check the work item before trying again.",
+            "afterwards could not settle whether it went through"
+            + (string.IsNullOrEmpty(why) ? "" : $" - {why}")
+            + ". Check the work item before trying again.",
             plan, cause);
 
     private string WorkItemUrl(int id) => $"{OrgUrl}/_apis/wit/workitems/{id}?api-version={ApiVersion}";

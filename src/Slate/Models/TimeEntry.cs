@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace Slate.Models;
@@ -18,6 +19,18 @@ public sealed class TimeEntry
     public string WorkItemType { get; set; } = "";
     public string WorkItemUrl { get; set; } = "";
     public string Project { get; set; } = "";
+
+    /// <summary>
+    /// The Azure DevOps organization these hours were booked to. Work item numbers are only
+    /// unique within an organization, so without this an Undo made after switching to another
+    /// one would take hours off whatever #7 happens to be over there. The project is not part
+    /// of it: ids do not repeat across the projects of one organization, and the time endpoints
+    /// are organization-scoped, so narrowing it further would only refuse honest undos.
+    ///
+    /// Empty on entries written before this was kept, and on ones whose organization could not
+    /// be worked out; those are acted on as before rather than being stranded.
+    /// </summary>
+    public string Organization { get; set; } = "";
 
     /// <summary>The day the time is booked against - snapshotted, so moving the block later does not move the entry.</summary>
     public DateTime Date { get; set; }
@@ -57,9 +70,44 @@ public sealed class TimeEntry
     /// </summary>
     public TimeWritePlan? UnconfirmedUndo { get; set; }
 
+    /// <summary>
+    /// Anything in the saved entry this copy does not know about, kept so it survives a save.
+    /// A newer Slate can add fields, and an older one that reads and writes the plan after a
+    /// rollback would otherwise quietly drop them - including the ones that say a booking or
+    /// an undo was never confirmed, which is exactly how the same hours get booked twice.
+    /// </summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement> Extra { get; set; } = [];
+
     public DateTime End => Start.AddMinutes(BlockMinutes);
 
     public int Minutes => (int)Math.Round(Hours * 60);
+
+    /// <summary>
+    /// Whether these hours belong to the Azure DevOps organization given - the one an undo,
+    /// a check or a settle is about to act through.
+    ///
+    /// The stamp answers it outright. Entries written before there was one are judged on the
+    /// work item link they were kept with, which begins with the organization they were read
+    /// from, so switching organization does not strand them either. Only an entry that says
+    /// nothing at all is taken on trust: refusing those would make old entries impossible to
+    /// undo for no better reason than that they are old.
+    /// </summary>
+    public bool BelongsTo(string organization)
+    {
+        var wanted = NormaliseOrganization(organization);
+        if (wanted.Length == 0) return true;
+
+        if (Organization.Length > 0)
+            return string.Equals(NormaliseOrganization(Organization), wanted, StringComparison.OrdinalIgnoreCase);
+
+        return WorkItemUrl.Length == 0
+               || WorkItemUrl.StartsWith(wanted + "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>One spelling of an organization URL, so two ways of writing the same one match.</summary>
+    public static string NormaliseOrganization(string organizationUrl) =>
+        organizationUrl.Trim().TrimEnd('/');
 }
 
 /// <summary>How a time write ended, as far as it can be told.</summary>
@@ -94,11 +142,25 @@ public sealed record TimeWritePlan(
     bool SetsRemaining,
     DateTimeOffset SentAt)
 {
+    /// <summary>
+    /// How long a change that has not shown up on the work item is still given to arrive
+    /// before it is called lost - well past the client's own timeout, and past anything a
+    /// gateway would sit on a request for.
+    /// </summary>
+    public static readonly TimeSpan LandingWindow = TimeSpan.FromMinutes(5);
+
     [JsonIgnore]
     public double AppliedCompleted => CompletedAfter - CompletedBefore;
 
     [JsonIgnore]
     public double AppliedRemaining => SetsRemaining ? RemainingAfter - RemainingBefore : 0;
+
+    /// <summary>
+    /// True while a send of this could still be on its way, so nothing may decide on its
+    /// behalf that it never went on.
+    /// </summary>
+    [JsonIgnore]
+    public bool CouldStillLand => DateTimeOffset.Now - SentAt < LandingWindow;
 }
 
 /// <summary>
@@ -106,6 +168,9 @@ public sealed record TimeWritePlan(
 /// afterwards could not settle whether it landed. Written down so the block is not offered
 /// again as if nothing had happened - on the next opening, or after a restart - and so a
 /// later check can still settle it, filing the entry if the time did go on.
+///
+/// It is written down before the change is sent rather than after it comes back, so a copy
+/// that dies between the two still leaves the next one something to settle.
 /// </summary>
 public sealed class UnconfirmedBooking
 {
@@ -114,4 +179,20 @@ public sealed class UnconfirmedBooking
 
     /// <summary>What was sent, which is what a later check looks for on the work item.</summary>
     public TimeWritePlan? Plan { get; set; }
+
+    /// <summary>
+    /// True while the write this was written down for is still going in this copy. Until it
+    /// comes back there is nothing to tell anyone and nothing to check - this is not an
+    /// unconfirmed booking yet, only one in flight. Never saved: a copy that finds one of
+    /// these in the plan file is the next one along, and to it the write really is unsettled.
+    /// </summary>
+    [JsonIgnore]
+    public bool InFlight { get; set; }
+
+    /// <summary>
+    /// True once no send of it can still be arriving, so letting it go cannot be overtaken by
+    /// it landing straight afterwards.
+    /// </summary>
+    [JsonIgnore]
+    public bool CanBeLetGo => !InFlight && (Plan is not { } plan || !plan.CouldStillLand);
 }

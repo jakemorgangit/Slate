@@ -63,6 +63,15 @@
                                     <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
                                             @onclick="() => SystemShell.OpenUrl(url)">Open #@allocation.WorkItemId ↗</button>
                                 }
+                                @* The way out of a booking Azure DevOps will never settle - offered only
+                                   once no send of it could still be arriving, so saying it never went on
+                                   cannot be overtaken by it landing a moment later. *@
+                                @if (unconfirmed.All(b => b.CanBeLetGo))
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                            title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting, and the block can be recorded again."
+                                            @onclick="LetGo">Never went on</button>
+                                }
                             </div>
                         </div>
                     </div>
@@ -167,11 +176,15 @@
                     </div>
                 }
 
-                @if (allocation.RecordedMinutes > 0)
+                @* What this machine has actually booked from this block. Read from the entries,
+                   which is where recording has lived since it stopped being a running total on
+                   the block - Allocation.RecordedMinutes is only kept to migrate old plans from,
+                   and is zeroed the moment one is read, so it never had anything to say here. *@
+                @if (Plan.RecordedMinutesForBlock(allocation.Id) is > 0 and var recordedHere)
                 {
                     <p class="muted" style="font-size: 12px">
-                        @Ui.Duration(allocation.RecordedMinutes) has already been recorded from this block
-                        (@Ui.Ago(allocation.LastRecordedAt)).
+                        @Ui.Duration(recordedHere) has already been recorded from this block
+                        (@Ui.Ago(Plan.LatestEntryForBlock(allocation.Id)?.RecordedAt)).
                     </p>
                 }
             </div>
@@ -398,9 +411,15 @@
     }
 
     /// <summary>
-    /// Looks again for this block's unconfirmed bookings, without writing anything. If this
-    /// opening's own booking turns out to have gone on, that is the save done, and the
-    /// dialog closes the way a save would have closed it.
+    /// Looks again for this block's unconfirmed bookings, without writing anything. A check
+    /// that files an entry closes the dialog, whichever opening the booking came from: the
+    /// hours in the box were chosen against a block that had none of it, so leaving the form
+    /// up - Record enabled, the same hours still in it - is one press away from booking them
+    /// a second time. Record day's row goes the same way, to Recorded and unticked.
+    ///
+    /// Nothing is rebased here. A check that could not settle everything leaves the guard in
+    /// <see cref="SaveAsync"/> armed against whatever it did file, so the next Record is
+    /// refused rather than added on top.
     /// </summary>
     private async Task CheckAsync()
     {
@@ -411,22 +430,35 @@
         {
             var outcome = await State.CheckUnconfirmedAsync(allocation.Id);
 
-            if (outcome == TimeWriteOutcome.Recorded && _unconfirmed && State.RecordingFor?.Id == allocation.Id)
+            if (outcome == TimeWriteOutcome.Recorded)
             {
+                // Forgotten first, so a dialog reopened for another block while this ran is
+                // seeded for that one rather than coming back with these hours in.
                 _openedFor = null;
-                State.CancelRecordTime();
+                if (State.RecordingFor?.Id == allocation.Id) State.CancelRecordTime();
                 return;
             }
 
+            // Null is "there was nothing left to check", not "nothing landed": the quiet
+            // settle had already been through it. Either way this opening's own booking is
+            // no longer outstanding, and the banner has gone with it.
             if (outcome != TimeWriteOutcome.Unconfirmed) _unconfirmed = false;
-
-            // Whatever the check filed was this dialog's own doing, and is on screen now.
-            _recordedAtOpen = Plan.RecordedMinutesForBlock(allocation.Id);
         }
         finally
         {
             _checking = false;
             Prime();
         }
+    }
+
+    /// <summary>
+    /// Stops waiting on a booking that never went on. Nothing is filed and nothing is sent,
+    /// so the hours in the box are still what is left on this block and the guard in
+    /// <see cref="SaveAsync"/> still holds - Record simply becomes available again.
+    /// </summary>
+    private void LetGo()
+    {
+        if (_saving || _checking || Shown is not { } allocation) return;
+        if (State.LetGoUnconfirmed(allocation.Id)) _unconfirmed = false;
     }
 }

@@ -537,20 +537,15 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     public IReadOnlyList<TimeEntry> TimeEntries => store.TimeEntries;
 
-    /// <summary>Records that time was booked against the work item from this block.</summary>
-    public TimeEntry AddTimeEntry(
-        Allocation allocation, double hours, bool reducedRemaining,
-        double appliedCompleted = 0, double appliedRemaining = 0, string comment = "")
-    {
-        var entry = BuildTimeEntry(allocation, hours, reducedRemaining, appliedCompleted, appliedRemaining, comment);
-
-        store.TimeEntries.Add(entry);
-        Persist();
-        return entry;
-    }
+    /// <summary>
+    /// The organization these hours are being booked to, stamped onto every entry so that a
+    /// later Undo, check or settle can tell whether the work item it is about to act on is
+    /// even the one they went to.
+    /// </summary>
+    public string Organization => TimeEntry.NormaliseOrganization(settings.Current.Ado.OrganizationUrl);
 
     /// <summary>The entry a booking from this block makes, not yet filed.</summary>
-    public static TimeEntry BuildTimeEntry(
+    public TimeEntry BuildTimeEntry(
         Allocation allocation, double hours, bool reducedRemaining,
         double appliedCompleted = 0, double appliedRemaining = 0, string comment = "")
     {
@@ -562,6 +557,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             WorkItemType = allocation.WorkItemType,
             WorkItemUrl = allocation.WorkItemUrl,
             Project = allocation.Project,
+            Organization = Organization,
             Date = allocation.Start.Date,
             Start = allocation.Start,
             BlockMinutes = allocation.DurationMinutes,
@@ -578,29 +574,81 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     // ---------------------------------------------------------------- unconfirmed bookings
 
     /// <summary>
-    /// Writes down a booking Azure DevOps never confirmed. Nothing counts it as recorded:
-    /// it may not be on the work item. It only stops the block being offered again as if
-    /// nothing had happened, and keeps what a later check needs to settle it.
+    /// Writes a booking down before it is sent, pinned to the revision it tests against, and
+    /// again for each further send of the same one so the record always names the change that
+    /// is actually out there. Nothing counts it as recorded: it may not be on the work item.
+    ///
+    /// Before the send rather than after the answer, because a copy that goes away in between
+    /// would otherwise leave hours on a work item with nothing here pointing at them, and the
+    /// block offered again as if it had never been booked.
     /// </summary>
-    public void AddUnconfirmed(Allocation allocation, double hours, bool reducedRemaining, string comment, TimeWritePlan plan)
+    public void PinUnconfirmed(UnconfirmedBooking booking, TimeWritePlan plan)
     {
-        store.UnconfirmedBookings.Add(new UnconfirmedBooking
-        {
-            Entry = BuildTimeEntry(allocation, hours, reducedRemaining,
-                plan.AppliedCompleted, plan.AppliedRemaining, comment),
-            Plan = plan,
-        });
+        booking.Plan = plan;
+        booking.InFlight = true;
+
+        // Both fields clamp at zero, so what the change actually moves is only known once it
+        // has been worked out against the item as it stands.
+        booking.Entry.AppliedCompleted = plan.AppliedCompleted;
+        booking.Entry.AppliedRemaining = plan.AppliedRemaining;
+
+        if (!store.UnconfirmedBookings.Contains(booking)) store.UnconfirmedBookings.Add(booking);
         Persist();
     }
 
-    public IReadOnlyList<UnconfirmedBooking> UnconfirmedBookings => store.UnconfirmedBookings;
+    /// <summary>
+    /// The write came back unanswered, so what was written down before it went out is now a
+    /// genuinely unconfirmed booking: something to tell the user about, and to check later.
+    /// </summary>
+    public void LeaveUnconfirmed(UnconfirmedBooking booking)
+    {
+        booking.InFlight = false;
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Files a booking that did go through as the entry it makes, lets go of anything its
+    /// write overtook, and takes it off the unconfirmed list - all in one save. Two saves
+    /// would leave a moment where a copy that died had both the entry and the booking, and
+    /// the next settle would file the same hours a second time.
+    /// </summary>
+    public TimeEntry Confirm(UnconfirmedBooking booking, TimeRecordResult result)
+    {
+        booking.InFlight = false;
+        booking.Entry.AppliedCompleted = result.AppliedCompleted;
+        booking.Entry.AppliedRemaining = result.AppliedRemaining;
+
+        store.UnconfirmedBookings.Remove(booking);
+        store.TimeEntries.Add(booking.Entry);
+        if (result.Plan is { } landed) DropOvertaken(landed);
+
+        Persist();
+        return booking.Entry;
+    }
+
+    /// <summary>Lets go of a booking that certainly never reached the work item.</summary>
+    public void DropUnconfirmed(UnconfirmedBooking booking)
+    {
+        booking.InFlight = false;
+        if (store.UnconfirmedBookings.Remove(booking)) Persist();
+    }
+
+    /// <summary>
+    /// The bookings still to be settled. Ones whose write is still going in this copy are not
+    /// among them: until it comes back there is nothing to say and nothing to check, and the
+    /// block it belongs to is claimed by that write anyway.
+    /// </summary>
+    public IReadOnlyList<UnconfirmedBooking> UnconfirmedBookings =>
+        [.. store.UnconfirmedBookings.Where(b => !b.InFlight)];
 
     /// <summary>The unsettled bookings from one block, oldest first.</summary>
     public IReadOnlyList<UnconfirmedBooking> UnconfirmedForBlock(Guid allocationId) =>
-        [.. store.UnconfirmedBookings.Where(b => b.Entry.AllocationId == allocationId).OrderBy(b => b.Entry.RecordedAt)];
+        [.. store.UnconfirmedBookings
+            .Where(b => !b.InFlight && b.Entry.AllocationId == allocationId)
+            .OrderBy(b => b.Entry.RecordedAt)];
 
     public bool HasUnconfirmed(Guid allocationId) =>
-        store.UnconfirmedBookings.Any(b => b.Entry.AllocationId == allocationId);
+        store.UnconfirmedBookings.Any(b => !b.InFlight && b.Entry.AllocationId == allocationId);
 
     /// <summary>Still waiting to be settled, rather than filed or let go since it was read.</summary>
     public bool IsUnsettled(UnconfirmedBooking booking) => store.UnconfirmedBookings.Contains(booking);
@@ -624,19 +672,33 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     }
 
     /// <summary>
-    /// Lets go of the unconfirmed bookings a write that did land has overtaken: those pinned to
-    /// the same revision of the same work item. Only one write can ever become the revision
-    /// after it, so they cannot land now - and checking one later would find this write's
-    /// change there, and file it a second time if it happened to be the same size.
+    /// Lets go of everything a write that did land has overtaken: bookings and undos alike
+    /// pinned to the same revision of the same work item. Only one write can ever become the
+    /// revision after it, so none of the others can land now - and checking one later would
+    /// find this write's change sitting there and claim it, which for an undo means dropping
+    /// an entry whose hours are still on the work item.
+    ///
+    /// Both lists together, because the two are pinned the same way and a booking can just as
+    /// easily overtake an undo as another booking: zero-clamping alone makes any two changes
+    /// that drive Completed Work to nothing from the same place identical.
     /// </summary>
-    public void DropUnconfirmedOvertakenBy(TimeWritePlan landed)
+    private bool DropOvertaken(TimeWritePlan landed)
     {
-        if (DropOvertaken(landed)) Persist();
+        var dropped = store.UnconfirmedBookings.RemoveAll(b => b.Plan is { } plan && Overtaken(plan, landed)) > 0;
+
+        foreach (var entry in store.TimeEntries)
+        {
+            if (entry.UnconfirmedUndo is not { } undo || !Overtaken(undo, landed)) continue;
+
+            entry.UnconfirmedUndo = null;
+            dropped = true;
+        }
+
+        return dropped;
     }
 
-    private bool DropOvertaken(TimeWritePlan landed) =>
-        store.UnconfirmedBookings.RemoveAll(b =>
-            b.Plan is { } plan && plan.WorkItemId == landed.WorkItemId && plan.Rev == landed.Rev) > 0;
+    private static bool Overtaken(TimeWritePlan pending, TimeWritePlan landed) =>
+        pending.WorkItemId == landed.WorkItemId && pending.Rev == landed.Rev;
 
     /// <summary>Writes down, or clears, an undo of this entry that was never confirmed.</summary>
     public void SetUnconfirmedUndo(Guid entryId, TimeWritePlan? plan)
@@ -647,9 +709,16 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         Persist();
     }
 
-    public void RemoveTimeEntry(Guid entryId)
+    /// <summary>
+    /// Drops an entry, and in the same save lets go of whatever the write that took it off
+    /// overtook. One save, so no copy can die holding the entry gone and the sweep undone.
+    /// </summary>
+    public void RemoveTimeEntry(Guid entryId, TimeWritePlan? landed = null)
     {
-        if (store.TimeEntries.RemoveAll(e => e.Id == entryId) > 0) Persist();
+        var removed = store.TimeEntries.RemoveAll(e => e.Id == entryId) > 0;
+        var swept = landed is { } plan && DropOvertaken(plan);
+
+        if (removed || swept) Persist();
     }
 
     public TimeEntry? FindTimeEntry(Guid entryId) =>

@@ -115,10 +115,18 @@
                                                     break;
                                                 case RowStatus.Unconfirmed:
                                                     @* Not ticked and not tickable: sending it again is how the same
-                                                       hours would go on twice. Check looks without writing. *@
+                                                       hours would go on twice. Check looks without writing, and
+                                                       "Never went on" is the way out of one that never settles. *@
                                                     <div style="color: var(--danger); font-size: 11.5px" title="@row.Error">May be booked</div>
                                                     <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
                                                             @onclick="() => CheckAsync(row)">Check</button>
+                                                    @if (Plan.UnconfirmedForBlock(row.AllocationId) is { Count: > 0 } pending
+                                                         && pending.All(b => b.CanBeLetGo))
+                                                    {
+                                                        <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                                                title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting, and the block can be recorded again."
+                                                                @onclick="() => LetGo(row)">Never went on</button>
+                                                    }
                                                     break;
                                                 default:
                                                     @if (!row.TracksTime)
@@ -548,9 +556,23 @@
                     break;
 
                 case TimeWriteOutcome.Failed:
-                    row.Status = RowStatus.Pending;
-                    row.Selected = row.TracksTime && row.Hours > 0;
-                    row.Error = null;
+                    ReopenForRecording(row);
+                    break;
+
+                // Nothing was left to check: the quiet settle had already been through it, so
+                // the plan itself says where this row stands. Ticking it on the strength of
+                // "nothing landed" would offer hours the settle may well have just filed.
+                case null:
+                    if (Plan.RecordedMinutesForBlock(row.AllocationId) > row.RecordedHereMinutes)
+                    {
+                        row.Status = RowStatus.Recorded;
+                        row.Selected = false;
+                        row.Error = null;
+                    }
+                    else
+                    {
+                        ReopenForRecording(row);
+                    }
                     break;
 
                 default:
@@ -563,5 +585,23 @@
             _checking = false;
             Prime();
         }
+    }
+
+    /// <summary>
+    /// Stops waiting on a row's booking that never went on, and offers the block again. Only
+    /// the plan is touched - nothing is sent to Azure DevOps either way.
+    /// </summary>
+    private void LetGo(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+        if (State.LetGoUnconfirmed(row.AllocationId)) ReopenForRecording(row);
+    }
+
+    /// <summary>Puts a row back where an unbooked one starts: offered, ticked and editable.</summary>
+    private void ReopenForRecording(RowVm row)
+    {
+        row.Status = RowStatus.Pending;
+        row.Selected = row.TracksTime && row.Hours > 0;
+        row.Error = null;
     }
 }
