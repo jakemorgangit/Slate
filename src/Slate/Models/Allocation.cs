@@ -61,6 +61,11 @@ public sealed class Allocation
     /// Anything in the saved block this copy does not know about, kept so it survives a save -
     /// see <see cref="PlanFile.Extra"/>. A newer Slate can add fields to a block, and an older
     /// one put back by a rollback would otherwise drop them the first time it saved.
+    ///
+    /// Belongs to the one block it was read for, so a duplicate does not inherit it: these are
+    /// members this copy cannot read, and the ones worth keeping are the ones that say what a
+    /// block is against the outside world. <see cref="Clone"/> hands the same dictionary to
+    /// both blocks, so whoever copies a block gives the copy its own.
     /// </summary>
     [JsonExtensionData]
     public Dictionary<string, JsonElement> Extra { get; set; } = [];

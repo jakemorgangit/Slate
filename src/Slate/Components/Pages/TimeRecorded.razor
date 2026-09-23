@@ -172,7 +172,7 @@
                             @if (!entry.BelongsTo(_organization))
                             {
                                 <div>
-                                    It was booked against <span class="mono">@Booked(entry)</span>, which Slate is
+                                    It was booked against <span class="mono">@AppState.BookedAgainst(entry)</span>, which Slate is
                                     not connected to now, so nothing here can settle it.
                                 </div>
                             }
@@ -340,14 +340,21 @@
                                        of that undo could still be arriving, which is the same
                                        window a booking's answers wait for. An entry booked in
                                        another week has no row here at all; those are gathered
-                                       into their own section at the top of the page. *@
+                                       into their own section at the top of the page.
+
+                                       Gated on the organization as well, the way that section
+                                       is: both answers rest on the user having looked at the
+                                       work item, and hours booked against an address Slate is
+                                       not connected to are the one case where they cannot
+                                       have. "Same organization", just below, is the way out
+                                       for those. *@
                                     @if (entry.UnconfirmedUndo is { } undo)
                                     {
                                         <div style="margin-top: 4px; font-size: 11.5px; color: var(--danger)">
                                             Azure DevOps never confirmed the undo sent @Ui.Ago(undo.SentAt),
                                             so those hours may or may not still be on the work item.
                                         </div>
-                                        @if (!undo.CouldStillLand)
+                                        @if (!undo.CouldStillLand && entry.BelongsTo(_organization))
                                         {
                                             <div class="row" style="margin-top: 6px; gap: 6px">
                                                 <button class="btn btn-sm btn-ghost" disabled="@(_undoing is not null)"
@@ -368,7 +375,7 @@
                                     @if (!entry.BelongsTo(_organization))
                                     {
                                         <div style="margin-top: 4px; font-size: 11.5px; color: var(--text-3)">
-                                            Booked against <span class="mono">@Booked(entry)</span>, which Slate is
+                                            Booked against <span class="mono">@AppState.BookedAgainst(entry)</span>, which Slate is
                                             not connected to now, so Undo would change a different work item.
                                             <button class="btn btn-sm btn-ghost" style="margin-left: 6px"
                                                     disabled="@(_undoing is not null)"
@@ -420,7 +427,7 @@
     private List<TimeEntry> _entries = [];
     private List<DateTime> _days = [];
     private List<Row> _rows = [];
-    private List<Unsettled> _unsettled = [];
+    private List<AppState.UnsettledBlock> _unsettled = [];
     /// <summary>
     /// Entries whose undo Azure DevOps never confirmed, from weeks other than the one on
     /// screen. The pin is taken here rather than read again while rendering: the quiet settle
@@ -436,35 +443,6 @@
 
     /// <summary>How much of a note the row shows before the rest is left to the tooltip.</summary>
     private const int NoteLimit = 110;
-
-    /// <summary>
-    /// One block's worth of bookings Azure DevOps never confirmed, oldest first.
-    /// <see cref="Mine"/> are the ones this connection may act on; <see cref="Elsewhere"/> is
-    /// the address the rest were booked against, when there are any - nothing here can settle
-    /// those, because #7 over there is a different work item.
-    ///
-    /// The two are kept apart rather than the block being judged by its first booking, because
-    /// a block can hold one made before an organization was switched and one made after. Read
-    /// off the oldest, a mixed block offered no check and no answers for the booking that is
-    /// plainly this organization's, and its one way out - "same organization" - re-stamped the
-    /// foreign booking as well.
-    /// </summary>
-    private sealed record Unsettled(
-        Guid AllocationId,
-        IReadOnlyList<UnconfirmedBooking> Bookings,
-        IReadOnlyList<UnconfirmedBooking> Mine,
-        string? Elsewhere)
-    {
-        public TimeEntry First => Bookings[0].Entry;
-
-        public int Minutes => Bookings.Sum(b => b.Entry.Minutes);
-
-        /// <summary>Nothing on this block can be answered for from here.</summary>
-        public bool AllElsewhere => Mine.Count == 0;
-
-        /// <summary>Only once none of the ones that can be answered could still be arriving.</summary>
-        public bool CanBeLetGo => Mine.Count > 0 && Mine.All(b => b.CanBeLetGo);
-    }
 
     /// <summary>One work item's week: its per-day totals.</summary>
     private sealed record Row(int WorkItemId, string Title, string WorkItemType, Dictionary<DateTime, int> ByDay)
@@ -534,7 +512,7 @@
         // whose block was deleted has nowhere else at all to be settled from.
         _unsettled = [.. Plan.UnconfirmedBookings
             .GroupBy(b => b.Entry.AllocationId)
-            .Select(g => Group(g.Key, [.. g.OrderBy(b => b.Entry.RecordedAt)]))
+            .Select(g => State.Split(g.Key, [.. g.OrderBy(b => b.Entry.RecordedAt)]))
             .OrderBy(u => u.First.RecordedAt)];
 
         // An entry whose undo is stuck is outstanding in the same sense, and it cannot be
@@ -550,19 +528,12 @@
         }
     }
 
-    private Unsettled Group(Guid allocationId, IReadOnlyList<UnconfirmedBooking> bookings) =>
-        new(allocationId, bookings,
-            [.. bookings.Where(b => b.Entry.BelongsTo(_organization))],
-            bookings.Select(b => b.Entry).FirstOrDefault(e => !e.BelongsTo(_organization)) is { } entry
-                ? Booked(entry)
-                : null);
-
     /// <summary>
     /// Looks at the work item for one block's unconfirmed bookings, without writing anything.
     /// The list rebuilds itself from the plan afterwards, so whatever it settled simply drops
     /// off - filed above as an entry, or let go.
     /// </summary>
-    private async Task CheckAsync(Unsettled block)
+    private async Task CheckAsync(AppState.UnsettledBlock block)
     {
         if (_busy is not null) return;
 
@@ -579,7 +550,7 @@
     }
 
     /// <summary>Stops waiting on bookings the user has checked and found are not on the item.</summary>
-    private void LetGo(Unsettled block)
+    private void LetGo(AppState.UnsettledBlock block)
     {
         if (_busy is not null) return;
 
@@ -592,7 +563,7 @@
     /// in the two dialogs because a booking whose block has been deleted has nowhere else to
     /// be answered at all, and "never went on" is the wrong answer for it.
     /// </summary>
-    private void FileIt(Unsettled block)
+    private void FileIt(AppState.UnsettledBlock block)
     {
         if (_busy is not null) return;
 
@@ -600,12 +571,8 @@
         Recompute();
     }
 
-    /// <summary>Where a set of hours says it was booked, however little it was stamped with.</summary>
-    private static string Booked(TimeEntry entry) =>
-        entry.Organization is { Length: > 0 } stamp ? stamp : entry.WorkItemUrl;
-
     /// <summary>Takes a block's bookings as this organization's, when the user says they are.</summary>
-    private void Adopt(Unsettled block)
+    private void Adopt(AppState.UnsettledBlock block)
     {
         if (_busy is not null) return;
 

@@ -42,6 +42,14 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// </summary>
     public bool CanSave => store.CanSave;
 
+    /// <summary>
+    /// Whether the plan that was on disk could be read at all - see
+    /// <see cref="PlanStore.PlanWasUnreadable"/>. True for the whole session when it could
+    /// not, even though saving works again once the old file has been put aside: what was
+    /// outstanding is in that file and nowhere else, so a time write is refused on this too.
+    /// </summary>
+    public bool PlanWasUnreadable => store.PlanWasUnreadable;
+
     public IReadOnlyList<Allocation> Allocations => store.All;
 
     public IEnumerable<Allocation> InRange(DateTime start, DateTime end) =>
@@ -173,6 +181,13 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         copy.SyncedFingerprint = null;
         copy.LastError = null;
 
+        // Cleared for the same reason as the four above, and with more reason: a newer Slate's
+        // per-block members are exactly what this copy cannot read, so it cannot tell which of
+        // them say what that one block is - an event, a send, hours already booked. Clearing
+        // also gives the copy its own dictionary, which Clone does not: it copies the
+        // reference, and the two blocks would write each other's members for the session.
+        copy.Extra = [];
+
         store.Edit(file => file.Allocations.Add(copy));
         Persist();
         return copy;
@@ -295,7 +310,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
                 {
                     if (allocation.OutlookEventId is null)
                     {
-                        allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                        allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
                         created++;
                     }
                     else if (!await graph.EventExistsAsync(allocation.OutlookEventId, ct))
@@ -306,7 +321,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
                     }
                     else
                     {
-                        await graph.UpdateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                        await graph.UpdateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
                         updated++;
                     }
 
@@ -340,9 +355,9 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         try
         {
             if (allocation.OutlookEventId is null || !await graph.EventExistsAsync(allocation.OutlookEventId, ct))
-                allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
             else
-                await graph.UpdateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                await graph.UpdateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
 
             allocation.MissingInOutlook = false;
 
@@ -940,9 +955,30 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     public int RecordedMinutes(int workItemId) =>
         store.TimeEntries.Where(e => e.WorkItemId == workItemId).Sum(e => e.Minutes);
 
-    /// <summary>Total minutes recorded from one calendar block.</summary>
+    /// <summary>
+    /// Total minutes recorded from one calendar block, read without taking the plan's lock.
+    ///
+    /// For the UI thread, which asks this of every block on the grid several times a render
+    /// and of a dialog's rows as they are built. The lock stays off this path because a save
+    /// holds it across serialising the whole plan and writing it to disk, and putting a render
+    /// behind that for every block is not a trade worth making for a number that is only shown.
+    ///
+    /// Anything reading it from another thread wants
+    /// <see cref="RecordedMinutesForBlockLocked"/>: the sum enumerates the entries, and an
+    /// entry filed while it does brings the reader down.
+    /// </summary>
     public int RecordedMinutesForBlock(Guid allocationId) =>
         store.TimeEntries.Where(e => e.AllocationId == allocationId).Sum(e => e.Minutes);
+
+    /// <summary>
+    /// The same total, taken under the lock a save holds - for the two sync paths, which run
+    /// from the calendar timer's thread-pool callback while a booking is being filed from the
+    /// UI thread or from the quiet settle. The enumeration throws when that happens, and the
+    /// throw lands on one allocation as a sync failure reading "Collection was modified",
+    /// whose event is then not sent until the next pass.
+    /// </summary>
+    private int RecordedMinutesForBlockLocked(Guid allocationId) =>
+        store.Edit(file => file.TimeEntries.Where(e => e.AllocationId == allocationId).Sum(e => e.Minutes));
 
     // ---------------------------------------------------------------- helpers
 

@@ -29,8 +29,13 @@
             <div class="modal-body">
                 @* A booking from this block that Azure DevOps never confirmed. It may already be
                    on the work item, so Record stays off until it is settled - pressing it again
-                   is exactly how the same hours would go on twice. *@
-                @if (Plan.UnconfirmedForBlock(allocation.Id) is { Count: > 0 } unconfirmed)
+                   is exactly how the same hours would go on twice.
+
+                   Split the way the Time tab splits it, and for the same reason: a block can
+                   hold a booking made before an organization was switched and one made after,
+                   and every action here is offered on the ones it would actually be allowed
+                   for. Nothing offered and then refused, and nothing withheld that would work. *@
+                @if (State.UnsettledFor(allocation.Id) is { } unconfirmed)
                 {
                     <div class="banner error">
                         <span>!</span>
@@ -42,34 +47,55 @@
                             }
                             else
                             {
-                                <div><strong>@Ui.Duration(unconfirmed.Sum(b => b.Entry.Minutes))</strong> booked from
-                                    this block @Ui.Ago(unconfirmed[^1].Entry.RecordedAt) was never confirmed by Azure DevOps.</div>
+                                <div><strong>@Ui.Duration(unconfirmed.Minutes)</strong> booked from
+                                    this block @Ui.Ago(unconfirmed.Latest.RecordedAt) was never confirmed by Azure DevOps.</div>
+                            }
+                            @if (unconfirmed.Elsewhere is { } where)
+                            {
+                                <div>
+                                    @(unconfirmed.AllElsewhere ? "It was booked" : "Part of it was booked")
+                                    against <span class="mono">@where</span>, which Slate is not connected to
+                                    now, so nothing here can settle @(unconfirmed.AllElsewhere ? "it" : "that part").
+                                </div>
                             }
                             <div>It may already be on #@allocation.WorkItemId, so nothing more can be recorded
                                 from this block until that is settled.</div>
                             <div class="row" style="margin-top: 8px; gap: 6px">
-                                <button class="btn btn-sm" disabled="@(_saving || _checking)" @onclick="CheckAsync">
-                                    @if (_checking)
-                                    {
-                                        <span class="spinner"></span>
-                                        <span>Checking…</span>
-                                    }
-                                    else
-                                    {
-                                        <span>Check again</span>
-                                    }
-                                </button>
+                                @if (!unconfirmed.AllElsewhere)
+                                {
+                                    <button class="btn btn-sm" disabled="@(_saving || _checking)" @onclick="CheckAsync">
+                                        @if (_checking)
+                                        {
+                                            <span class="spinner"></span>
+                                            <span>Checking…</span>
+                                        }
+                                        else
+                                        {
+                                            <span>Check again</span>
+                                        }
+                                    </button>
+                                }
                                 @if (WorkItemUrl(allocation) is { Length: > 0 } url)
                                 {
                                     <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
                                             @onclick="() => SystemShell.OpenUrl(url)">Open #@allocation.WorkItemId ↗</button>
+                                }
+                                @* The one way out of a booking made against an address this
+                                   connection is not at: it cannot be checked or answered for
+                                   here, and a renamed or moved organization has no old address
+                                   to switch back to. Only re-stamps the ones that are refused. *@
+                                @if (unconfirmed.Elsewhere is not null)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                            title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps; the booking simply becomes one this connection can check and answer for."
+                                            @onclick="Adopt">Same organization - settle it here</button>
                                 }
                                 @* The way out of a booking Azure DevOps will never settle, in both
                                    directions: whichever way the work item reads, the user can say so
                                    and Slate writes it down. Offered only once no send of it could
                                    still be arriving, so an answer cannot be overtaken by the change
                                    landing a moment later. *@
-                                @if (unconfirmed.All(b => b.CanBeLetGo))
+                                @if (unconfirmed.CanBeLetGo)
                                 {
                                     <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
                                             title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
@@ -478,6 +504,21 @@
     {
         if (_saving || _checking || Shown is not { } allocation) return;
         if (State.LetGoUnconfirmed(allocation.Id)) _unconfirmed = false;
+    }
+
+    /// <summary>
+    /// Takes this block's refused bookings as this organization's, when the user says they
+    /// are. The way out of the one refusal there is otherwise no way out of from here: an
+    /// organization that was renamed or moved has no old address left to switch back to.
+    ///
+    /// Only re-stamps them, and only the ones actually refused. Nothing is sent and nothing
+    /// is settled, so the banner stays and the check and the two answers - which still decide
+    /// - simply become available for them.
+    /// </summary>
+    private void Adopt()
+    {
+        if (_saving || _checking || Shown is not { } allocation) return;
+        State.AdoptOrganizationForBlock(allocation.Id);
     }
 
     /// <summary>

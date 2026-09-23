@@ -1845,6 +1845,16 @@ public sealed class AppState(
         "Your plan cannot be written at the moment, so time booked now could not be recorded here and could go on the work item twice. Close Slate, make sure nothing else is holding the plan file, and start it again.";
 
     /// <summary>
+    /// Why time cannot be written after a plan that would not parse was put aside. Saving
+    /// works again - it is a new, empty plan - but the bookings Azure DevOps never confirmed
+    /// were in the old file and nowhere else, while the blocks come back from their Outlook
+    /// events reading as never recorded. Recording one of those is how hours already on a work
+    /// item go on it a second time, and nothing here can tell which blocks those are.
+    /// </summary>
+    private const string PlanUnreadable =
+        "Your plan could not be read when Slate started, so it cannot tell which hours are already on a work item. The old file is kept beside it in the Slate data folder: sort that out, then start Slate again.";
+
+    /// <summary>
     /// A time write refused here, before anything went to Azure DevOps, because the block
     /// already has a booking nothing has settled. Its own kind, so every caller can tell it
     /// apart from a failure and offer the check rather than a one-click retry.
@@ -1855,19 +1865,20 @@ public sealed class AppState(
     /// Counts a time write in, or says why it cannot go ahead. Every null must be paired with
     /// an <see cref="EndWrite"/>.
     ///
-    /// Two refusals, for the two ways a write would end up on a work item with nothing here
-    /// to show for it: a handover, where the copy that will carry on has already read the
-    /// plan, and a plan file that cannot be written at all, where nothing is read back by
-    /// anybody. Every path that books, undoes, checks or answers for time goes through this
-    /// or through <see cref="TryClaimBlock"/>, which starts here.
+    /// Three refusals, for the three ways a write would end up on a work item with nothing
+    /// here to show for it: a handover, where the copy that will carry on has already read the
+    /// plan; a plan file that cannot be written at all, where nothing is read back by anybody;
+    /// and one that could not be read this time, where what was outstanding is in a file
+    /// nothing will open again. Every path that books, undoes, checks or answers for time goes
+    /// through this or through <see cref="TryClaimBlock"/>, which starts here.
     /// </summary>
     private string? TryBeginTimeWrite()
     {
         if (!TryBeginWrite()) return RestartingForUpdate;
-        if (planner.CanSave) return null;
+        if (planner.CanSave && !planner.PlanWasUnreadable) return null;
 
         EndWrite();
-        return PlanUnwritable;
+        return planner.CanSave ? PlanUnreadable : PlanUnwritable;
     }
 
     /// <summary>
@@ -2099,6 +2110,72 @@ public sealed class AppState(
         elsewhere = why;
         return mine;
     }
+
+    /// <summary>
+    /// One block's unconfirmed bookings, split into the ones this connection may act on and
+    /// the address the rest were booked against.
+    ///
+    /// What every opening onto those bookings shows is decided from this, so that none of them
+    /// can offer an action the answer paths will then refuse - and none of them can hide one
+    /// that would work. A block can hold a booking made before an organization was switched
+    /// and one made after: the check and the two answers are for <see cref="Mine"/>, and
+    /// "same organization" is the way out for the others.
+    /// </summary>
+    public sealed record UnsettledBlock(
+        Guid AllocationId,
+        IReadOnlyList<UnconfirmedBooking> Bookings,
+        IReadOnlyList<UnconfirmedBooking> Mine,
+        string? Elsewhere)
+    {
+        /// <summary>The oldest booking of the block, which names the work item for all of them.</summary>
+        public TimeEntry First => Bookings[0].Entry;
+
+        /// <summary>The newest, which is the one "sent ten minutes ago" is about.</summary>
+        public TimeEntry Latest => Bookings[^1].Entry;
+
+        public int Minutes => Bookings.Sum(b => b.Entry.Minutes);
+
+        /// <summary>Nothing on this block can be checked or answered for from here.</summary>
+        public bool AllElsewhere => Mine.Count == 0;
+
+        /// <summary>Only once none of the ones that can be answered could still be arriving.</summary>
+        public bool CanBeLetGo => Mine.Count > 0 && Mine.All(b => b.CanBeLetGo);
+    }
+
+    /// <summary>
+    /// The unconfirmed bookings of one block as <see cref="UnsettledBlock"/> reads them, or
+    /// null when the block has none left. For the two record dialogs, which ask about the one
+    /// block they are open on.
+    /// </summary>
+    public UnsettledBlock? UnsettledFor(Guid allocationId) =>
+        planner.UnconfirmedForBlock(allocationId) is { Count: > 0 } bookings
+            ? Split(allocationId, bookings)
+            : null;
+
+    /// <summary>
+    /// The same split, for a caller that already has the bookings in hand - the Time tab,
+    /// which reads every block's at once and must judge them all from the one snapshot.
+    /// </summary>
+    public UnsettledBlock Split(Guid allocationId, IReadOnlyList<UnconfirmedBooking> bookings)
+    {
+        var mine = new List<UnconfirmedBooking>(bookings.Count);
+        string? elsewhere = null;
+
+        // The same test the answers themselves are refused by, so what is offered and what is
+        // accepted cannot drift apart; only the wording differs, this one being what the
+        // address is rather than why it is a refusal.
+        foreach (var booking in bookings)
+        {
+            if (WrongConnection(booking.Entry) is null) mine.Add(booking);
+            else elsewhere ??= BookedAgainst(booking.Entry);
+        }
+
+        return new UnsettledBlock(allocationId, bookings, mine, elsewhere);
+    }
+
+    /// <summary>Where a set of hours says it was booked, however little it was stamped with.</summary>
+    public static string BookedAgainst(TimeEntry entry) =>
+        entry.Organization is { Length: > 0 } stamp ? stamp : entry.WorkItemUrl;
 
     /// <summary>
     /// Lets go of a block's unconfirmed bookings without asking Azure DevOps again: the user

@@ -444,12 +444,19 @@ public sealed partial class AzureDevOpsClient
             // What is held may have been read for an account this connection no longer uses.
             // Read again before a change of ours is put down to somebody else - that reading
             // is the one that leads to hours on the work item being discarded from here.
-            mine = await TryReadMyNamesAsync(refresh: true, ct);
+            //
+            // Asked of connectionData itself rather than through the names, because a read
+            // that failed comes back as no names at all - which is never a mismatch - and a
+            // 401 while a token renews would turn the one piece of evidence that says "not
+            // ours" into a claim on somebody else's hours. A reading that could not be had
+            // says nothing either way, so the mismatch already in hand stands.
+            var reread = await ReadConnectionAsync(refresh: true, ct);
 
-            if (Mismatched(revision, mine))
+            if (reread is null || Mismatched(revision, reread.Names))
                 return Undecided(plan, now,
                     $"revision {plan.Rev + 1} of #{plan.WorkItemId} made the change, but Azure DevOps says it was made by "
-                    + $"[{string.Join(", ", revision.Names)}] and this sign-in answers to [{string.Join(", ", mine)}]");
+                    + $"[{string.Join(", ", revision.Names)}] and this sign-in answers to "
+                    + $"[{string.Join(", ", reread?.Names ?? mine)}]");
         }
 
         return (Landing.Landed, now, null);

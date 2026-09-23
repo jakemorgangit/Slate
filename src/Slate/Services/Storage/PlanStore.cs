@@ -70,6 +70,31 @@ public sealed class PlanStore
         }
     }
 
+    /// <summary>
+    /// True for the whole session when the plan that was there could not be read - whether it
+    /// was put aside afterwards or left where it is.
+    ///
+    /// Saving again is fine once the old file is out of the way, but knowing what was
+    /// outstanding is not: the bookings and undos Azure DevOps never confirmed were in that
+    /// file and nowhere else, while the blocks themselves are adopted back from their Outlook
+    /// events with nothing on them to say hours may already have gone on. Recording against
+    /// one of those is how the same hours land on a work item twice, so time writes are
+    /// refused on this as well as on <see cref="CanSave"/>. The next start decides it again
+    /// from whatever plan is there then, so it is one session's refusal rather than a dead end.
+    ///
+    /// Reading it loads the plan if nothing has yet, for the same reason as the two above.
+    /// </summary>
+    public bool PlanWasUnreadable
+    {
+        get
+        {
+            _ = Cached;
+            return _planWasUnreadable;
+        }
+    }
+
+    private bool _planWasUnreadable;
+
     public List<Allocation> All => Cached.Allocations;
 
     public List<TimeEntry> TimeEntries => Cached.TimeEntries;
@@ -162,6 +187,7 @@ public sealed class PlanStore
             // There is a plan there; this copy simply could not get at it. Carrying on with an
             // empty one is fine - saving over the real one with it is not.
             _refuseToSave = true;
+            _planWasUnreadable = true;
             _loadProblem = $"Your plan could not be read ({ex.Message}). Nothing will be saved over it, and " +
                            "nothing you do now will be written down either - so recording time is refused for " +
                            "this session. Close Slate, make sure nothing else is holding the file, and start " +
@@ -192,16 +218,26 @@ public sealed class PlanStore
     /// and undos Azure DevOps never confirmed live in it too - the only record of which hours
     /// may already be on a work item. One bad value is no reason to lose all of that, and an
     /// empty plan saved on top is exactly how it would be lost.
+    ///
+    /// Putting it aside saves the file, not the session: what it knew is still out of reach,
+    /// and the blocks come back from their Outlook events reading as never recorded. So both
+    /// ways out of here set <see cref="PlanWasUnreadable"/>, and time writes are refused until
+    /// the file has been dealt with and Slate started again.
     /// </summary>
     private PlanFile Unreadable(string path, JsonException? ex)
     {
+        _planWasUnreadable = true;
+
         var moved = path + "." + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".unreadable";
 
         try
         {
             File.Move(path, moved, overwrite: true);
-            _loadProblem = "Your plan could not be read, so Slate has started a new one. The old file is kept " +
-                           $"as {Path.GetFileName(moved)} in the Slate data folder - nothing in it has been lost.";
+            _loadProblem = "Your plan could not be read, so Slate has started a new one. The old file is kept as " +
+                           $"{Path.GetFileName(moved)} in the Slate data folder, and with it the only record of " +
+                           "which bookings Azure DevOps never confirmed - so Slate cannot tell which hours are " +
+                           "already on a work item. Recording time is refused until that file has been sorted " +
+                           "out and Slate started again; check the work items before recording those blocks again.";
         }
         catch (Exception move) when (move is IOException or UnauthorizedAccessException)
         {

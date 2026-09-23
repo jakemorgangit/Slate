@@ -76,6 +76,16 @@
                                 {
                                     var disabled = !row.TracksTime || row.Status is RowStatus.Recorded or RowStatus.Unconfirmed
                                                    || _saving || _checking;
+
+                                    @* What the block is actually waiting on, so the row offers
+                                       the actions that would be allowed for it and no others.
+                                       Asked only of a row that is waiting: every other one has
+                                       nothing to split. Null means nothing is left on the block
+                                       - settled from elsewhere while this list sat here - and
+                                       Check is what tells the row so. *@
+                                    var pending = row.Status == RowStatus.Unconfirmed
+                                        ? State.UnsettledFor(row.AllocationId)
+                                        : null;
                                     <tr @key="row.AllocationId" class="@(row.Status is RowStatus.Failed or RowStatus.Unconfirmed ? "row-failed" : "")">
                                         <td>
                                             <input type="checkbox" checked="@row.Selected" disabled="@disabled"
@@ -119,13 +129,33 @@
                                                 case RowStatus.Unconfirmed:
                                                     @* Not ticked and not tickable: sending it again is how the same
                                                        hours would go on twice. Check looks without writing, and the
-                                                       two answers are the way out of one that never settles. *@
+                                                       two answers are the way out of one that never settles.
+
+                                                       Offered against the bookings this connection may act on, the
+                                                       way the Time tab does it: hours booked before an organization
+                                                       was switched cannot be checked or answered from here at all,
+                                                       and "same organization" is the only way forward for those. *@
                                                     <div style="color: var(--danger); font-size: 11.5px" title="@row.Error">May be booked</div>
+                                                    @if (pending is { Elsewhere: { } where })
+                                                    {
+                                                        <div class="muted" style="font-size: 11px">
+                                                            @(pending.AllElsewhere ? "Booked" : "Partly booked")
+                                                            against <span class="mono">@where</span>
+                                                        </div>
+                                                    }
                                                     <div class="row" style="gap: 4px; flex-wrap: wrap">
-                                                        <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
-                                                                @onclick="() => CheckAsync(row)">Check</button>
-                                                        @if (Plan.UnconfirmedForBlock(row.AllocationId) is { Count: > 0 } pending
-                                                             && pending.All(b => b.CanBeLetGo))
+                                                        @if (pending is null or { AllElsewhere: false })
+                                                        {
+                                                            <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
+                                                                    @onclick="() => CheckAsync(row)">Check</button>
+                                                        }
+                                                        @if (pending is { Elsewhere: not null })
+                                                        {
+                                                            <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                                                    title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps; the booking simply becomes one this connection can check and answer for."
+                                                                    @onclick="() => Adopt(row)">Same organization</button>
+                                                        }
+                                                        @if (pending is { CanBeLetGo: true })
                                                         {
                                                             <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
                                                                     title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
@@ -630,11 +660,17 @@
     /// <summary>
     /// Stops waiting on a row's booking that never went on, and offers the block again. Only
     /// the plan is touched - nothing is sent to Azure DevOps either way.
+    ///
+    /// Offered again only once nothing at all is left on the block. Letting go settles the
+    /// bookings this connection may answer for, and one made against another organization is
+    /// left standing - the write refuses the block while it is, so a row put back as ready
+    /// would be ticked, prefilled, and then refused the moment Record was pressed.
     /// </summary>
     private void LetGo(RowVm row)
     {
         if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
-        if (State.LetGoUnconfirmed(row.AllocationId)) ReopenForRecording(row);
+        if (State.LetGoUnconfirmed(row.AllocationId) && !Plan.HasUnconfirmed(row.AllocationId))
+            ReopenForRecording(row);
     }
 
     /// <summary>
@@ -642,15 +678,35 @@
     /// and the hours are on it. The other half of <see cref="LetGo"/>: without it, a booking
     /// that did land but can never be settled could only be let go, which would offer the
     /// block again with the hours already on the work item.
+    ///
+    /// Reads as recorded only once nothing is left on the block, for the mirror of the reason
+    /// above: a row that says Recorded stops offering the answers, and the booking still
+    /// waiting there would have nowhere left in this list to be settled from.
     /// </summary>
     private void FileIt(RowVm row)
     {
         if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
         if (!State.FileUnconfirmed(row.AllocationId)) return;
+        if (Plan.HasUnconfirmed(row.AllocationId)) return;
 
         row.Status = RowStatus.Recorded;
         row.Selected = false;
         row.Error = null;
+    }
+
+    /// <summary>
+    /// Takes a row's refused bookings as this organization's, when the user says they are.
+    /// The way out of the one refusal there is otherwise no way out of from this list: an
+    /// organization that was renamed or moved has no old address left to switch back to, so
+    /// without this the row's Check and both its answers stay out of reach for ever.
+    ///
+    /// Only re-stamps them, and only the ones actually refused. The row stays as it is -
+    /// nothing has been settled - and the actions that were hidden appear.
+    /// </summary>
+    private void Adopt(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+        State.AdoptOrganizationForBlock(row.AllocationId);
     }
 
     /// <summary>Puts a row back where an unbooked one starts: offered, ticked and editable.</summary>
