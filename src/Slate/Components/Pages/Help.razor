@@ -465,9 +465,10 @@
                         one that opens next time, but it is not a promise: if Windows will not let the files
                         move in that moment, or they were already moving when the sign-out arrived — Slate
                         answers Windows rather than hold it up, and leaves the work under way to finish as
-                        the app closes — the new version is left where Slate runs from, with the one you
-                        were on beside it as <code>.old</code> to rename back. <code>crash.log</code> says
-                        which. A copy built with <code>dotnet build</code> only ever offers the link.</dd>
+                        the app closes — the new version is left where Slate runs from, or, if Slate was
+                        ended between the two renames, nothing is there at all. The one you were on is
+                        beside it as <code>.old</code> to rename back either way. <code>crash.log</code>
+                        says which. A copy built with <code>dotnet build</code> only ever offers the link.</dd>
 
                     <dt>Something else</dt>
                     <dd>Anything unexpected is written to <code>crash.log</code> in the data folder below.</dd>

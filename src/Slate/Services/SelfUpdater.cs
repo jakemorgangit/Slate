@@ -19,9 +19,11 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
     /// back under its own name with the copy it was made from still beside it as .old, which
     /// the message tells the user to clear away by restarting. The reassuring "nothing was
     /// changed" a caller otherwise adds would flatly contradict any of the three.
-    /// SelfUpdater.NothingLeftBehind is where those three are defined, and what every throw it
-    /// builds takes this from; Swap's copy-back failure is in the third of them and, since it
-    /// words its own message rather than being built there, marks itself the same way by hand.
+    /// SelfUpdater.NothingLeftBehind is where those three are defined, and every throw built by
+    /// its Failed and Interrupted takes this from it. Two throws in Swap word their own messages
+    /// rather than being built there - the copy-back failure, and the opening step of the next
+    /// install in that session, which stops on the .old that failure left - and both are about
+    /// the third of the three, so each of them marks itself the same way by hand.
     /// </summary>
     public bool NothingChanged { get; init; } = true;
 }
@@ -251,7 +253,7 @@ public sealed class SelfUpdater
             //
             // The throw at the end of this block goes by the same answer, so it is built in
             // the same hold - by the time it is thrown the lock is long gone - and built by
-            // Failed, like every other throw that has to say what it left behind.
+            // Failed, like the other throws this class builds from a settled handover.
             Restored restored;
             SelfUpdateException? unexpected = null;
             lock (HandoverLock)
@@ -628,9 +630,15 @@ public sealed class SelfUpdater
             // that name. So the remedy is the one those failures already named - a restart,
             // which both frees the name and gets the file cleared away - and it is said here
             // too, because this is where the next attempt in the same session lands.
+            //
+            // Marked by hand, like the copy-back failure below that reports the same state:
+            // the file named here really is there and really does have to be cleared away, so
+            // the reassuring "nothing was changed" the caller would otherwise add would
+            // contradict the whole point of the message.
             throw new SelfUpdateException(
                 $"An earlier copy ({Path.GetFileName(old)}) is still in use, so there is nowhere to set this one " +
-                "aside. Restart Slate and try again.", ex);
+                "aside. Restart Slate and try again.", ex)
+            { NothingChanged = false };
         }
 
         _swapping = true;
@@ -969,10 +977,12 @@ public sealed class SelfUpdater
 
     /// <summary>
     /// The rename budget for a rollback Windows is waiting on: see RollBack. A cap rather than
-    /// a count, because both loops it is handed to - <see cref="Restore"/>'s and
-    /// <see cref="Retry"/>'s - stop on <see cref="_pressedToExit"/> as well, and that flag is
-    /// set before any caller asks for this budget, so each of them makes a single try and
-    /// leaves. The failure that really does need a second one - the new copy's image still
+    /// a count, because the loop it is handed to - <see cref="Restore"/>'s - stops on
+    /// <see cref="_pressedToExit"/> as well, and that flag is set before any caller asks for
+    /// this budget, so it makes a single try and leaves. It reaches <see cref="Retry"/>, which
+    /// stops on the same flag, only through the last-resort copy at the end of Restore - which
+    /// that flag skips outright - so Retry is handed it only in the case the next paragraph
+    /// describes. The failure that really does need a second try - the new copy's image still
     /// being let go of the instant after it was stopped - is covered a level up, where RollBack
     /// calls Restore again once that copy has actually gone.
     ///
@@ -1278,8 +1288,11 @@ public sealed class SelfUpdater
     /// update instead - that path puts the old version back exactly as a copy that closed does.
     /// Read the other way round, "cannot tell" would mean putting back a new copy that was
     /// starting perfectly well; letting the throw out would leave the wait through its finally,
-    /// which does roll back, and then reach the user as an install that changed nothing while
-    /// the new copy stands where Slate runs from. Only called under <see cref="HandoverLock"/>.
+    /// which does roll back, and so undo an update that may have been starting perfectly well
+    /// on nothing more than Windows declining to answer. What the user is told is right either
+    /// way - InstallAsync builds it from what was actually left at the path - so this is about
+    /// not undoing a healthy start rather than about the wording. Only called under
+    /// <see cref="HandoverLock"/>.
     /// </summary>
     private static int? ExitCodeIfGone(Process process, string version, ref bool asking)
     {
@@ -1455,10 +1468,10 @@ public sealed class SelfUpdater
     /// writing there.
     ///
     /// Waited out in short slices rather than in one call, so that a sign-out arriving in the
-    /// middle of a rollback that had the long wait is not sat out to the end. Every other wait
-    /// in a rollback reads <see cref="_pressedToExit"/> as it goes; this one is handed its
-    /// budget before it starts, and the ten seconds of it are ten seconds of
-    /// <see cref="HandoverLock"/> held against the window's thread, which is what puts Slate on
+    /// middle of a rollback that had the long wait is not sat out to the end. Like every other
+    /// wait in a rollback, it reads <see cref="_pressedToExit"/> as it goes; it used to be
+    /// handed its budget before it started, and the ten seconds of that would be ten seconds of
+    /// <see cref="HandoverLock"/> held against the window's thread, which is what put Slate on
     /// Windows' "these apps are stopping you" screen.
     /// </summary>
     private static void WaitForNewCopyToGo(Process? child, string version, int milliseconds)
@@ -1573,10 +1586,10 @@ public sealed class SelfUpdater
     /// back under its own name, and no .old left beside it. A rollback that could only get it
     /// back by copying leaves one, says so, and tells the user to restart before updating again
     /// - which the reassurance would flatly contradict, exactly as it would for a new version
-    /// left standing. Swap's own copy-back failure says the same thing and marks itself the
-    /// same way; the two states are the same state, so they read the same. Only called under
-    /// <see cref="HandoverLock"/>, like <see cref="Describe"/>, which asks the same question of
-    /// the same file.
+    /// left standing. Swap's own copy-back failure, and the opening step the next install then
+    /// stops at, say the same thing and mark themselves the same way by hand; it is all the one
+    /// state, so they read the same. Only called under <see cref="HandoverLock"/>, like
+    /// <see cref="Describe"/>, which asks the same question of the same file.
     /// </summary>
     private static bool NothingLeftBehind(Handover handover) =>
         handover.Restored == Restored.OldVersion && !File.Exists(handover.Old);
