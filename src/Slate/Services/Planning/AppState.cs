@@ -1753,6 +1753,14 @@ public sealed class AppState(
             Changed?.Invoke();
             return TimeWriteOutcome.Unconfirmed;
         }
+        catch (BlockUnsettledException ex)
+        {
+            // Nothing was sent, and nothing should be until the earlier booking is settled -
+            // so this is not a failure to try again.
+            toasts.Error("Could not record that time", ex.Message);
+            Changed?.Invoke();
+            return TimeWriteOutcome.Unconfirmed;
+        }
         catch (Exception ex)
         {
             toasts.Error("Could not record that time", ex.Message);
@@ -1796,6 +1804,13 @@ public sealed class AppState(
             Changed?.Invoke();
             return (TimeWriteOutcome.Unconfirmed, ex.Message);
         }
+        catch (BlockUnsettledException ex)
+        {
+            // The row is left the way a row whose own booking went unconfirmed is left -
+            // unticked, with a check offered - because that is exactly what it is now.
+            Changed?.Invoke();
+            return (TimeWriteOutcome.Unconfirmed, ex.Message);
+        }
         catch (Exception ex)
         {
             return (TimeWriteOutcome.Failed, ex.Message);
@@ -1816,6 +1831,16 @@ public sealed class AppState(
 
     private const string BlockBusy =
         "This block is already being recorded. Wait for that to finish, then check what it booked before recording any more.";
+
+    private const string BlockUnsettled =
+        "A booking from this block was never confirmed and may already be on the work item. Check it before recording any more against this block.";
+
+    /// <summary>
+    /// A time write refused here, before anything went to Azure DevOps, because the block
+    /// already has a booking nothing has settled. Its own kind, so every caller can tell it
+    /// apart from a failure and offer the check rather than a one-click retry.
+    /// </summary>
+    private sealed class BlockUnsettledException() : Exception(BlockUnsettled);
 
     /// <summary>
     /// Counts a time write in and claims its block, or says why it cannot go ahead. Every
@@ -1855,6 +1880,13 @@ public sealed class AppState(
     private async Task<TimeRecordResult> WriteTimeAsync(
         Allocation allocation, double hours, bool reduceRemaining, string note)
     {
+        // A booking from this block that nothing has settled may be on the work item already,
+        // so more hours on top of it are exactly how the same time goes on twice. Refused here
+        // rather than in each dialog, so no caller can get past it - a list built before the
+        // booking existed, a form that was already open, a retry beside a failed row. Settling
+        // it, by a check or by hand, is the way out.
+        if (planner.HasUnconfirmed(allocation.Id)) throw new BlockUnsettledException();
+
         var pending = new UnconfirmedBooking
         {
             Entry = planner.BuildTimeEntry(allocation, hours, reduceRemaining, comment: note),
@@ -2042,6 +2074,59 @@ public sealed class AppState(
                 "Azure DevOps either way.");
 
             Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            ReleaseBlock(allocationId);
+        }
+    }
+
+    /// <summary>
+    /// The other half of <see cref="LetGoUnconfirmed"/>: the user has looked at the work item
+    /// and the hours are on it, so the booking is filed as the entry it would have made.
+    ///
+    /// Without this, a booking Azure DevOps can never settle could only be let go - which
+    /// leaves the block offering the same hours again, with them already on the work item.
+    /// Nothing is written to Azure DevOps; this only writes down what is already there.
+    /// </summary>
+    public bool FileUnconfirmed(Guid allocationId)
+    {
+        if (TryClaimBlock(allocationId) is { } refused)
+        {
+            toasts.Error("Could not record that booking", refused);
+            return false;
+        }
+
+        try
+        {
+            var bookings = planner.UnconfirmedForBlock(allocationId);
+            if (bookings.Count == 0) return false;
+
+            // Same gate as letting one go: while a send could still be arriving, a check can
+            // still settle it for certain, and that is better than anybody's reading of the
+            // work item at this moment.
+            if (bookings.Any(b => !b.CanBeLetGo))
+            {
+                toasts.Error("Too soon to settle that booking by hand",
+                    "It was sent only moments ago and could still be arriving. Give it five minutes and check " +
+                    "again - Azure DevOps may yet answer for it.");
+                return false;
+            }
+
+            var workItemId = bookings[0].Entry.WorkItemId;
+            var minutes = 0;
+            foreach (var booking in bookings)
+                if (planner.SettleUnconfirmed(booking, landed: true)) minutes += booking.Entry.Minutes;
+
+            if (minutes == 0) return false;
+
+            toasts.Success($"{Ui.Hours(minutes)} on #{workItemId} recorded here",
+                "Taken as booked because you said the work item has it. Nothing was written to Azure DevOps; " +
+                "undo the entry from the time view if it turns out it does not.");
+
+            Changed?.Invoke();
+            _ = RefreshWorkItemAsync(workItemId);
             return true;
         }
         finally

@@ -50,13 +50,16 @@
                                content: an unconstrained title or a wide status message would
                                otherwise be free to push the table - and this modal - wider
                                than the dialog is meant to be. *@
+                            @* The status column is wide enough for a row that needs an answer to
+                               put its check and its two answers on one line, rather than a tower
+                               of buttons that trebles the height of that row. *@
                             <colgroup>
                                 <col style="width: 30px" />
                                 <col />
                                 <col style="width: 110px" />
                                 <col style="width: 76px" />
                                 <col style="width: 92px" />
-                                <col style="width: 120px" />
+                                <col style="width: 232px" />
                             </colgroup>
                             <thead>
                                 <tr>
@@ -115,18 +118,23 @@
                                                     break;
                                                 case RowStatus.Unconfirmed:
                                                     @* Not ticked and not tickable: sending it again is how the same
-                                                       hours would go on twice. Check looks without writing, and
-                                                       "Never went on" is the way out of one that never settles. *@
+                                                       hours would go on twice. Check looks without writing, and the
+                                                       two answers are the way out of one that never settles. *@
                                                     <div style="color: var(--danger); font-size: 11.5px" title="@row.Error">May be booked</div>
-                                                    <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
-                                                            @onclick="() => CheckAsync(row)">Check</button>
-                                                    @if (Plan.UnconfirmedForBlock(row.AllocationId) is { Count: > 0 } pending
-                                                         && pending.All(b => b.CanBeLetGo))
-                                                    {
-                                                        <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
-                                                                title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting, and the block can be recorded again."
-                                                                @onclick="() => LetGo(row)">Never went on</button>
-                                                    }
+                                                    <div class="row" style="gap: 4px; flex-wrap: wrap">
+                                                        <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
+                                                                @onclick="() => CheckAsync(row)">Check</button>
+                                                        @if (Plan.UnconfirmedForBlock(row.AllocationId) is { Count: > 0 } pending
+                                                             && pending.All(b => b.CanBeLetGo))
+                                                        {
+                                                            <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                                                    title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
+                                                                    @onclick="() => FileIt(row)">On it</button>
+                                                            <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                                                    title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting, and the block can be recorded again."
+                                                                    @onclick="() => LetGo(row)">Never went on</button>
+                                                        }
+                                                    </div>
                                                     break;
                                                 default:
                                                     @if (!row.TracksTime)
@@ -203,8 +211,10 @@
         public required int RecordedMinutes { get; init; }
 
         /// <summary>What this machine had booked on the block when the row was built - what
-        /// <see cref="Hours"/> was worked out from, and so what a save checks is still true.</summary>
-        public required int RecordedHereMinutes { get; init; }
+        /// <see cref="Hours"/> was worked out from, and so what a save checks is still true.
+        /// Settable so that time undone from the block while the list is open can bring it
+        /// down: the check is for hours booked on top of these, not for hours taken off.</summary>
+        public required int RecordedHereMinutes { get; set; }
 
         /// <summary>Settable because a row built before the work item list had loaded cannot
         /// know yet, and is opened up once the list says the item does take time.</summary>
@@ -277,6 +287,7 @@
         if (_openedFor == day)
         {
             EnableRowsThatNowTrackTime();
+            FollowTimeUndoneElsewhere();
             return;
         }
 
@@ -285,6 +296,18 @@
         _reduceRemaining = Settings.Current.Planning.ReduceRemainingOnRecord;
         _note = "";
         _notePosted.Clear();
+    }
+
+    /// <summary>
+    /// Keeps a row's mark in step with time undone from its block while the list is open -
+    /// from the calendar or the time view, neither of which this list hears about otherwise.
+    /// A save refuses a row whose block has gained time since it was built; hours taken off it
+    /// are not that, and without this the row would be refused for the wrong reason.
+    /// </summary>
+    private void FollowTimeUndoneElsewhere()
+    {
+        foreach (var row in _rows)
+            row.RecordedHereMinutes = Math.Min(row.RecordedHereMinutes, Plan.RecordedMinutesForBlock(row.AllocationId));
     }
 
     /// <summary>
@@ -421,15 +444,32 @@
                     continue;
                 }
 
+                // A booking from this block that nothing has settled may be on the work item
+                // already - made by "Record time…" while this list sat here, or by an earlier
+                // pass whose row read as a plain failure because the claim was lost. Sending
+                // it is what would book the hours twice, so the row becomes the one thing it
+                // now is: a block waiting on an answer. (AppState refuses the write as well;
+                // this is what makes the row say so rather than read as a failure to retry.)
+                if (Plan.HasUnconfirmed(row.AllocationId))
+                {
+                    row.Status = RowStatus.Unconfirmed;
+                    row.Selected = false;
+                    row.Error = UnconfirmedBefore;
+                    unsureCount++;
+                    StateHasChanged();
+                    continue;
+                }
+
                 // The hours were worked out from what was booked on the block when the list
                 // was built. Anything booked on it since - "Record time…" used while this run
                 // carried on behind a closed dialog, say - means they are no longer what is
-                // left, so the row is refused rather than booked on top of it.
-                if (Plan.RecordedMinutesForBlock(row.AllocationId) != row.RecordedHereMinutes)
+                // left, so the row is refused rather than booked on top of it. Hours undone
+                // from it are not that: the row's mark follows those down instead.
+                if (Plan.RecordedMinutesForBlock(row.AllocationId) > row.RecordedHereMinutes)
                 {
                     row.Status = RowStatus.Failed;
                     row.Selected = false;
-                    row.Error = "Time was recorded on this block after this list was opened. Close and reopen to see what is left.";
+                    row.Error = "More time was recorded on this block after this list was opened. Close and reopen to see what is left.";
                     failCount++;
                     StateHasChanged();
                     continue;
@@ -595,6 +635,22 @@
     {
         if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
         if (State.LetGoUnconfirmed(row.AllocationId)) ReopenForRecording(row);
+    }
+
+    /// <summary>
+    /// Files a row's booking as recorded because the user has the work item in front of them
+    /// and the hours are on it. The other half of <see cref="LetGo"/>: without it, a booking
+    /// that did land but can never be settled could only be let go, which would offer the
+    /// block again with the hours already on the work item.
+    /// </summary>
+    private void FileIt(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+        if (!State.FileUnconfirmed(row.AllocationId)) return;
+
+        row.Status = RowStatus.Recorded;
+        row.Selected = false;
+        row.Error = null;
     }
 
     /// <summary>Puts a row back where an unbooked one starts: offered, ticked and editable.</summary>

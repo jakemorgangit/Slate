@@ -140,7 +140,8 @@ public sealed record TimeWritePlan(
     double RemainingBefore,
     double RemainingAfter,
     bool SetsRemaining,
-    DateTimeOffset SentAt)
+    DateTimeOffset SentAt,
+    DateTimeOffset FirstSentAt = default)
 {
     /// <summary>
     /// How long a change that has not shown up on the work item is still given to arrive
@@ -157,10 +158,18 @@ public sealed record TimeWritePlan(
 
     /// <summary>
     /// True while a send of this could still be on its way, so nothing may decide on its
-    /// behalf that it never went on.
+    /// behalf that it never went on. Counted from the last send: a later one extends the wait.
     /// </summary>
     [JsonIgnore]
     public bool CouldStillLand => DateTimeOffset.Now - SentAt < LandingWindow;
+
+    /// <summary>
+    /// The earliest moment a revision could be this change. Nothing made before the first send
+    /// can be it, whatever it moved - the same hours booked from another machine, most likely.
+    /// Falls back to the last send for plans written before this was kept.
+    /// </summary>
+    [JsonIgnore]
+    public DateTimeOffset SendWindowStart => FirstSentAt == default ? SentAt : FirstSentAt;
 }
 
 /// <summary>

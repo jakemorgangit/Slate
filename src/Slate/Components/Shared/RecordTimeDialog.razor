@@ -28,14 +28,14 @@
 
             <div class="modal-body">
                 @* A booking from this block that Azure DevOps never confirmed. It may already be
-                   on the work item, so it is said first - and while it is this opening's own
-                   save, Record stays off rather than sending the same hours again. *@
+                   on the work item, so Record stays off until it is settled - pressing it again
+                   is exactly how the same hours would go on twice. *@
                 @if (Plan.UnconfirmedForBlock(allocation.Id) is { Count: > 0 } unconfirmed)
                 {
                     <div class="banner error">
                         <span>!</span>
                         <div class="grow">
-                            @if (Blocked)
+                            @if (_unconfirmed)
                             {
                                 <div>Azure DevOps did not confirm this booking, and a look at the work item
                                     afterwards could not settle whether it went on.</div>
@@ -45,7 +45,8 @@
                                 <div><strong>@Ui.Duration(unconfirmed.Sum(b => b.Entry.Minutes))</strong> booked from
                                     this block @Ui.Ago(unconfirmed[^1].Entry.RecordedAt) was never confirmed by Azure DevOps.</div>
                             }
-                            <div>It may already be on #@allocation.WorkItemId - check before recording again.</div>
+                            <div>It may already be on #@allocation.WorkItemId, so nothing more can be recorded
+                                from this block until that is settled.</div>
                             <div class="row" style="margin-top: 8px; gap: 6px">
                                 <button class="btn btn-sm" disabled="@(_saving || _checking)" @onclick="CheckAsync">
                                     @if (_checking)
@@ -63,11 +64,16 @@
                                     <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
                                             @onclick="() => SystemShell.OpenUrl(url)">Open #@allocation.WorkItemId ↗</button>
                                 }
-                                @* The way out of a booking Azure DevOps will never settle - offered only
-                                   once no send of it could still be arriving, so saying it never went on
-                                   cannot be overtaken by it landing a moment later. *@
+                                @* The way out of a booking Azure DevOps will never settle, in both
+                                   directions: whichever way the work item reads, the user can say so
+                                   and Slate writes it down. Offered only once no send of it could
+                                   still be arriving, so an answer cannot be overtaken by the change
+                                   landing a moment later. *@
                                 @if (unconfirmed.All(b => b.CanBeLetGo))
                                 {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                            title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
+                                            @onclick="FileIt">It did go on</button>
                                     <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
                                             title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting, and the block can be recorded again."
                                             @onclick="LetGo">Never went on</button>
@@ -230,11 +236,14 @@
     private bool _unconfirmed;
 
     /// <summary>
-    /// Record stays off while this opening's own booking is unconfirmed: pressing it again
-    /// is exactly how the same hours would go on twice. Once settled, or on a later opening
-    /// - where getting here again was a deliberate choice - the banner warns instead.
+    /// Record stays off while the block has a booking nothing has settled, whichever opening
+    /// or dialog made it: pressing it is exactly how the same hours would go on twice, and the
+    /// hours come prefilled, so it is one click away. A later opening is no safer than the one
+    /// the booking came from - the work item has not changed in between - so it is the block's
+    /// state that decides, not this opening's. <see cref="_unconfirmed"/> only chooses which
+    /// way the banner is worded. Settling it, by a check or by hand, is the way out.
     /// </summary>
-    private bool Blocked => _unconfirmed && _openedFor is { } a && Plan.HasUnconfirmed(a.Id);
+    private bool Blocked => Shown is { } a && Plan.HasUnconfirmed(a.Id);
 
     /// <summary>
     /// The block on screen: the one asked for, except while a save or a check for another
@@ -316,7 +325,14 @@
             return;
         }
 
-        if (_openedFor?.Id == allocation.Id) return;
+        if (_openedFor?.Id == allocation.Id)
+        {
+            // Time undone from this block while the form sits open leaves less on it than the
+            // form was seeded against. The save guards against hours booked on top of what was
+            // there, not against hours taken off it, so the mark comes down with them.
+            _recordedAtOpen = Math.Min(_recordedAtOpen, Plan.RecordedMinutesForBlock(allocation.Id));
+            return;
+        }
 
         _openedFor = allocation;
         _hours = Math.Max(0.25, BlockHours);
@@ -368,11 +384,13 @@
 
         // The hours were chosen against what was booked on the block when this opened.
         // Anything booked on it since - by a Record day pass carrying on behind a closed
-        // dialog, say - means they may be for time that is already on the work item.
-        if (Plan.RecordedMinutesForBlock(allocation.Id) != _recordedAtOpen)
+        // dialog, say - means they may be for time that is already on the work item. Only
+        // more, though: an entry undone meanwhile takes nothing away from these hours, and
+        // refusing over that would be a dead end until the dialog was opened again.
+        if (Plan.RecordedMinutesForBlock(allocation.Id) > _recordedAtOpen)
         {
             Toasts.Error("Could not record that time",
-                "Time was recorded on this block while this was open. Close it and open it again to see what is there now.");
+                "More time was recorded on this block while this was open. Close it and open it again to see what is there now.");
             return;
         }
 
@@ -460,5 +478,20 @@
     {
         if (_saving || _checking || Shown is not { } allocation) return;
         if (State.LetGoUnconfirmed(allocation.Id)) _unconfirmed = false;
+    }
+
+    /// <summary>
+    /// Files a booking the user has confirmed by eye. That is this opening over, the same way
+    /// a check that found the hours is: they are on the work item and recorded here now, and
+    /// the form still offers the block's full hours, which is one press from booking them
+    /// again.
+    /// </summary>
+    private void FileIt()
+    {
+        if (_saving || _checking || Shown is not { } allocation) return;
+        if (!State.FileUnconfirmed(allocation.Id)) return;
+
+        _openedFor = null;
+        if (State.RecordingFor?.Id == allocation.Id) State.CancelRecordTime();
     }
 }

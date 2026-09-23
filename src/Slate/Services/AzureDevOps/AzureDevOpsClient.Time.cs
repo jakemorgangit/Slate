@@ -32,6 +32,13 @@ public sealed partial class AzureDevOpsClient
     private static readonly TimeSpan RereadPause = TimeSpan.FromSeconds(2);
 
     /// <summary>
+    /// How far apart this machine's clock and the service's may be before a revision's time is
+    /// worth doubting. Generous on purpose: the times are only ever used to rule a revision
+    /// out, and ruling out one of our own is what would book the hours twice.
+    /// </summary>
+    private static readonly TimeSpan ClockSkew = TimeSpan.FromMinutes(10);
+
+    /// <summary>
     /// One time change per work item at a time from this copy. Two pinned to the same
     /// revision would otherwise race, and the loser's look at the work item would find the
     /// winner's change - same size, same person - and take it for its own.
@@ -145,7 +152,13 @@ public sealed partial class AzureDevOpsClient
                     return new TimeRecordResult(now.Completed, now.Remaining);
             }
 
-            pinned = pinned with { SentAt = DateTimeOffset.Now };
+            var sentAt = DateTimeOffset.Now;
+            pinned = pinned with
+            {
+                SentAt = sentAt,
+                FirstSentAt = pinned.FirstSentAt == default ? sentAt : pinned.FirstSentAt,
+            };
+
             AzureDevOpsException? refused = null;
 
             // Written down before it can possibly land, never after: a copy that goes away
@@ -172,10 +185,11 @@ public sealed partial class AzureDevOpsClient
                 lastFailure = ex;
             }
             catch (Exception ex) when (ex is not OperationCanceledException
-                                       && (outstanding || ex is AzureDevOpsException { Status: HttpStatusCode.BadRequest }))
+                                       && (outstanding || IsWorthSettling(ex)))
             {
                 // Turned away outright. Still looked into: an earlier send may be unaccounted
-                // for, and a failed revision test can come back as a plain bad request.
+                // for, a failed revision test can come back as a plain bad request, and even a
+                // refusal is worth putting to the work item before it is reported.
                 lastFailure = refused = ex as AzureDevOpsException ?? new AzureDevOpsException(ex.Message, ex);
             }
 
@@ -187,6 +201,13 @@ public sealed partial class AzureDevOpsClient
                 case Landing.Landed:
                     return ResultFrom(pinned, now);
 
+                // Nothing of this is on its way, so nothing of it can go on the work item any
+                // more - however little of the item could be read. An ordinary failure, which
+                // is safe to try again, rather than hours that may already be booked.
+                case Landing.Unknown when !outstanding:
+                case Landing.NotYet when !outstanding && refused is not null:
+                    throw refused ?? lastFailure!;
+
                 case Landing.Unknown:
                     throw Unconfirmed(pinned, lastFailure, why);
 
@@ -196,10 +217,6 @@ public sealed partial class AzureDevOpsClient
                     pinned = null;
                     outstanding = false;
                     break;
-
-                case Landing.NotYet when !outstanding && refused is not null:
-                    // Nothing of it went on and nothing is on its way: a plain refusal.
-                    throw refused;
 
                 case Landing.NotYet when !outstanding:
                     pinned = null;
@@ -269,10 +286,25 @@ public sealed partial class AzureDevOpsClient
                 $"#{plan.WorkItemId} is at revision {now.Rev}, behind the {plan.Rev} this was pinned to");
 
         // Pinned to plan.Rev, so the next revision is the only one this change can have made.
-        if (await ReadRevisionAsync(plan.WorkItemId, plan.Rev + 1, ct) is not { } revision)
+        var (revision, read) = await ReadRevisionAsync(plan.WorkItemId, plan.Rev + 1, ct);
+
+        // The history was read through where this change would be and it is not there. It had
+        // its one chance at that revision, so it never went on and never will.
+        if (read == RevisionRead.Absent) return (Landing.Lost, now, null);
+
+        if (revision is null)
             return Undecided(plan, now, $"revision {plan.Rev + 1} of #{plan.WorkItemId} could not be read");
 
         if (!revision.Made(plan)) return (Landing.Lost, now, null);
+
+        // The right change at the right revision - but a revision made before this change was
+        // first sent cannot be it. The same hours booked from a second machine look exactly
+        // like this one, and claiming those as ours would quietly lose a booking that is still
+        // owed. Not claimed and not ruled out: only the work item itself can say.
+        if (revision.RevisedDate is { } when && when < plan.SendWindowStart - ClockSkew)
+            return Undecided(plan, now,
+                $"revision {plan.Rev + 1} of #{plan.WorkItemId} made the change, but Azure DevOps dates it "
+                + $"{when:u}, before this was first sent at {plan.SendWindowStart:u}");
 
         // The right change at the right revision. Someone else making exactly this change as
         // the very next edit is far-fetched, but when the service names who made it and that
@@ -327,7 +359,7 @@ public sealed partial class AzureDevOpsClient
     private sealed record RevisionChange(
         double? CompletedOld, double? CompletedNew, bool CompletedChanged,
         double? RemainingOld, double? RemainingNew, bool RemainingChanged,
-        HashSet<string> Names)
+        HashSet<string> Names, DateTimeOffset? RevisedDate)
     {
         /// <summary>
         /// True when this revision moved the field the change moves, from exactly where the
@@ -354,11 +386,29 @@ public sealed partial class AzureDevOpsClient
         private static bool Same(double a, double b) => Math.Abs(a - b) < 0.001;
     }
 
+    /// <summary>How a look through a work item's history for one revision turned out.</summary>
+    private enum RevisionRead
+    {
+        /// <summary>Read, and there it is.</summary>
+        Found,
+
+        /// <summary>Read past where it would be: the history does not have it.</summary>
+        Absent,
+
+        /// <summary>Could not be read, or does not reach far enough to say either way.</summary>
+        Unreadable,
+    }
+
     /// <summary>
     /// One revision's changes, from the work item's updates - the only place that says what a
-    /// single revision changed and who made it. Null when it cannot be read or is not there.
+    /// single revision changed, who made it and when.
+    ///
+    /// Absent and unreadable are kept apart on purpose: only a history that was actually read
+    /// through can rule a change out, and treating a failed read as "not there" is what would
+    /// send the same hours a second time.
     /// </summary>
-    private async Task<RevisionChange?> ReadRevisionAsync(int id, int rev, CancellationToken ct)
+    private async Task<(RevisionChange? Change, RevisionRead Read)> ReadRevisionAsync(
+        int id, int rev, CancellationToken ct)
     {
         const int page = 200;
 
@@ -379,19 +429,24 @@ public sealed partial class AzureDevOpsClient
                         ? r.GetInt32()
                         : 0;
 
-                    if (updateRev == rev) return ReadRevisionChange(update);
-                    if (updateRev > rev) return null;
+                    if (updateRev == rev) return (ReadRevisionChange(update), RevisionRead.Found);
+
+                    // Past where it would be, so the history has been read through and it is
+                    // not in it.
+                    if (updateRev > rev) return (null, RevisionRead.Absent);
                 }
 
-                if (updates.Count < page) return null;
+                // The history stops short of a revision the work item is already past, so it
+                // has not caught up yet and its silence says nothing.
+                if (updates.Count < page) return (null, RevisionRead.Unreadable);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Unreadable is as good as absent here: either way it cannot be told.
+            // Unreadable, which is not the same as absent.
         }
 
-        return null;
+        return (null, RevisionRead.Unreadable);
     }
 
     private static RevisionChange ReadRevisionChange(JsonElement update)
@@ -414,11 +469,28 @@ public sealed partial class AzureDevOpsClient
         if (update.TryGetProperty("revisedBy", out var who))
             AddNames(by, who, "id", "uniqueName", "descriptor", "subjectDescriptor");
 
+        // The revision's own date, or the one the item's Changed Date moved to on the same
+        // save, which some process templates are the only ones to set.
+        var when = Moment(update, "revisedDate")
+                   ?? (fields.ValueKind == JsonValueKind.Object
+                       && fields.TryGetProperty("System.ChangedDate", out var changed)
+                       ? Moment(changed, "newValue")
+                       : null);
+
         return new RevisionChange(
             completed.Old, completed.New, completed.Changed,
             remaining.Old, remaining.New, remaining.Changed,
-            by);
+            by, when);
     }
+
+    /// <summary>A moment, whether it came as a string or was left out altogether.</summary>
+    private static DateTimeOffset? Moment(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object
+        && element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+        && DateTimeOffset.TryParse(value.GetString(), CultureInfo.InvariantCulture,
+            DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var parsed)
+            ? parsed
+            : null;
 
     private static HashSet<string> NewNameSet() => new(StringComparer.OrdinalIgnoreCase);
 
@@ -560,6 +632,17 @@ public sealed partial class AzureDevOpsClient
 
     private static TimeRecordResult ResultFrom(TimeWritePlan plan, TimeFields now) =>
         new(now.Completed, now.Remaining, plan.AppliedCompleted, plan.AppliedRemaining, plan);
+
+    /// <summary>
+    /// Refusals that are still worth putting to the work item before they are reported. A
+    /// failed revision test can come back as a plain bad request. "Service unavailable" is the
+    /// front door turning a request away rather than the service acting on it, so nothing
+    /// should have happened - but the one read is cheap, and it is the difference between
+    /// reporting a failure the work item agrees with and one it does not.
+    /// </summary>
+    private static bool IsWorthSettling(Exception ex) =>
+        ex is AzureDevOpsException
+        { Status: HttpStatusCode.BadRequest or HttpStatusCode.ServiceUnavailable };
 
     /// <summary>
     /// The revision test failing: the item was changed after it was read. Which status that

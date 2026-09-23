@@ -192,21 +192,32 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         HttpStatusCode.BadGateway, HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout,
     ];
 
+    /// <summary>
+    /// Statuses that leave a write in doubt: the service failed while handling the request, or
+    /// a gateway gave up while it carried on, so it may yet be carried out.
+    ///
+    /// "Service unavailable" is not one of them, and neither is throttling: those are the front
+    /// door turning the request away before it reaches anything that could act on it. Counting
+    /// them as doubtful would turn an ordinary outage - where every call fails and nothing at
+    /// all happens - into hours that may already be booked and a block nobody can record until
+    /// the work item can be read again.
+    /// </summary>
+    private static bool LeavesWritesInDoubt(HttpStatusCode status) =>
+        status is HttpStatusCode.RequestTimeout
+        || ((int)status >= 500 && status != HttpStatusCode.ServiceUnavailable);
+
     private static async Task<JsonDocument> ReadAsync(HttpResponseMessage response, CancellationToken ct)
     {
         using (response)
         {
             var payload = await response.Content.ReadAsStringAsync(ct);
 
-            // A server error can come from a gateway that gave up while the service carried
-            // on, or from the service failing after the change was already saved. Throttling
-            // and outright refusals are answered before anything is done.
             if (!response.IsSuccessStatusCode)
                 throw new AzureDevOpsException(DescribeFailure(response, payload))
                 {
                     Status = response.StatusCode,
                     IsTransient = BusyStatuses.Contains(response.StatusCode),
-                    Unanswered = (int)response.StatusCode >= 500 || response.StatusCode == HttpStatusCode.RequestTimeout,
+                    Unanswered = LeavesWritesInDoubt(response.StatusCode),
                     ErrorKey = ReadErrorKey(payload),
                 };
 
