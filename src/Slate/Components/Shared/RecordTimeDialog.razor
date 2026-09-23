@@ -54,8 +54,8 @@
                             {
                                 <div>
                                     @(unconfirmed.AllElsewhere ? "It was booked" : "Part of it was booked")
-                                    against <span class="mono">@where</span>, which Slate is not connected to
-                                    now, so nothing here can settle @(unconfirmed.AllElsewhere ? "it" : "that part").
+                                    against <span class="mono">@where</span>, @unconfirmed.ElsewhereWhy, so nothing
+                                    here can settle @(unconfirmed.AllElsewhere ? "it" : "that part").
                                 </div>
                             }
                             <div>It may already be on #@allocation.WorkItemId, so nothing more can be recorded
@@ -80,8 +80,8 @@
                                     <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
                                             @onclick="() => SystemShell.OpenUrl(url)">Open #@allocation.WorkItemId ↗</button>
                                 }
-                                @* The one way out of a booking made against an address this
-                                   connection is not at: it cannot be checked or answered for
+                                @* The one way out of a booking made against an organization this
+                                   connection is not on: it cannot be checked or answered for
                                    here, and a renamed or moved organization has no old address
                                    to switch back to. Only re-stamps the ones that are refused. *@
                                 @if (unconfirmed.Elsewhere is not null)

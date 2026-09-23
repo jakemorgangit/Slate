@@ -191,6 +191,19 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         copy.SyncedFingerprint = null;
         copy.LastError = null;
 
+        // The copy has no event, so nothing that describes one can be true of it. The first
+        // says the event this block had was deleted in Outlook, and a block's state is read
+        // from it before the event id is looked at at all: left on, the copy is born Missing,
+        // so every send skips it, nothing ever clears it - reconciling only judges blocks that
+        // have an event id - and the inspector offers to send again an event that never was.
+        // The second says the full title and notes are on the event and this shortened copy
+        // must never be written over them; there is no other side to protect here, and the
+        // event body is built without a subject or a body while it is set, on the create as
+        // much as on every update, so the copy would go onto the calendar blank. Every block
+        // adopted from a marker-only event carries that one, which makes it ordinary.
+        copy.MissingInOutlook = false;
+        copy.TextIsPartial = false;
+
         // Nothing has ever been booked from a block that did not exist a moment ago. These say
         // the opposite - hours already recorded against this block somewhere else - and nothing
         // refreshes them for the copy: its own event goes out with a recorded total of zero,

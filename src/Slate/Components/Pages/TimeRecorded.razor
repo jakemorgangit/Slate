@@ -84,8 +84,8 @@
                             {
                                 <div>
                                     @(block.AllElsewhere ? "It was booked" : "Part of it was booked")
-                                    against <span class="mono">@where</span>, which Slate is not
-                                    connected to now, so nothing here can settle
+                                    against <span class="mono">@where</span>, @block.ElsewhereWhy,
+                                    so nothing here can settle
                                     @(block.AllElsewhere ? "it" : "that part").
                                 </div>
                             }
@@ -172,8 +172,8 @@
                             @if (!entry.BelongsTo(_organization))
                             {
                                 <div>
-                                    It was booked against <span class="mono">@AppState.BookedAgainst(entry)</span>, which Slate is
-                                    not connected to now, so nothing here can settle it.
+                                    It was booked against <span class="mono">@AppState.BookedAgainst(entry)</span>,
+                                    @AppState.WhyNotOurs(entry, _organization), so nothing here can settle it.
                                 </div>
                             }
                             <div class="row" style="margin-top: 8px; gap: 6px">
@@ -308,7 +308,7 @@
                             // are: it is the test the write paths themselves refuse by.
                             var elsewhere = !entry.BelongsTo(_organization);
                             var undoTitle = elsewhere
-                                ? $"Booked against {AppState.BookedAgainst(entry)}, which Slate is not connected to now, so Undo would change a different work item. Say it is the same organization first."
+                                ? $"Booked against {AppState.BookedAgainst(entry)}, {AppState.WhyNotOurs(entry, _organization)}, so Undo would change a different work item. Say it is the same organization first."
                                 : "Take this time back off the work item";
                             <div class="ghost-entry" @key="entry.Id" style="--wi-color: @Ui.ColorFor(entry.WorkItemType)">
                                 <div class="ghost-time">
@@ -352,8 +352,8 @@
 
                                        Gated on the organization as well, the way that section
                                        is: both answers rest on the user having looked at the
-                                       work item, and hours booked against an address Slate is
-                                       not connected to are the one case where they cannot
+                                       work item, and hours booked against an organization
+                                       Slate is not on are the one case where they cannot
                                        have. "Same organization", just below, is the way out
                                        for those. *@
                                     @if (entry.UnconfirmedUndo is { } undo)
@@ -375,16 +375,16 @@
                                         }
                                     }
 
-                                    @* Hours booked against an address this connection is not
-                                       at cannot be undone from here: #7 over here is a
+                                    @* Hours booked against an organization this connection is
+                                       not on cannot be undone from here: #7 over there is a
                                        different work item. Recoverable rather than a dead end,
                                        because an organization that was renamed or moved has no
                                        old address left to switch back to. *@
                                     @if (elsewhere)
                                     {
                                         <div style="margin-top: 4px; font-size: 11.5px; color: var(--text-3)">
-                                            Booked against <span class="mono">@AppState.BookedAgainst(entry)</span>, which Slate is
-                                            not connected to now, so Undo would change a different work item.
+                                            Booked against <span class="mono">@AppState.BookedAgainst(entry)</span>,
+                                            @AppState.WhyNotOurs(entry, _organization), so Undo would change a different work item.
                                             <button class="btn btn-sm btn-ghost" style="margin-left: 6px"
                                                     disabled="@(_undoing is not null)"
                                                     title="Only if that address and this one are the same organization - renamed, moved to dev.azure.com, or reached by a new server name. Nothing is written to Azure DevOps."

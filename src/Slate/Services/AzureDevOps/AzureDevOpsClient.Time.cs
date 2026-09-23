@@ -402,10 +402,17 @@ public sealed partial class AzureDevOpsClient
                     ? $"moved Remaining Work from {revision.RemainingOld ?? 0:0.##}h to "
                       + $"{revision.RemainingNew ?? 0:0.##}h"
                     : $"left Remaining Work at {plan.RemainingBefore:0.##}h")
-                + (plan.SetsRemaining
-                    ? $", where this change moves it from {plan.RemainingBefore:0.##}h to "
-                      + $"{plan.RemainingAfter:0.##}h"
-                    : ", which this change does not touch"));
+                // Said of what this change does to the field rather than of whether it writes
+                // it. Our patch carries Remaining Work whenever the change sets it at all -
+                // including when what it sets is the value already there, which is what
+                // reducing remaining on an item that has never had any comes to - and calling
+                // that "moves it from 0h to 0h" describes a re-write as a move.
+                + (!plan.SetsRemaining
+                    ? ", which this change does not touch"
+                    : Same(plan.RemainingBefore, plan.RemainingAfter)
+                        ? $", where this change leaves it at {plan.RemainingAfter:0.##}h"
+                        : $", where this change moves it from {plan.RemainingBefore:0.##}h to "
+                          + $"{plan.RemainingAfter:0.##}h"));
 
         // The same question the other way round, for a change that moves Remaining Work alone -
         // an undo whose Completed Work delta clamped to nothing, because the work item's
@@ -504,6 +511,14 @@ public sealed partial class AzureDevOpsClient
     }
 
     /// <summary>
+    /// Whether two readings of an hours field are the same amount. The service keeps them as
+    /// floating point, so exact equality answers no to two numbers that are the same to any
+    /// precision a timesheet has. Used by the reasoning below and by what it says afterwards,
+    /// so that a change which only re-writes a field is never described as moving it.
+    /// </summary>
+    private static bool Same(double a, double b) => Math.Abs(a - b) < 0.001;
+
+    /// <summary>
     /// What one revision did to the time fields, and every name the service gave for whose
     /// hand it was. More than one, because the same person is named differently depending on
     /// where you ask - and matching on any of them is what keeps an ordinary booking from
@@ -569,8 +584,6 @@ public sealed partial class AzureDevOpsClient
             CompletedChanged
                 ? Same(CompletedOld ?? 0, plan.CompletedBefore) && Same(CompletedNew ?? 0, plan.CompletedAfter)
                 : Same(plan.CompletedBefore, plan.CompletedAfter);
-
-        private static bool Same(double a, double b) => Math.Abs(a - b) < 0.001;
     }
 
     /// <summary>How a look through a work item's history for one revision turned out.</summary>

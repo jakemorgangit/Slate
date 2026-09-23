@@ -103,8 +103,6 @@ public sealed class PlanStore
 
     public Dictionary<int, int> Priorities => Cached.Priorities;
 
-    public List<string> PendingDeletes => Cached.PendingDeletes;
-
     /// <summary>Event ids the plan has deliberately let go of, so they are not picked up again.</summary>
     public List<string> Disowned => Cached.Disowned;
 

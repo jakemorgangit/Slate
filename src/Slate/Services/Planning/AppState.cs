@@ -2072,19 +2072,49 @@ public sealed class AppState(
     /// The way out is named as well as the refusal: an organization can be renamed or moved,
     /// and after that there is no switching back to what no longer exists. Someone who knows
     /// it is the same organization can say so from the Time tab, and everything works again.
+    /// Switching back is only offered when there is somewhere to switch back to, which is not
+    /// every refusal - see <see cref="SameAddressAs"/>.
     /// </summary>
     private string? WrongConnection(TimeEntry entry)
     {
-        if (entry.BelongsTo(CurrentOrganization)) return null;
+        var organization = CurrentOrganization;
+        if (entry.BelongsTo(organization)) return null;
 
-        var where = entry.Organization.Length > 0 ? entry.Organization : entry.WorkItemUrl;
-        var here = CurrentOrganization.Url is { Length: > 0 } url ? url : "somewhere else";
+        var where = BookedAgainst(entry);
+
+        // Refused on the organization's own id while the address is the one Slate is pointed
+        // at. Two things lead here: a Server collection rebuilt where another one used to
+        // answer, and "same organization" said while connectionData had not been read yet,
+        // which writes this address onto the entry and leaves the id it was booked with
+        // standing - so a claim that turns out to be wrong comes back here with both halves
+        // naming the same address. Telling the user to switch back would be telling them to
+        // switch to where they already are, so only the way out that exists is offered.
+        if (SameAddressAs(entry, organization))
+            return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" was booked against a different Azure " +
+                   $"DevOps organization at this same address, {where}, where #{entry.WorkItemId} is a " +
+                   "different work item. If it is that same organization after all, say so from the Time " +
+                   "tab and Slate will settle it here.";
+
+        var here = organization.Url is { Length: > 0 } url ? url : "somewhere else";
 
         return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" was booked against {where}, and Slate is " +
                $"connected to {here} now, where #{entry.WorkItemId} is a different work item. Switch back " +
                "to settle it - or, if this is that same organization under a new address, say so from the " +
                "Time tab and Slate will settle it here.";
     }
+
+    /// <summary>
+    /// Of an entry this connection has already refused: true when the hours were booked at the
+    /// very address Slate is reaching Azure DevOps on, so what the two disagree about is the
+    /// organization's identity rather than where it lives.
+    ///
+    /// Everything that explains such a refusal has to know: the usual wordings - "which Slate
+    /// is not connected to now", "switch back" - would name the address Slate is plainly
+    /// connected to and send the user somewhere they already are.
+    /// </summary>
+    private static bool SameAddressAs(TimeEntry entry, OrganizationRef organization) =>
+        organization.Url.Length > 0
+        && TimeEntry.NormaliseOrganization(BookedAgainst(entry)) == organization.Url;
 
     /// <summary>
     /// The bookings of a block this connection may answer for, with <paramref name="elsewhere"/>
@@ -2121,11 +2151,20 @@ public sealed class AppState(
     /// and one made after: the check and the two answers are for <see cref="Mine"/>, and
     /// "same organization" is the way out for the others.
     /// </summary>
+    /// <param name="Elsewhere">
+    /// The address the bookings that were left out were booked against, or null when none were.
+    /// </param>
+    /// <param name="ElsewhereWhy">
+    /// Why that address is not this connection's, as <see cref="WhyNotOurs"/> puts it - which
+    /// is not always that Slate is somewhere else. Carried beside the address so the two are
+    /// worked out from the one booking and cannot describe different ones.
+    /// </param>
     public sealed record UnsettledBlock(
         Guid AllocationId,
         IReadOnlyList<UnconfirmedBooking> Bookings,
         IReadOnlyList<UnconfirmedBooking> Mine,
-        string? Elsewhere)
+        string? Elsewhere,
+        string ElsewhereWhy = "")
     {
         /// <summary>The oldest booking of the block, which names the work item for all of them.</summary>
         public TimeEntry First => Bookings[0].Entry;
@@ -2160,6 +2199,8 @@ public sealed class AppState(
     {
         var mine = new List<UnconfirmedBooking>(bookings.Count);
         string? elsewhere = null;
+        var elsewhereWhy = "";
+        var organization = CurrentOrganization;
 
         // The same test the answers themselves are refused by, so what is offered and what is
         // accepted cannot drift apart; only the wording differs, this one being what the
@@ -2167,15 +2208,38 @@ public sealed class AppState(
         foreach (var booking in bookings)
         {
             if (WrongConnection(booking.Entry) is null) mine.Add(booking);
-            else elsewhere ??= BookedAgainst(booking.Entry);
+            else if (elsewhere is null)
+            {
+                elsewhere = BookedAgainst(booking.Entry);
+                elsewhereWhy = WhyNotOurs(booking.Entry, organization);
+            }
         }
 
-        return new UnsettledBlock(allocationId, bookings, mine, elsewhere);
+        return new UnsettledBlock(allocationId, bookings, mine, elsewhere, elsewhereWhy);
     }
 
     /// <summary>Where a set of hours says it was booked, however little it was stamped with.</summary>
     public static string BookedAgainst(TimeEntry entry) =>
         entry.Organization is { Length: > 0 } stamp ? stamp : entry.WorkItemUrl;
+
+    /// <summary>
+    /// Why the address a refused set of hours was booked against is not this connection's, as
+    /// the clause that follows that address wherever one is shown.
+    ///
+    /// Usually because Slate is reaching Azure DevOps somewhere else. Not always: the refusal
+    /// can be about which organization answers at one address rather than about the address -
+    /// see <see cref="SameAddressAs"/> - and saying "not connected to" there would be saying
+    /// it of the address Slate is connected to.
+    ///
+    /// Told which organization rather than reading it, the way <see cref="BookedAgainst"/> is
+    /// handed its entry: a page that judged a row against the connection it was built with
+    /// must explain that row against the same one, or the sentence and the button it sits
+    /// beside can end up describing different connections.
+    /// </summary>
+    public static string WhyNotOurs(TimeEntry entry, OrganizationRef organization) =>
+        SameAddressAs(entry, organization)
+            ? "which Azure DevOps now reports as a different organization at the same address"
+            : "which Slate is not connected to now";
 
     /// <summary>
     /// Lets go of a block's unconfirmed bookings without asking Azure DevOps again: the user
@@ -2660,9 +2724,10 @@ public sealed class AppState(
     {
         // Somebody else's #7, refused before anything is counted in: an undo that was never
         // going to happen must not hold a handover open, nor claim the entry on its way to
-        // being turned away. The time view disables its Undo on this same test, because it is
-        // the one place that can also offer the way out; the plan's own menus offer it and are
-        // answered here, where the refusal names where to go. Read from the plan rather than
+        // being turned away. Every opening onto an undo - the time view's button, the plan's
+        // context menu, the inspector's "Undo last" - is disabled on this same test, so none
+        // of them offers hours it could only be refused for; this is what holds that to
+        // account rather than each page promising it. Read from the plan rather than
         // trusting the caller's copy, and asked again below under the claim, where the entry
         // cannot change underneath the write.
         if (planner.FindTimeEntry(entry.Id) is { } shown && WrongConnection(shown) is { } wrongOrganization)
