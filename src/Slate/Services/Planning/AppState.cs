@@ -2264,6 +2264,13 @@ public sealed class AppState(
     /// </summary>
     public void ResumeAfterFailedHandover()
     {
+        // Before the gate reopens, and whether or not this copy got as far as closing it: an
+        // update that did not go ahead leaves the data folder this copy's again, and a gate
+        // open over a frozen folder would take every save and write none of them. The updater
+        // thaws it itself as it puts things back; this is the second pair of hands, since
+        // nothing else would ever notice.
+        DataFolder.Thaw();
+
         lock (_timers)
         {
             if (!writes.IsClosed) return;

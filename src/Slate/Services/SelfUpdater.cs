@@ -25,7 +25,8 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
 ///
 /// Every step that can fail before the old copy exits is undone if it does - including the old
 /// copy being ended from outside, by Windows signing out, while the new one is still starting -
-/// so the original path always holds a working Slate. Settings and the plan live in the data
+/// so the original path always holds a working Slate. Ended before the swap, the install stops
+/// there instead and moves nothing at all. Settings and the plan live in the data
 /// folder and are written as they change. Before any file moves the old copy finishes whatever
 /// it was writing and refuses anything new, and from the moment it starts the new copy it
 /// writes nothing into the data folder at all unless the update is undone, so restarting
@@ -412,6 +413,14 @@ public sealed class SelfUpdater
     private static Handover? _unconfirmed;
 
     /// <summary>
+    /// Why this copy is on its way out, from the moment <see cref="SettleBeforeExit"/> is
+    /// first called. Held under <see cref="HandoverLock"/>, because it is what stops an
+    /// install that has not swapped anything yet from starting to. Only ever set: a copy told
+    /// it is ending does not un-end.
+    /// </summary>
+    private static string? _exitingBecause;
+
+    /// <summary>
     /// Swaps the files and registers the handover in one hold of the lock, so there is no
     /// instant at which the new .exe is in place with nothing on record to put the old one back.
     /// </summary>
@@ -419,6 +428,18 @@ public sealed class SelfUpdater
     {
         lock (HandoverLock)
         {
+            // Nothing may move once this copy has been told it is ending. The install runs on
+            // a pool thread that no shutdown waits for, so the process can be torn down at any
+            // point from here on: between the two renames in Swap, which would leave nothing
+            // at Slate's own path, or after the new copy is started, which would leave the new
+            // .exe in place and the good one only as .old with nobody left to put it back.
+            // SettleBeforeExit covers that from the moment the swap is on record; this covers
+            // the stretch before it, where all it would have found is an install still
+            // downloading, checking, or waiting for writes in flight.
+            if (_exitingBecause is { } why)
+                throw new OperationCanceledException(
+                    $"{why} before Slate {handover.Version} was swapped in, so nothing was changed.");
+
             Swap(handover.Exe, handover.Download, handover.Old);
             _unconfirmed = handover;
         }
@@ -677,9 +698,13 @@ public sealed class SelfUpdater
     {
         lock (HandoverLock)
         {
+            // Recorded whether or not there is anything to settle yet, and kept at the first
+            // reason given: an install that has not reached the swap must not reach it now.
+            _exitingBecause ??= why;
+
             if (_unconfirmed is not { } handover) return;
 
-            if (handover.Ready?.WaitOne(0) == true)
+            if (IsReady(handover))
             {
                 CrashLog.WriteLine($"{why} as Slate {handover.Version} finished starting, so the update stands.");
                 HandOver(handover);
@@ -689,6 +714,28 @@ public sealed class SelfUpdater
             CrashLog.WriteLine($"{why} before Slate {handover.Version} had started, so the update was undone.");
             handover.Interruption = why;
             RollBack(handover);
+        }
+    }
+
+    /// <summary>
+    /// Whether the new copy has said its window is up. Anything thrown by the handle - it is
+    /// disposed once the wait for the new copy is over, which only happens after the handover
+    /// has been settled and taken off the record, so this should not be reachable - counts as
+    /// "not up": the worst that does is put back a Slate that was already working, whereas
+    /// letting it throw would take the exception onto the window's thread mid sign-out and
+    /// leave the new .exe in place with nothing watching it. Only called under
+    /// <see cref="HandoverLock"/>.
+    /// </summary>
+    private static bool IsReady(Handover handover)
+    {
+        try
+        {
+            return handover.Ready?.WaitOne(0) == true;
+        }
+        catch (Exception ex)
+        {
+            CrashLog.WriteLine($"Could not tell whether Slate {handover.Version} had started: {ex}");
+            return false;
         }
     }
 
@@ -703,34 +750,48 @@ public sealed class SelfUpdater
     /// Stops the new copy if it was started and is still running, puts the old .exe back, and
     /// lets this copy write to the data folder again - in that order, since until the new copy
     /// is gone the folder is still its. Only called under <see cref="HandoverLock"/>.
+    ///
+    /// Nothing gets out of here: every step is a best effort that logs what it could not do,
+    /// so that the steps after it still run. Letting one out would leave the handover on
+    /// record with the data folder frozen, and the app carrying on with every save from then
+    /// on held in memory and never written - or, from <see cref="SettleBeforeExit"/>, take it
+    /// onto the window's thread while Windows is signing out.
     /// </summary>
     private static void RollBack(Handover handover)
     {
         try
         {
-            if (handover.Child is { HasExited: false } child)
+            try
             {
-                child.Kill(entireProcessTree: true);
-                if (!child.WaitForExit(10_000))
-                    CrashLog.WriteLine($"Slate {handover.Version} was still exiting 10 seconds after being stopped.");
+                if (handover.Child is { HasExited: false } child)
+                {
+                    child.Kill(entireProcessTree: true);
+                    if (!child.WaitForExit(10_000))
+                        CrashLog.WriteLine($"Slate {handover.Version} was still exiting 10 seconds after being stopped.");
+                }
             }
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
-        {
-            CrashLog.WriteLine($"Could not stop Slate {handover.Version} after it failed to start: {ex}");
-        }
+            catch (Exception ex)
+            {
+                // Whatever it is, not only the documented few: ending the whole tree reports a
+                // descendant it could not end as an AggregateException, and by now the new copy
+                // has WebView2 children of its own. The copy itself is ended first either way,
+                // and a stray child of a copy that never showed its window is the lesser harm.
+                CrashLog.WriteLine($"Could not stop Slate {handover.Version} after it failed to start: {ex}");
+            }
 
-        try
-        {
             Restore(handover.Exe, handover.Old, handover.Download);
+        }
+        catch (Exception ex)
+        {
+            CrashLog.WriteLine($"Putting the old Slate back after a failed update did not finish: {ex}");
         }
         finally
         {
             handover.Outcome = HandoverOutcome.RolledBack;
             _unconfirmed = null;
 
-            // Even if the new copy could not be confirmed gone: a folder left frozen would
-            // quietly keep every change made from here on off the disk.
+            // Even if the new copy could not be confirmed gone, or the old one put back: a
+            // folder left frozen would quietly keep every change made from here on off the disk.
             DataFolder.Thaw();
         }
     }
