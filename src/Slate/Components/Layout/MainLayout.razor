@@ -8,6 +8,7 @@
 @inject SelfUpdater Updater
 @inject SettingsStore Settings
 @inject PlannerService Planner
+@inject PlanStore Plan
 @inject ToastService Toasts
 @inject IJSRuntime Js
 @inject NavigationManager Nav
@@ -245,6 +246,11 @@
         // First, because the copy this one replaced is waiting on it before it exits.
         if (SelfUpdater.TakeUpdatedFrom() is { } previous)
             Toasts.Success($"Updated to {AppInfo.Version}", $"Slate was on {previous}. Settings and the plan carried over.");
+
+        // A plan that could not be read is the one thing worth interrupting the first paint
+        // for: it holds every block, every entry, and the record of which bookings Azure
+        // DevOps never confirmed. An error rather than a warning, so it stays until read.
+        if (Plan.LoadProblem is { } problem) Toasts.Error("Your plan could not be read", problem);
 
         await ApplyThemeAsync();
         await State.RefreshSignInAsync();

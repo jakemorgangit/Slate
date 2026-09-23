@@ -538,15 +538,12 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     public IReadOnlyList<TimeEntry> TimeEntries => store.TimeEntries;
 
     /// <summary>
-    /// The organization these hours are being booked to, stamped onto every entry so that a
-    /// later Undo, check or settle can tell whether the work item it is about to act on is
-    /// even the one they went to.
+    /// The entry a booking from this block makes, not yet filed. The organization is passed
+    /// in rather than read from the settings: its id comes from Azure DevOps itself, and this
+    /// is the stamp a later Undo, check or settle judges the work item by.
     /// </summary>
-    public string Organization => TimeEntry.NormaliseOrganization(settings.Current.Ado.OrganizationUrl);
-
-    /// <summary>The entry a booking from this block makes, not yet filed.</summary>
     public TimeEntry BuildTimeEntry(
-        Allocation allocation, double hours, bool reducedRemaining,
+        Allocation allocation, OrganizationRef organization, double hours, bool reducedRemaining,
         double appliedCompleted = 0, double appliedRemaining = 0, string comment = "")
     {
         return new TimeEntry
@@ -557,7 +554,8 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             WorkItemType = allocation.WorkItemType,
             WorkItemUrl = allocation.WorkItemUrl,
             Project = allocation.Project,
-            Organization = Organization,
+            Organization = organization.Url,
+            OrganizationId = organization.Id,
             Date = allocation.Start.Date,
             Start = allocation.Start,
             BlockMinutes = allocation.DurationMinutes,
@@ -592,7 +590,13 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         booking.Entry.AppliedCompleted = plan.AppliedCompleted;
         booking.Entry.AppliedRemaining = plan.AppliedRemaining;
 
-        if (!store.UnconfirmedBookings.Contains(booking)) store.UnconfirmedBookings.Add(booking);
+        // Through the store, under the lock a save holds: this runs from a time write, which
+        // can be going on while a polling timer is saving the plan on another thread.
+        store.Edit(file =>
+        {
+            if (!file.UnconfirmedBookings.Contains(booking)) file.UnconfirmedBookings.Add(booking);
+        });
+
         Persist();
     }
 
@@ -618,9 +622,12 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         booking.Entry.AppliedCompleted = result.AppliedCompleted;
         booking.Entry.AppliedRemaining = result.AppliedRemaining;
 
-        store.UnconfirmedBookings.Remove(booking);
-        store.TimeEntries.Add(booking.Entry);
-        if (result.Plan is { } landed) DropOvertaken(landed);
+        store.Edit(file =>
+        {
+            file.UnconfirmedBookings.Remove(booking);
+            file.TimeEntries.Add(booking.Entry);
+            if (result.Plan is { } landed) DropOvertaken(file, landed, booking.Entry);
+        });
 
         Persist();
         return booking.Entry;
@@ -630,7 +637,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     public void DropUnconfirmed(UnconfirmedBooking booking)
     {
         booking.InFlight = false;
-        if (store.UnconfirmedBookings.Remove(booking)) Persist();
+        if (store.Edit(file => file.UnconfirmedBookings.Remove(booking))) Persist();
     }
 
     /// <summary>
@@ -659,16 +666,24 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// </summary>
     public bool SettleUnconfirmed(UnconfirmedBooking booking, bool landed)
     {
-        if (!store.UnconfirmedBookings.Remove(booking)) return false;
-
-        if (landed)
+        // Removing it is also the test that it was still there to settle: whether another
+        // check or the quiet settle got here first is only knowable inside the same lock that
+        // takes it off the list.
+        var settled = store.Edit(file =>
         {
-            store.TimeEntries.Add(booking.Entry);
-            if (booking.Plan is { } plan) DropOvertaken(plan);
-        }
+            if (!file.UnconfirmedBookings.Remove(booking)) return false;
 
-        Persist();
-        return true;
+            if (landed)
+            {
+                file.TimeEntries.Add(booking.Entry);
+                if (booking.Plan is { } plan) DropOvertaken(file, plan, booking.Entry);
+            }
+
+            return true;
+        });
+
+        if (settled) Persist();
+        return settled;
     }
 
     /// <summary>
@@ -681,14 +696,24 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// Both lists together, because the two are pinned the same way and a booking can just as
     /// easily overtake an undo as another booking: zero-clamping alone makes any two changes
     /// that drive Completed Work to nothing from the same place identical.
+    ///
+    /// Only within the organization the write that landed belongs to, which
+    /// <paramref name="from"/> carries. A work item number and a revision mean nothing outside
+    /// one organization, so without that a booking made before a switch would be let go on the
+    /// strength of a revision of some other organization's #7 - and its hours could still be
+    /// sitting on the item it really went to.
     /// </summary>
-    private bool DropOvertaken(TimeWritePlan landed)
+    private static bool DropOvertaken(PlanFile file, TimeWritePlan landed, TimeEntry from)
     {
-        var dropped = store.UnconfirmedBookings.RemoveAll(b => b.Plan is { } plan && Overtaken(plan, landed)) > 0;
+        var where = OrganizationRef.For(from.Organization, from.OrganizationId);
 
-        foreach (var entry in store.TimeEntries)
+        var dropped = file.UnconfirmedBookings.RemoveAll(
+            b => b.Plan is { } plan && Overtaken(plan, landed) && b.Entry.BelongsTo(where)) > 0;
+
+        foreach (var entry in file.TimeEntries)
         {
             if (entry.UnconfirmedUndo is not { } undo || !Overtaken(undo, landed)) continue;
+            if (!entry.BelongsTo(where)) continue;
 
             entry.UnconfirmedUndo = null;
             dropped = true;
@@ -703,10 +728,52 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// <summary>Writes down, or clears, an undo of this entry that was never confirmed.</summary>
     public void SetUnconfirmedUndo(Guid entryId, TimeWritePlan? plan)
     {
-        if (FindTimeEntry(entryId) is not { } entry) return;
+        var set = store.Edit(file =>
+        {
+            if (file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is not { } entry) return false;
 
-        entry.UnconfirmedUndo = plan;
-        Persist();
+            entry.UnconfirmedUndo = plan;
+            return true;
+        });
+
+        if (set) Persist();
+    }
+
+    /// <summary>
+    /// Settles an undo that was never confirmed, against the very pin it was judged by.
+    ///
+    /// The pin is checked here rather than by the caller because the caller had to await
+    /// Azure DevOps to learn the answer, and in that time another undo of the same work item
+    /// can land and sweep this pin away - which says this one did not land, whatever the
+    /// history seemed to say a moment ago. Checked and acted on inside one lock, so there is
+    /// no gap between the two: false means somebody else has already settled it.
+    ///
+    /// Landed, the entry goes and everything its revision overtook goes with it, in one save.
+    /// Not landed, only the pin is let go: the hours are still on the work item and the entry
+    /// still stands for them.
+    /// </summary>
+    public bool SettleUnconfirmedUndo(Guid entryId, TimeWritePlan expected, bool landed)
+    {
+        var settled = store.Edit(file =>
+        {
+            if (file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is not { } entry) return false;
+            if (entry.UnconfirmedUndo != expected) return false;
+
+            if (landed)
+            {
+                file.TimeEntries.Remove(entry);
+                DropOvertaken(file, expected, entry);
+            }
+            else
+            {
+                entry.UnconfirmedUndo = null;
+            }
+
+            return true;
+        });
+
+        if (settled) Persist();
+        return settled;
     }
 
     /// <summary>
@@ -715,10 +782,62 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// </summary>
     public void RemoveTimeEntry(Guid entryId, TimeWritePlan? landed = null)
     {
-        var removed = store.TimeEntries.RemoveAll(e => e.Id == entryId) > 0;
-        var swept = landed is { } plan && DropOvertaken(plan);
+        var changed = store.Edit(file =>
+        {
+            var gone = file.TimeEntries.FirstOrDefault(e => e.Id == entryId);
+            var removed = gone is not null && file.TimeEntries.Remove(gone);
+            var swept = landed is { } plan && gone is not null && DropOvertaken(file, plan, gone);
+            return removed || swept;
+        });
 
-        if (removed || swept) Persist();
+        if (changed) Persist();
+    }
+
+    /// <summary>
+    /// Says that a block's unsettled bookings were made against this organization after all,
+    /// whatever address they were stamped with: a rename, Microsoft's move to dev.azure.com,
+    /// or a server answering to a new name all leave hours stranded behind a stamp that no
+    /// longer matches anything, and the old address may not even exist to switch back to.
+    ///
+    /// Only the stamp changes. Nothing is written to Azure DevOps, and the booking is no more
+    /// settled than it was - it can simply be checked and answered for again. Returns how many
+    /// were brought over.
+    /// </summary>
+    public int AdoptOrganization(Guid allocationId, OrganizationRef organization)
+    {
+        var stamped = store.Edit(file =>
+        {
+            var count = 0;
+            foreach (var booking in file.UnconfirmedBookings)
+            {
+                if (booking.Entry.AllocationId != allocationId) continue;
+                if (Stamp(booking.Entry, organization)) count++;
+            }
+
+            return count;
+        });
+
+        if (stamped > 0) Persist();
+        return stamped;
+    }
+
+    /// <summary>The same for one filed entry, whose undo is the thing being refused.</summary>
+    public bool AdoptOrganizationForEntry(Guid entryId, OrganizationRef organization)
+    {
+        var stamped = store.Edit(file =>
+            file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is { } entry && Stamp(entry, organization));
+
+        if (stamped) Persist();
+        return stamped;
+    }
+
+    private static bool Stamp(TimeEntry entry, OrganizationRef organization)
+    {
+        if (entry.Organization == organization.Url && entry.OrganizationId == organization.Id) return false;
+
+        entry.Organization = organization.Url;
+        entry.OrganizationId = organization.Id;
+        return true;
     }
 
     public TimeEntry? FindTimeEntry(Guid entryId) =>

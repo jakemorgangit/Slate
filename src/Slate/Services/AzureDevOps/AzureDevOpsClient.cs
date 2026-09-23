@@ -855,17 +855,14 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             id, rev, new Dictionary<string, object?> { ["System.Description"] = html ?? "" }, ct);
     }
 
-    /// <summary>Who the current credential belongs to, used to decide what is editable here.</summary>
-    public async Task<string> GetAuthenticatedUserAsync(CancellationToken ct = default)
-    {
-        using var doc = await SendAsync(HttpMethod.Get,
-            $"{OrgUrl}/_apis/connectionData?api-version={ApiVersion}-preview", null, ct);
-
-        return doc.RootElement.TryGetProperty("authenticatedUser", out var user) &&
-               user.TryGetProperty("providerDisplayName", out var name)
-            ? name.GetString() ?? ""
-            : "";
-    }
+    /// <summary>
+    /// Who the current credential belongs to, used to decide what is editable here. Read
+    /// through the same connectionData call the time writes use, so the one thing that says
+    /// which organization this is and whose hand a revision was is read once and agreed on.
+    /// Empty when it could not be read, which is how it has always been treated here.
+    /// </summary>
+    public async Task<string> GetAuthenticatedUserAsync(CancellationToken ct = default) =>
+        (await ReadConnectionAsync(refresh: false, ct))?.DisplayName ?? "";
 
     // ---------------------------------------------------------------- discussion
 

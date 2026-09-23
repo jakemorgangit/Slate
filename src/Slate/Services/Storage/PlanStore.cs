@@ -17,6 +17,32 @@ public sealed class PlanStore
     private readonly Lock _gate = new();
     private PlanFile? _cached;
 
+    /// <summary>
+    /// Why the plan on disk could not be read, when it could not, for the one notice that
+    /// says so. Null on an ordinary start, including the first one of all.
+    ///
+    /// Reading it loads the plan if nothing has yet, so that asking the question at startup
+    /// gets the answer rather than the moment before it.
+    /// </summary>
+    public string? LoadProblem
+    {
+        get
+        {
+            _ = Cached;
+            return _loadProblem;
+        }
+    }
+
+    private string? _loadProblem;
+
+    /// <summary>
+    /// True when the file that is there must not be written over: it exists, it could not be
+    /// read, and it could not be put safely aside either. Everything in it - the blocks, the
+    /// entries, and the record of which bookings and undos were never confirmed - is still in
+    /// that file, and saving an empty plan on top would be the end of it.
+    /// </summary>
+    private bool _refuseToSave;
+
     public List<Allocation> All => Cached.Allocations;
 
     public List<TimeEntry> TimeEntries => Cached.TimeEntries;
@@ -52,6 +78,37 @@ public sealed class PlanStore
         }
     }
 
+    /// <summary>
+    /// Runs a change to the plan's own lists holding the lock <see cref="Save"/> holds while
+    /// it copies them.
+    ///
+    /// Every list here is written from the UI thread and read from the two polling timers'
+    /// thread-pool callbacks, or the other way round. Save copies each one to take its
+    /// snapshot, and a copy reads the count and then takes the items: a list that grew in
+    /// between no longer fits, and the save comes apart with it ("Destination array was not
+    /// long enough"; "Collection was modified" for the dictionary, which enumerates). On the
+    /// calendar path that exception is swallowed into the load's error message, so what was
+    /// being saved - the record of a booking about to be sent, among it - is quietly lost.
+    /// This is the same protection <see cref="Append"/> gives the blocks, for the rest of
+    /// what the file holds.
+    /// </summary>
+    public T Edit<T>(Func<PlanFile, T> change)
+    {
+        lock (_gate)
+        {
+            return change(Cached);
+        }
+    }
+
+    /// <summary>The same, for a change with nothing to report back.</summary>
+    public void Edit(Action<PlanFile> change)
+    {
+        lock (_gate)
+        {
+            change(Cached);
+        }
+    }
+
     private PlanFile Cached
     {
         get
@@ -63,22 +120,72 @@ public sealed class PlanStore
         }
     }
 
-    private static PlanFile Load()
+    private PlanFile Load()
     {
-        PlanFile file;
+        var path = AppPaths.PlanFile;
+
+        string text;
         try
         {
-            file = File.Exists(AppPaths.PlanFile)
-                ? JsonSerializer.Deserialize<PlanFile>(File.ReadAllText(AppPaths.PlanFile), Json) ?? new PlanFile()
-                : new PlanFile();
+            if (!File.Exists(path)) return new PlanFile();
+            text = File.ReadAllText(path);
         }
-        catch (Exception ex) when (ex is JsonException or IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            // There is a plan there; this copy simply could not get at it. Carrying on with an
+            // empty one is fine - saving over the real one with it is not.
+            _refuseToSave = true;
+            _loadProblem = $"Your plan could not be read ({ex.Message}). Nothing will be saved over it until " +
+                           "Slate can read it again, so close Slate, make sure nothing else is holding the file, " +
+                           "and start it again.";
+            CrashLog.WriteLine($"Could not read the plan at {path}: {ex}");
             return new PlanFile();
         }
 
+        PlanFile? file;
+        try
+        {
+            file = JsonSerializer.Deserialize<PlanFile>(text, Json);
+        }
+        catch (JsonException ex)
+        {
+            return Unreadable(path, ex);
+        }
+
+        if (file is null) return Unreadable(path, null);
+
         Migrate(file);
         return file;
+    }
+
+    /// <summary>
+    /// A plan file that will not parse. It is put aside under its own name before anything is
+    /// written where it was: it holds every block and every time entry, and - since bookings
+    /// and undos Azure DevOps never confirmed live in it too - the only record of which hours
+    /// may already be on a work item. One bad value is no reason to lose all of that, and an
+    /// empty plan saved on top is exactly how it would be lost.
+    /// </summary>
+    private PlanFile Unreadable(string path, JsonException? ex)
+    {
+        var moved = path + "." + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".unreadable";
+
+        try
+        {
+            File.Move(path, moved, overwrite: true);
+            _loadProblem = "Your plan could not be read, so Slate has started a new one. The old file is kept " +
+                           $"as {Path.GetFileName(moved)} in the Slate data folder - nothing in it has been lost.";
+        }
+        catch (Exception move) when (move is IOException or UnauthorizedAccessException)
+        {
+            _refuseToSave = true;
+            _loadProblem = "Your plan could not be read, and it could not be put aside either. Nothing will be " +
+                           "saved over it, so close Slate and take a copy of plan.json from the Slate data folder " +
+                           "before starting it again.";
+            CrashLog.WriteLine($"Could not set the unreadable plan at {path} aside: {move}");
+        }
+
+        CrashLog.WriteLine($"The plan at {path} could not be read: {ex?.Message ?? "it held nothing at all"}.");
+        return new PlanFile();
     }
 
     /// <summary>
@@ -132,7 +239,13 @@ public sealed class PlanStore
 
         lock (_gate)
         {
+            // Read first: the flag below is set by the load, and this can be what triggers it.
             var current = Cached;
+
+            // The one thing worse than not saving this change: saving it over a plan that is
+            // still sitting there with everything else in it.
+            if (_refuseToSave) return;
+
             // Version and Extra come from what was read rather than from this copy's own
             // defaults: a plan a newer Slate wrote must not come back from here looking older
             // than it is, nor lose the members that version added.

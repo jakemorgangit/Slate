@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Slate.Models;
 
@@ -44,6 +46,19 @@ public sealed partial class AzureDevOpsClient
     /// winner's change - same size, same person - and take it for its own.
     /// </summary>
     private readonly ConcurrentDictionary<int, SemaphoreSlim> _timeGates = new();
+
+    /// <summary>
+    /// The last change this session sent to a work item that came back unanswered and is not
+    /// settled yet. The gate above is given up when that happens - it has to be, or the check
+    /// that would settle it could never run - so the next change to the same item can be
+    /// planned from a revision that the earlier one is still about to move. Remembered here so
+    /// that when both end up pinned to the same revision, neither claims the one revision the
+    /// two of them are competing for.
+    ///
+    /// This session's sends only. One left behind by a previous copy lives in the plan file,
+    /// and is settled through <see cref="CheckTimeWriteAsync"/> before it can matter.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, TimeWritePlan> _unanswered = new();
 
     /// <summary>
     /// Told what is about to go out, just before each send of it. The caller writes the change
@@ -89,18 +104,32 @@ public sealed partial class AzureDevOpsClient
         try
         {
             var (landing, now, _) = await SettleAsync(plan, ct);
-            return landing switch
+
+            var answer = landing switch
             {
-                Landing.Landed => (true, ResultFrom(plan, now!)),
+                Landing.Landed => (Landed: (bool?)true, Result: ResultFrom(plan, now!)),
                 Landing.Lost => (false, null),
                 Landing.NotYet when !plan.CouldStillLand => (false, null),
                 _ => (null, null),
             };
+
+            if (answer.Landed is not null) ForgetUnanswered(plan);
+            return answer;
         }
         finally
         {
             gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Stops watching for a change once it is settled - or once something else has taken the
+    /// one revision it could ever have become, which settles it just as finally.
+    /// </summary>
+    private void ForgetUnanswered(TimeWritePlan settled)
+    {
+        if (_unanswered.TryGetValue(settled.WorkItemId, out var held) && held.Rev == settled.Rev)
+            _unanswered.TryRemove(settled.WorkItemId, out _);
     }
 
     /// <summary>
@@ -120,12 +149,45 @@ public sealed partial class AzureDevOpsClient
         await gate.WaitAsync(ct);
         try
         {
-            return await AdjustTimeLockedAsync(id, completedDelta, remainingDelta, pinning, ct);
+            // Whatever the last change to this item left unanswered is put to the work item
+            // first, so this one is planned from where the item really stands rather than
+            // from a revision the other is still about to move.
+            await SettleUnansweredAsync(id, ct);
+
+            var result = await AdjustTimeLockedAsync(id, completedDelta, remainingDelta, pinning, ct);
+
+            // This change made a revision of its own, so anything still pinned behind it had
+            // its chance and missed it.
+            _unanswered.TryRemove(id, out _);
+            return result;
+        }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            // Still out there, and still able to land at any moment until the item moves past
+            // the revision it is pinned to.
+            _unanswered[id] = ex.Plan;
+            throw;
         }
         finally
         {
             gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Looks once at a change to this work item that went out unanswered, and forgets it when
+    /// the item itself has settled it either way. What cannot be settled stays remembered: it
+    /// is still free to land, and the next change is planned knowing that.
+    /// </summary>
+    private async Task SettleUnansweredAsync(int id, CancellationToken ct)
+    {
+        if (!_unanswered.TryGetValue(id, out var earlier)) return;
+
+        var (landing, _, _) = await SettleAsync(earlier, ct);
+
+        if (landing is Landing.Landed or Landing.Lost
+            || (landing is Landing.NotYet && !earlier.CouldStillLand))
+            _unanswered.TryRemove(id, out _);
     }
 
     private async Task<TimeRecordResult> AdjustTimeLockedAsync(
@@ -297,6 +359,29 @@ public sealed partial class AzureDevOpsClient
 
         if (!revision.Made(plan)) return (Landing.Lost, now, null);
 
+        // It moved the field this change moves, exactly as this change would - but left the
+        // other one somewhere this change would not have. Ours with a process rule on top of
+        // it, or somebody else's edit that happens to line up; either way, filing this as ours
+        // would write down an amount the work item does not agree with, and a later Undo would
+        // then put back hours that were never taken off. Not claimed, and not ruled out.
+        if (!revision.RemainingAgrees(plan))
+            return Undecided(plan, now,
+                $"revision {plan.Rev + 1} of #{plan.WorkItemId} made this change to Completed Work, but "
+                + (plan.SetsRemaining
+                    ? $"left Remaining Work at {revision.RemainingNew ?? plan.RemainingBefore:0.##}h where this "
+                      + $"change sets it to {plan.RemainingAfter:0.##}h"
+                    : $"also moved Remaining Work to {revision.RemainingNew ?? 0:0.##}h, which this change "
+                      + "does not touch"));
+
+        // Another change of ours, pinned to the same revision, that went out without an answer
+        // and could still be the one sitting here. Only one of the two can have made it, and
+        // nothing on the revision itself can say which, so neither may claim it.
+        if (_unanswered.TryGetValue(plan.WorkItemId, out var other)
+            && !ReferenceEquals(other, plan) && other.Rev == plan.Rev && revision.Made(other))
+            return Undecided(plan, now,
+                $"an earlier change to #{plan.WorkItemId} pinned to the same revision went out without an "
+                + "answer and makes the same change, so which of the two this revision is cannot be told");
+
         // The right change at the right revision - but a revision made before this change was
         // first sent cannot be it. The same hours booked from a second machine look exactly
         // like this one, and claiming those as ours would quietly lose a booking that is still
@@ -310,14 +395,29 @@ public sealed partial class AzureDevOpsClient
         // the very next edit is far-fetched, but when the service names who made it and that
         // is plainly not this account, it is not claimed. Unknown rather than lost, so that a
         // mismatch in how the two name the same person can never lead to booking it again.
-        var mine = await TryReadMyNamesAsync(ct);
-        if (mine.Count > 0 && revision.Names.Count > 0 && !revision.Names.Overlaps(mine))
-            return Undecided(plan, now,
-                $"revision {plan.Rev + 1} of #{plan.WorkItemId} made the change, but Azure DevOps says it was made by "
-                + $"[{string.Join(", ", revision.Names)}] and this sign-in answers to [{string.Join(", ", mine)}]");
+        var mine = await TryReadMyNamesAsync(refresh: false, ct);
+        if (Mismatched(revision, mine))
+        {
+            // What is held may have been read for an account this connection no longer uses.
+            // Read again before a change of ours is put down to somebody else - that reading
+            // is the one that leads to hours on the work item being discarded from here.
+            mine = await TryReadMyNamesAsync(refresh: true, ct);
+
+            if (Mismatched(revision, mine))
+                return Undecided(plan, now,
+                    $"revision {plan.Rev + 1} of #{plan.WorkItemId} made the change, but Azure DevOps says it was made by "
+                    + $"[{string.Join(", ", revision.Names)}] and this sign-in answers to [{string.Join(", ", mine)}]");
+        }
 
         return (Landing.Landed, now, null);
     }
+
+    /// <summary>
+    /// True when the service plainly names somebody else as the hand behind a revision. Names
+    /// neither side gave say nothing either way, and are never a mismatch.
+    /// </summary>
+    private static bool Mismatched(RevisionChange revision, HashSet<string> mine) =>
+        mine.Count > 0 && revision.Names.Count > 0 && !revision.Names.Overlaps(mine);
 
     /// <summary>
     /// Could not be told either way, with the reason kept for the log and for what is shown.
@@ -364,8 +464,10 @@ public sealed partial class AzureDevOpsClient
         /// <summary>
         /// True when this revision moved the field the change moves, from exactly where the
         /// change found it to exactly where it would leave it. Only that one field is held to
-        /// account: a process rule may touch others on the same save, and a false "not ours"
-        /// is the answer that would book the hours a second time.
+        /// account here, because a false answer from this one is a hard "never went on": the
+        /// change is worked out again and sent, and hours already on the item go on twice.
+        /// What the other field did is asked separately, by <see cref="RemainingAgrees"/>,
+        /// where a no leaves the question open instead of answering it.
         /// </summary>
         public bool Made(TimeWritePlan plan)
         {
@@ -382,6 +484,23 @@ public sealed partial class AzureDevOpsClient
             // A change that moves nothing is never sent.
             return false;
         }
+
+        /// <summary>
+        /// True when this revision also left Remaining Work where the change would have.
+        ///
+        /// A change that sets Remaining must be seen to have moved it; one that does not set
+        /// it must be seen not to have moved it at all - our patch does not carry the field,
+        /// so a revision that moved it is not simply ours. Both directions matter because the
+        /// applied amounts are what an Undo puts back: an entry filed for a revision that
+        /// moved Remaining Work by something other than what the entry says would leave that
+        /// field permanently out by the difference.
+        /// </summary>
+        public bool RemainingAgrees(TimeWritePlan plan) =>
+            plan.SetsRemaining && !Same(plan.RemainingBefore, plan.RemainingAfter)
+                ? RemainingChanged
+                  && Same(RemainingOld ?? 0, plan.RemainingBefore)
+                  && Same(RemainingNew ?? 0, plan.RemainingAfter)
+                : !RemainingChanged;
 
         private static bool Same(double a, double b) => Math.Abs(a - b) < 0.001;
     }
@@ -522,11 +641,29 @@ public sealed partial class AzureDevOpsClient
     }
 
     /// <summary>
-    /// Every name the account this client works as answers to, remembered for as long as the
-    /// connection stays the same. Empty when it could not be read, which simply means the
-    /// identity has no say in whether a change was ours.
+    /// What connectionData said, for the connection it was read from: the organization's own
+    /// id, the display name of the account, and every name that account answers to.
+    ///
+    /// One object, swapped in whole, because the parts have to agree with each other. Kept as
+    /// two fields assigned one after the other - and read from calls holding different locks -
+    /// it let a reader pair one connection's key with another's names, and whose hand a
+    /// revision was is exactly what that pairing decides.
     /// </summary>
-    private (string Connection, HashSet<string> Names) _myNames = ("", NewNameSet());
+    private sealed record ConnectionIdentity(
+        string Key, string Org, string InstanceId, string DisplayName, HashSet<string> Names);
+
+    private volatile ConnectionIdentity? _connection;
+
+    /// <summary>
+    /// The id Azure DevOps gives the organization this client is pointed at, once
+    /// connectionData has been read for it; empty until then, and empty again the moment the
+    /// URL moves on. Stamped onto time entries because it is the one part of an organization
+    /// that a rename, Microsoft's move to dev.azure.com or a new server address leaves alone.
+    /// </summary>
+    public string OrganizationId => _connection is { } held && held.Org == OrgUrl ? held.InstanceId : "";
+
+    /// <summary>Forgets who this connection is, for when the credential behind it changes.</summary>
+    private void ForgetConnectionIdentity() => _connection = null;
 
     /// <summary>
     /// The two identities connectionData names. They are often different people on paper -
@@ -542,19 +679,27 @@ public sealed partial class AzureDevOpsClient
     /// AAD-backed organization - authorizedUser usually is - and either can be named by
     /// descriptor or sign-in address rather than by id. Taking all of them and matching on any
     /// is what stops an ordinary booking looking like somebody else's edit for ever.
+    ///
+    /// Remembered for as long as the organization, the way of signing in and the account
+    /// itself all stay put. Null when it could not be read, which simply means the identity
+    /// has no say in whether a change was ours.
     /// </summary>
-    private async Task<HashSet<string>> TryReadMyNamesAsync(CancellationToken ct)
+    private async Task<ConnectionIdentity?> ReadConnectionAsync(bool refresh, CancellationToken ct)
     {
-        // The organization decides which identity ids mean anything, and the way of signing in
-        // decides who we are; either moving makes what is held here somebody else's answer.
-        var connection = $"{OrgUrl}|{settings.Current.Ado.AuthMode}";
-        if (_myNames.Connection == connection && _myNames.Names.Count > 0) return _myNames.Names;
+        var org = OrgUrl;
+        var key = $"{org}|{settings.Current.Ado.AuthMode}|{await CredentialKeyAsync()}";
 
-        var names = NewNameSet();
+        // Read once into a local: what is swapped in below is complete before anyone sees it.
+        var held = _connection;
+        if (!refresh && held is not null && held.Key == key) return held;
+
         try
         {
             using var doc = await SendAsync(HttpMethod.Get,
-                $"{OrgUrl}/_apis/connectionData?api-version={ApiVersion}-preview", null, ct);
+                $"{org}/_apis/connectionData?api-version={ApiVersion}-preview", null, ct);
+
+            var names = NewNameSet();
+            var display = "";
 
             foreach (var which in ConnectionIdentities)
             {
@@ -567,17 +712,48 @@ public sealed partial class AzureDevOpsClient
                     && properties.ValueKind == JsonValueKind.Object
                     && properties.TryGetProperty("Account", out var account))
                     AddNames(names, account, "$value");
+
+                // authenticatedUser comes first, so its name is the one shown.
+                if (display.Length == 0
+                    && user.TryGetProperty("providerDisplayName", out var name)
+                    && name.ValueKind == JsonValueKind.String)
+                    display = name.GetString() ?? "";
             }
+
+            var read = new ConnectionIdentity(key, org, Str(doc.RootElement, "instanceId"), display, names);
+            _connection = read;
+            return read;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            CrashLog.WriteLine($"Could not read who this sign-in is from {OrgUrl}: {ex.Message}");
-            return names;
+            CrashLog.WriteLine($"Could not read who this sign-in is from {org}: {ex.Message}");
+            return null;
         }
-
-        if (names.Count > 0) _myNames = (connection, names);
-        return names;
     }
+
+    /// <summary>
+    /// What tells one account on an organization from another. A personal access token is
+    /// taken by its fingerprint rather than its text: two tokens are two people, and only one
+    /// of them made any given revision. An Entra sign-in is told apart by the account signed in.
+    ///
+    /// Without this, swapping a token for a colleague's - or signing out and back in as
+    /// somebody else, which changes neither the URL nor the way of signing in - left the
+    /// previous account's names in hand for the rest of the session. A change that really was
+    /// ours would then read as somebody else's, and worse, one of theirs could be claimed as
+    /// ours and an entry filed for hours nobody here booked.
+    /// </summary>
+    private async Task<string> CredentialKeyAsync()
+    {
+        var ado = settings.Current.Ado;
+        if (ado.AuthMode != AdoAuthMode.Entra)
+            return "pat:" + Convert.ToHexStringLower(
+                SHA256.HashData(Encoding.UTF8.GetBytes(ado.PersonalAccessToken)))[..16];
+
+        return "entra:" + ((await auth.GetStatusAsync()).Username ?? "");
+    }
+
+    private async Task<HashSet<string>> TryReadMyNamesAsync(bool refresh, CancellationToken ct) =>
+        (await ReadConnectionAsync(refresh, ct))?.Names ?? NewNameSet();
 
     private static TimeWritePlan PlanTimeWrite(int id, TimeFields now, double completedDelta, double remainingDelta)
     {

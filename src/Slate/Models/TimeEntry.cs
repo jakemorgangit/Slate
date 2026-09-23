@@ -32,6 +32,18 @@ public sealed class TimeEntry
     /// </summary>
     public string Organization { get; set; } = "";
 
+    /// <summary>
+    /// The id Azure DevOps gives that organization - connectionData's instanceId. Kept beside
+    /// the URL because the URL is not an identity: a rename, Microsoft's own move from
+    /// {org}.visualstudio.com to dev.azure.com, or a new host name in front of an Azure DevOps
+    /// Server collection all change it while the organization stays the one these hours are on.
+    /// The id does not move, so it is preferred whenever both sides have one.
+    ///
+    /// Empty on entries written before this was kept, and whenever the id could not be read;
+    /// the URL then decides, as it did before.
+    /// </summary>
+    public string OrganizationId { get; set; } = "";
+
     /// <summary>The day the time is booked against - snapshotted, so moving the block later does not move the entry.</summary>
     public DateTime Date { get; set; }
 
@@ -87,27 +99,97 @@ public sealed class TimeEntry
     /// Whether these hours belong to the Azure DevOps organization given - the one an undo,
     /// a check or a settle is about to act through.
     ///
-    /// The stamp answers it outright. Entries written before there was one are judged on the
-    /// work item link they were kept with, which begins with the organization they were read
-    /// from, so switching organization does not strand them either. Only an entry that says
+    /// The ids settle it outright when both sides carry one, because they are the only part
+    /// of an organization that does not move. Failing that the stamped URL is compared, in
+    /// the one spelling <see cref="NormaliseOrganization"/> reduces every address to. Entries
+    /// written before there was a stamp are judged on the work item link they were kept with,
+    /// which was built from the organization they were read from. Only an entry that says
     /// nothing at all is taken on trust: refusing those would make old entries impossible to
     /// undo for no better reason than that they are old.
     /// </summary>
-    public bool BelongsTo(string organization)
+    public bool BelongsTo(OrganizationRef organization)
     {
-        var wanted = NormaliseOrganization(organization);
+        if (OrganizationId.Length > 0 && organization.Id.Length > 0)
+            return string.Equals(OrganizationId, organization.Id, StringComparison.OrdinalIgnoreCase);
+
+        var wanted = organization.Url;
         if (wanted.Length == 0) return true;
 
-        if (Organization.Length > 0)
-            return string.Equals(NormaliseOrganization(Organization), wanted, StringComparison.OrdinalIgnoreCase);
+        if (Organization.Length > 0) return NormaliseOrganization(Organization) == wanted;
 
-        return WorkItemUrl.Length == 0
-               || WorkItemUrl.StartsWith(wanted + "/", StringComparison.OrdinalIgnoreCase);
+        if (WorkItemUrl.Length == 0) return true;
+
+        var from = NormaliseOrganization(WorkItemUrl);
+        return from == wanted || from.StartsWith(wanted + "/", StringComparison.Ordinal);
     }
 
-    /// <summary>One spelling of an organization URL, so two ways of writing the same one match.</summary>
-    public static string NormaliseOrganization(string organizationUrl) =>
-        organizationUrl.Trim().TrimEnd('/');
+    /// <summary>
+    /// One spelling of an organization URL, so the same organization reached by another
+    /// address still matches. The scheme, any credential in front of the host and the case
+    /// are dropped, as is everything past the organization itself - a project left in the URL,
+    /// most often - and Azure DevOps' two names for one hosted organization,
+    /// {org}.visualstudio.com and dev.azure.com/{org}, come out the same. That last pair is
+    /// Microsoft's own migration, which moved every existing entry's address underneath it.
+    ///
+    /// A host it does not know keeps its path intact. On Azure DevOps Server the collection
+    /// can sit at any depth - /tfs/DefaultCollection as often as /DefaultCollection - and each
+    /// collection on a server has its own #7, so guessing where to cut is the one mistake here
+    /// worth avoiding. A server that changed address is what <see cref="OrganizationId"/> is
+    /// for.
+    /// </summary>
+    public static string NormaliseOrganization(string organizationUrl)
+    {
+        var text = organizationUrl.Trim().TrimEnd('/');
+        if (text.Length == 0) return "";
+
+        var scheme = text.IndexOf("://", StringComparison.Ordinal);
+        if (scheme >= 0) text = text[(scheme + 3)..];
+
+        text = text.ToLowerInvariant();
+
+        var slash = text.IndexOf('/');
+        var host = slash < 0 ? text : text[..slash];
+        var path = slash < 0 ? "" : text[(slash + 1)..];
+
+        // A personal access token pasted into the address lives in front of the host.
+        var at = host.LastIndexOf('@');
+        if (at >= 0) host = host[(at + 1)..];
+
+        const string legacyHost = ".visualstudio.com";
+        if (host.EndsWith(legacyHost, StringComparison.Ordinal))
+            return HostedOrganization(host[..^legacyHost.Length]);
+
+        if (host == "dev.azure.com")
+        {
+            var end = path.IndexOf('/');
+            return HostedOrganization(end < 0 ? path : path[..end]);
+        }
+
+        return path.Length == 0 ? host : host + "/" + path;
+    }
+
+    /// <summary>
+    /// The one name a hosted organization is known by here. Spelled as a dev.azure.com
+    /// address rather than the bare name so that it cannot collide with a single-label
+    /// server of the same name on someone's network.
+    /// </summary>
+    private static string HostedOrganization(string name) =>
+        name.Length == 0 ? "dev.azure.com" : "dev.azure.com/" + name;
+}
+
+/// <summary>
+/// An Azure DevOps organization as far as anything here needs to know it: the address it is
+/// reached at, in the one spelling <see cref="TimeEntry.NormaliseOrganization"/> gives, and
+/// the id the service itself gives it. Either may be empty - the id until connectionData has
+/// been read, the URL until one is configured - and what is known is what gets compared.
+/// </summary>
+public sealed record OrganizationRef(string Url, string Id)
+{
+    /// <summary>Nothing known, which every entry is taken to belong to rather than stranded.</summary>
+    public static readonly OrganizationRef None = new("", "");
+
+    public static OrganizationRef For(string organizationUrl, string id) =>
+        new(TimeEntry.NormaliseOrganization(organizationUrl), id.Trim());
 }
 
 /// <summary>How a time write ended, as far as it can be told.</summary>
@@ -143,6 +225,15 @@ public sealed record TimeWritePlan(
     DateTimeOffset SentAt,
     DateTimeOffset FirstSentAt = default)
 {
+    /// <summary>
+    /// Anything in the saved plan this copy does not know about, kept so it survives a save -
+    /// see <see cref="PlanFile.Extra"/>. This is the record that says what went out, so a
+    /// member of it dropped on the way through an older copy is exactly how a lost answer
+    /// stops being settleable.
+    /// </summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement> Extra { get; set; } = [];
+
     /// <summary>
     /// How long a change that has not shown up on the work item is still given to arrive
     /// before it is called lost - well past the client's own timeout, and past anything a
@@ -188,6 +279,15 @@ public sealed class UnconfirmedBooking
 
     /// <summary>What was sent, which is what a later check looks for on the work item.</summary>
     public TimeWritePlan? Plan { get; set; }
+
+    /// <summary>
+    /// Anything in the saved plan this copy does not know about, kept so it survives a save -
+    /// see <see cref="PlanFile.Extra"/>. Without it, an older copy putting the plan back after
+    /// a failed handover would drop whatever a newer one had added to the very record that
+    /// says these hours may already be on the work item.
+    /// </summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement> Extra { get; set; } = [];
 
     /// <summary>
     /// True while the write this was written down for is still going in this copy. Until it

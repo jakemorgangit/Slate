@@ -28,6 +28,11 @@ public sealed partial class AzureDevOpsClient
     {
         _members = null;
         _membersReadAt = default;
+
+        // Who this client is answering as belongs to the connection just as much as the
+        // roster does, and it decides whose hand a revision was - so it goes here too rather
+        // than waiting for its own key to notice.
+        ForgetConnectionIdentity();
     }
 
     public async Task<IReadOnlyList<OrgMember>> GetOrgMembersAsync(

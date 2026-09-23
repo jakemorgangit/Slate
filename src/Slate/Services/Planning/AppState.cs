@@ -1889,7 +1889,7 @@ public sealed class AppState(
 
         var pending = new UnconfirmedBooking
         {
-            Entry = planner.BuildTimeEntry(allocation, hours, reduceRemaining, comment: note),
+            Entry = planner.BuildTimeEntry(allocation, CurrentOrganization, hours, reduceRemaining, comment: note),
         };
 
         TimeRecordResult result;
@@ -1982,29 +1982,28 @@ public sealed class AppState(
 
             var workItemId = bookings[0].Entry.WorkItemId;
 
-            if (WrongConnection(bookings[0].Entry) is { } elsewhere)
-            {
-                toasts.Error($"That booking on #{workItemId} is not from this organization", elsewhere);
-                return TimeWriteOutcome.Unconfirmed;
-            }
+            // Judged one booking at a time, inside the settle. A block can hold bookings made
+            // before and after an organization was switched, and taking the oldest one's
+            // answer for all of them put every later booking permanently out of reach.
+            var settled = await SettleBlockAsync(bookings);
 
-            var (landedMinutes, unsure, unpostedNote) = await SettleBlockAsync(bookings);
-
-            if (landedMinutes > 0)
-                toasts.Success($"{Ui.Hours(landedMinutes)} did go on #{workItemId}",
+            if (settled.LandedMinutes > 0)
+                toasts.Success($"{Ui.Hours(settled.LandedMinutes)} did go on #{workItemId}",
                     "It is recorded here now as well."
-                    + (unpostedNote ? " Its note is kept on the entry; it was not posted to the discussion." : ""));
+                    + (settled.UnpostedNote ? " Its note is kept on the entry; it was not posted to the discussion." : ""));
 
-            if (unsure > 0)
+            if (settled.Elsewhere is { } elsewhere)
+                toasts.Error($"That booking on #{workItemId} is not from this organization", elsewhere);
+            else if (settled.Unsure > 0)
                 toasts.Error($"Still cannot tell whether that time went on #{workItemId}",
                     "Azure DevOps could not be asked, or the change may still be on its way. Look at the work " +
                     "item itself, or check again in a few minutes. If it is not there, use \"Never went on\" to let it go.");
-            else if (landedMinutes == 0)
+            else if (settled.LandedMinutes == 0)
                 toasts.Info($"Nothing was booked on #{workItemId}",
                     "That time never reached the work item, so it can be recorded again.");
 
-            return unsure > 0 ? TimeWriteOutcome.Unconfirmed
-                : landedMinutes > 0 ? TimeWriteOutcome.Recorded
+            return settled.Unsure > 0 ? TimeWriteOutcome.Unconfirmed
+                : settled.LandedMinutes > 0 ? TimeWriteOutcome.Recorded
                 : TimeWriteOutcome.Failed;
         }
         catch (Exception ex)
@@ -2019,17 +2018,33 @@ public sealed class AppState(
     }
 
     /// <summary>
+    /// The Azure DevOps organization hours are being booked to at this moment: the address it
+    /// is reached at, and the id the service gives it once it has been read. Both are stamped
+    /// onto every entry, and both are what a later undo, check or settle judges by.
+    /// </summary>
+    public OrganizationRef CurrentOrganization =>
+        OrganizationRef.For(Settings.Ado.OrganizationUrl, ado.OrganizationId);
+
+    /// <summary>
     /// Why this entry's hours are not this connection's to act on, or null when they are.
     /// Work item numbers only mean anything within one organization, so an undo or a check
     /// run after switching would otherwise read, and change, a different item altogether.
+    ///
+    /// The way out is named as well as the refusal: an organization can be renamed or moved,
+    /// and after that there is no switching back to what no longer exists. Someone who knows
+    /// it is the same organization can say so from the Time tab, and everything works again.
     /// </summary>
     private string? WrongConnection(TimeEntry entry)
     {
-        if (entry.BelongsTo(planner.Organization)) return null;
+        if (entry.BelongsTo(CurrentOrganization)) return null;
 
         var where = entry.Organization.Length > 0 ? entry.Organization : entry.WorkItemUrl;
-        return $"It was booked against {where}, and Slate is connected to {planner.Organization} now. " +
-               "#" + entry.WorkItemId + " over there is a different work item. Switch back to settle it.";
+        var here = CurrentOrganization.Url is { Length: > 0 } url ? url : "somewhere else";
+
+        return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" was booked against {where}, and Slate is " +
+               $"connected to {here} now, where #{entry.WorkItemId} is a different work item. Switch back " +
+               "to settle it - or, if this is that same organization under a new address, say so from the " +
+               "Time tab and Slate will settle it here.";
     }
 
     /// <summary>
@@ -2041,6 +2056,11 @@ public sealed class AppState(
     /// Only once no send of it could still be arriving, so this can never be overtaken by the
     /// change landing a moment later; and the block is claimed first, so it cannot run beside
     /// a write of its own.
+    ///
+    /// Never for a booking made against another organization. This answer rests entirely on
+    /// the user having looked at the work item - and that is the one case where they cannot
+    /// have, because Slate is not connected to the organization the hours went to, and #7 over
+    /// here is a different work item altogether.
     /// </summary>
     public bool LetGoUnconfirmed(Guid allocationId)
     {
@@ -2054,6 +2074,12 @@ public sealed class AppState(
         {
             var bookings = planner.UnconfirmedForBlock(allocationId);
             if (bookings.Count == 0) return false;
+
+            if (bookings.Select(b => WrongConnection(b.Entry)).FirstOrDefault(why => why is not null) is { } elsewhere)
+            {
+                toasts.Error("That booking is not this organization's to let go", elsewhere);
+                return false;
+            }
 
             if (bookings.Any(b => !b.CanBeLetGo))
             {
@@ -2089,6 +2115,9 @@ public sealed class AppState(
     /// Without this, a booking Azure DevOps can never settle could only be let go - which
     /// leaves the block offering the same hours again, with them already on the work item.
     /// Nothing is written to Azure DevOps; this only writes down what is already there.
+    ///
+    /// Refused for another organization's booking for the same reason letting one go is: the
+    /// work item this claims to have looked at is not one this connection can even show.
     /// </summary>
     public bool FileUnconfirmed(Guid allocationId)
     {
@@ -2102,6 +2131,12 @@ public sealed class AppState(
         {
             var bookings = planner.UnconfirmedForBlock(allocationId);
             if (bookings.Count == 0) return false;
+
+            if (bookings.Select(b => WrongConnection(b.Entry)).FirstOrDefault(why => why is not null) is { } elsewhere)
+            {
+                toasts.Error("That booking is not this organization's to settle", elsewhere);
+                return false;
+            }
 
             // Same gate as letting one go: while a send could still be arriving, a check can
             // still settle it for certain, and that is better than anybody's reading of the
@@ -2135,6 +2170,156 @@ public sealed class AppState(
         }
     }
 
+    /// <summary>
+    /// Takes a block's unsettled bookings as this organization's after all, when the user says
+    /// so. The way out of the one refusal there is otherwise no way out of: an organization
+    /// that was renamed or moved has no old address left to switch back to, so without this
+    /// those hours could never be checked, answered for or undone again.
+    ///
+    /// It only re-stamps them. Nothing is written to Azure DevOps and nothing is settled - the
+    /// check and the two answers simply become available again, and they still decide.
+    /// </summary>
+    public bool AdoptOrganizationForBlock(Guid allocationId)
+    {
+        if (TryClaimBlock(allocationId) is { } refused)
+        {
+            toasts.Error("Could not move that booking over", refused);
+            return false;
+        }
+
+        try
+        {
+            var bookings = planner.UnconfirmedForBlock(allocationId);
+            if (bookings.Count == 0) return false;
+
+            var workItemId = bookings[0].Entry.WorkItemId;
+            if (planner.AdoptOrganization(allocationId, CurrentOrganization) == 0) return false;
+
+            toasts.Info($"That booking on #{workItemId} is this organization's now",
+                "Nothing was written to Azure DevOps. Check it, or answer for it, as usual.");
+
+            Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            ReleaseBlock(allocationId);
+        }
+    }
+
+    /// <summary>
+    /// The same for a filed entry, whose undo is what the organization stamp is refusing.
+    /// Claimed the way an undo of it is, so it cannot run beside one.
+    /// </summary>
+    public bool AdoptOrganizationForEntry(Guid entryId)
+    {
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not move that entry over", RestartingForUpdate);
+            return false;
+        }
+
+        lock (_undoingEntries)
+        {
+            if (!_undoingEntries.Add(entryId))
+            {
+                EndWrite();
+                return false;
+            }
+        }
+
+        try
+        {
+            if (planner.FindTimeEntry(entryId) is not { } entry) return false;
+            if (!planner.AdoptOrganizationForEntry(entryId, CurrentOrganization)) return false;
+
+            toasts.Info($"Those hours on #{entry.WorkItemId} are this organization's now",
+                "Nothing was written to Azure DevOps. Undo works on them again.");
+
+            Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            lock (_undoingEntries) _undoingEntries.Remove(entryId);
+            EndWrite();
+        }
+    }
+
+    /// <summary>
+    /// Answers for an undo Azure DevOps never confirmed, when the user has the work item in
+    /// front of them: it went through, so the entry goes, or it did not, so the entry stands
+    /// and the pin is let go.
+    ///
+    /// Without this an undo stuck at "cannot tell" left its entry permanently un-undoable -
+    /// every Undo of it stopped at the same unanswerable question. Nothing is written to Azure
+    /// DevOps either way; this only writes down what the work item already says.
+    ///
+    /// Gated like the booking answers: only once no send of it could still be arriving, and
+    /// never for another organization's hours, which are the ones the user cannot have looked
+    /// at from here.
+    /// </summary>
+    public bool AnswerUnconfirmedUndo(Guid entryId, bool wentThrough)
+    {
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not settle that undo", RestartingForUpdate);
+            return false;
+        }
+
+        lock (_undoingEntries)
+        {
+            if (!_undoingEntries.Add(entryId))
+            {
+                EndWrite();
+                toasts.Error("Could not settle that undo", "That entry is already being undone.");
+                return false;
+            }
+        }
+
+        try
+        {
+            if (planner.FindTimeEntry(entryId) is not { UnconfirmedUndo: { } plan } entry) return false;
+
+            if (WrongConnection(entry) is { } elsewhere)
+            {
+                toasts.Error("That undo is not this organization's to settle", elsewhere);
+                return false;
+            }
+
+            if (plan.CouldStillLand)
+            {
+                toasts.Error("Too soon to settle that undo by hand",
+                    "It was sent only moments ago and could still be arriving. Give it five minutes and undo " +
+                    "again - Azure DevOps may yet answer for it.");
+                return false;
+            }
+
+            if (!planner.SettleUnconfirmedUndo(entryId, plan, wentThrough)) return false;
+
+            if (wentThrough)
+            {
+                toasts.Success($"The undo of {entry.Hours:0.##}h on #{entry.WorkItemId} is settled",
+                    "Taken as gone through because you said the work item no longer has those hours. Nothing " +
+                    "was written to Azure DevOps.");
+                _ = RefreshWorkItemAsync(entry.WorkItemId);
+            }
+            else
+            {
+                toasts.Info($"The undo of {entry.Hours:0.##}h on #{entry.WorkItemId} never went through",
+                    "The entry stands, and Undo works on it again.");
+            }
+
+            Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            lock (_undoingEntries) _undoingEntries.Remove(entryId);
+            EndWrite();
+        }
+    }
+
     private bool _settledUnconfirmed;
 
     /// <summary>
@@ -2146,10 +2331,11 @@ public sealed class AppState(
     /// </summary>
     private async Task SettleUnconfirmedQuietlyAsync()
     {
+        var organization = CurrentOrganization;
         var landedMinutes = 0;
 
         foreach (var group in planner.UnconfirmedBookings
-                     .Where(b => b.Entry.BelongsTo(planner.Organization))
+                     .Where(b => b.Entry.BelongsTo(organization))
                      .GroupBy(b => b.Entry.AllocationId).ToList())
         {
             // A block being booked or checked right now is left to whatever is doing it.
@@ -2178,7 +2364,7 @@ public sealed class AppState(
         // item numbers mean something else here.
         var undoneMinutes = 0;
         foreach (var entry in planner.TimeEntries
-                     .Where(e => e.UnconfirmedUndo is not null && e.BelongsTo(planner.Organization)).ToList())
+                     .Where(e => e.UnconfirmedUndo is not null && e.BelongsTo(organization)).ToList())
         {
             if (!TryBeginWrite()) break;
 
@@ -2198,18 +2384,21 @@ public sealed class AppState(
                 if (entry.UnconfirmedUndo is not { } plan) continue;
 
                 var (landed, _) = await ado.CheckTimeWriteAsync(plan);
-                if (landed is true)
+                if (landed is null) continue;
+
+                // The pin is tested again, inside the same lock that acts on it. Reading it
+                // before the await is not enough: a manual undo of another entry of this work
+                // item can land while this check is out and sweep this pin away - which says
+                // this undo did not land, whatever the check thought it saw. Two entries
+                // pinned to one revision and describing the same change are ordinary, not
+                // exotic, and dropping both would leave an hour on the work item with nothing
+                // here pointing at it. Landed, the removal and the sweep go in one save.
+                if (!planner.SettleUnconfirmedUndo(entry.Id, plan, landed.Value)) continue;
+
+                if (landed.Value)
                 {
-                    // The sweep goes with the removal, in one save: this undo became the
-                    // revision after the one it was pinned to, so every other change pinned
-                    // there is out of the running and must not later claim it as its own.
-                    planner.RemoveTimeEntry(entry.Id, plan);
                     undoneMinutes += entry.Minutes;
                     _ = RefreshWorkItemAsync(entry.WorkItemId);
-                }
-                else if (landed is false)
-                {
-                    planner.SetUnconfirmedUndo(entry.Id, null);
                 }
             }
             catch (Exception)
@@ -2231,14 +2420,22 @@ public sealed class AppState(
     }
 
     /// <summary>
+    /// What came of settling one block's unconfirmed bookings. <see cref="Elsewhere"/> is the
+    /// reason the first booking from another organization could not be looked at, when there
+    /// was one; those are counted in <see cref="Unsure"/> as well, because nothing about them
+    /// has been settled either.
+    /// </summary>
+    private sealed record BlockSettlement(int LandedMinutes, int Unsure, string? Elsewhere, bool UnpostedNote);
+
+    /// <summary>
     /// Settles what can be settled of one block's unconfirmed bookings. The caller claims the
     /// block first, so nothing else books or checks it meanwhile.
     /// </summary>
-    private async Task<(int LandedMinutes, int Unsure, bool UnpostedNote)> SettleBlockAsync(
-        IReadOnlyList<UnconfirmedBooking> bookings)
+    private async Task<BlockSettlement> SettleBlockAsync(IReadOnlyList<UnconfirmedBooking> bookings)
     {
         var landedMinutes = 0;
         var unsure = 0;
+        string? elsewhere = null;
         var unpostedNote = false;
 
         foreach (var booking in bookings)
@@ -2249,8 +2446,9 @@ public sealed class AppState(
 
             // Somebody else's #7. Left standing rather than guessed at, and counted as
             // unsettled so nothing offers the block as free to book.
-            if (!booking.Entry.BelongsTo(planner.Organization))
+            if (WrongConnection(booking.Entry) is { } why)
             {
+                elsewhere ??= why;
                 unsure++;
                 continue;
             }
@@ -2274,7 +2472,7 @@ public sealed class AppState(
         }
 
         Changed?.Invoke();
-        return (landedMinutes, unsure, unpostedNote);
+        return new BlockSettlement(landedMinutes, unsure, elsewhere, unpostedNote);
     }
 
     /// <summary>
@@ -2363,12 +2561,14 @@ public sealed class AppState(
                     return false;
                 }
 
-                if (landed.Value)
+                // Removed and swept in one save, against the very pin it was judged by: that
+                // undo became the revision after the one it was pinned to, so nothing else
+                // pinned there can have landed, and anything still waiting to be checked there
+                // must not claim it. The pin is tested inside that same save because another
+                // undo of this work item can have landed and swept it while this check was
+                // out - and that says this one did not land, whatever the check saw.
+                if (landed.Value && planner.SettleUnconfirmedUndo(entry.Id, earlier, landed: true))
                 {
-                    // Removed and swept in one save: that undo became the revision after the
-                    // one it was pinned to, so nothing else pinned there can have landed, and
-                    // anything still waiting to be checked there must not claim it.
-                    planner.RemoveTimeEntry(entry.Id, earlier);
                     toasts.Success($"Undid {entry.Hours:0.##}h on #{entry.WorkItemId}",
                         "The earlier undo had gone through after all, so nothing more was taken off.");
                     Changed?.Invoke();
@@ -2376,7 +2576,7 @@ public sealed class AppState(
                     return true;
                 }
 
-                planner.SetUnconfirmedUndo(entry.Id, null);
+                planner.SettleUnconfirmedUndo(entry.Id, earlier, landed: false);
             }
 
             // Entries written before the applied amounts were recorded fall back to the
