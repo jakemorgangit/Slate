@@ -136,7 +136,7 @@ The **Plan** tab is a week grid with your work items down the left.
 | More actions | Right-click a calendar block: record time, edit, duplicate, send, delete |
 | Record time | Right-click a block → **Record time…**, or the button in the inspector — with an optional note that posts to the discussion |
 | Record a whole day | Click the hours in a day's header, **Record today** in the toolbar, or <kbd>Ctrl</kbd>+<kbd>R</kbd> — one dialog, every block, editable hours per row |
-| Undo recorded time | Right-click the same block → **Undo recorded time**, or Undo in the Time tab |
+| Undo recorded time | Right-click the same block → **Undo recorded time**, or Undo in the Time tab — with the option to remove the note it posted too |
 | Set a priority | Right-click a work item or block → **Your triage** stays here, **Azure DevOps** writes back |
 | Change the status | Open the work item and pick a state, or set one while recording time |
 | Raise new work | **New work item** on the Work items tab, or **＋** above the Plan sidebar |
@@ -222,8 +222,8 @@ The dialog also takes an optional **note**, which is posted to the work item's *
 Azure DevOps — Plain or Markdown, the same picker the comment box uses, remembering whichever you
 used last. Leave it empty and nothing is posted. The hours are the point of the operation and are
 already written by the time the note goes out, so a discussion that refuses the note says so and
-leaves the booking standing rather than unwinding a good write over a failed extra. Undoing the
-entry later takes the hours back off the work item but does not retract the comment.
+leaves the booking standing rather than unwinding a good write over a failed extra. Slate keeps
+the id of the comment it posted, so undoing those hours can offer to take the note off with them.
 
 ### The Time tab
 
@@ -243,6 +243,31 @@ below it grouped by day](docs/screenshots/03-time.png)
 
 Undo is also on the calendar block's right-click menu, which reverses the most recent booking
 made from that block.
+
+Either way it asks first, with **Also remove the note from the work item's discussion** ticked:
+a note saying what the time went on is misleading once the hours are gone. The hours come off
+first and the comment only afterwards, so a delete Azure DevOps refuses is reported on its own
+and never puts the booking back. The tick is only offered when Slate knows which comment it
+posted and which project it went under, and the entry belongs to the organization you are
+connected to; otherwise the dialog says why there is nothing it can remove. An undo Azure DevOps
+could not confirm removes nothing — the hours may still be on the work item, and the note with
+them.
+
+Recording a whole day posts a work item's note once however many of its blocks are booked, and
+every one of those entries carries that comment — so the note comes off with the **last** of the
+hours it covers. Undo one of them while the others stand and the dialog names what the note also
+speaks for and leaves the tick off; you can still tick it, knowing what it leaves behind, and
+the entries left over stop claiming a comment that has gone. Days recorded by an earlier version
+of Slate did not write the comment down on every block of them, so there the dialog says the note
+cannot be removed rather than offering to.
+
+The same question is asked wherever an entry is dropped. An undo Azure DevOps never confirmed
+leaves two answers on the Time tab: **The undo did go through** drops the entry, so it asks and
+offers the same tick — that entry may be the last record of which comment the note was — while
+**It never went through** changes nothing but the pin and asks nothing. The one entry that goes
+without asking is one Slate settles by itself in the background: when it finds an unconfirmed
+undo really did land, the entry goes and the note stays. Nobody is there to be asked, and nothing
+is claimed about the comment.
 
 ### Recording a whole day
 

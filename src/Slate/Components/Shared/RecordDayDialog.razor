@@ -265,11 +265,18 @@
     private bool _checking;
 
     /// <summary>
-    /// The work items a note has already gone to in this opening, with the note that went.
-    /// Kept across retries, so neither a second block of the same item nor a retried row
-    /// posts the same comment to a discussion twice - while an edited note is still new.
+    /// The work items a note has already gone to in this opening, with the note that went and
+    /// the comment it became. Kept across retries, so neither a second block of the same item
+    /// nor a retried row posts the same comment to a discussion twice - while an edited note
+    /// is still new.
+    ///
+    /// Being in here at all is what says a note has been sent; the comment beside it is null
+    /// when the discussion turned it down, which is a note not to send it again rather than
+    /// one to send it now. The comment goes to every later row of the same item so each entry
+    /// is written down carrying it, and the note only leaves the discussion with the last of
+    /// the hours it covers.
     /// </summary>
-    private readonly HashSet<(int WorkItemId, string Note)> _notePosted = [];
+    private readonly Dictionary<(int WorkItemId, string Note), TimeNote?> _notePosted = new();
 
     private int SelectedCount => _rows.Count(r => r.Selected);
     private int SelectedMinutes => (int)Math.Round(_rows.Where(r => r.Selected).Sum(r => r.Hours) * 60);
@@ -509,18 +516,21 @@
                     continue;
                 }
 
-                // One comment per work item, however many of its blocks are booked.
-                var postNote = !string.IsNullOrWhiteSpace(note) && !_notePosted.Contains((row.WorkItemId, note));
+                // One comment per work item, however many of its blocks are booked - and the
+                // rest of them are written down carrying that same comment, so it is only
+                // taken off the discussion with the last of the hours it speaks for.
+                var sent = _notePosted.TryGetValue((row.WorkItemId, note), out var shared);
+                var postNote = !string.IsNullOrWhiteSpace(note) && !sent;
 
-                var (outcome, error) = await State.RecordTimeSilentAsync(
-                    allocation, row.Hours, _reduceRemaining, note, noteFormat, postNote);
+                var (outcome, error, posted) = await State.RecordTimeSilentAsync(
+                    allocation, row.Hours, _reduceRemaining, note, noteFormat, postNote, shared);
 
                 if (outcome == TimeWriteOutcome.Recorded)
                 {
                     // Counted as sent even if the discussion turned it down: that has already
                     // been reported, and trying again on the item's next block could double it
                     // up if the first one did land after all.
-                    if (postNote) _notePosted.Add((row.WorkItemId, note));
+                    if (postNote) _notePosted[(row.WorkItemId, note)] = posted;
 
                     row.Status = RowStatus.Recorded;
                     row.Selected = false;

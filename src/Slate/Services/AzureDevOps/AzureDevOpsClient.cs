@@ -134,7 +134,29 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     }
 
     private async Task<JsonDocument> SendAsync(
-        HttpMethod method, string url, object? body, CancellationToken ct, string? contentType = null)
+        HttpMethod method, string url, object? body, CancellationToken ct, string? contentType = null) =>
+        ReadAnswer(await SendForPayloadAsync(method, url, body, ct, contentType));
+
+    /// <summary>
+    /// The same send with nothing read back, for a request whose answer is the status alone -
+    /// a delete, which Azure DevOps replies to with an empty body. Parsing that as JSON would
+    /// report a delete that plainly worked as an answer this app could not read.
+    ///
+    /// Nothing read back is not nothing checked: the sign-in page a rejected credential is
+    /// answered 2xx with is turned away inside the send itself, so this is no more willing to
+    /// call a request a success than any other here.
+    /// </summary>
+    private async Task SendNoAnswerAsync(HttpMethod method, string url, CancellationToken ct) =>
+        await SendForPayloadAsync(method, url, null, ct, null);
+
+    /// <summary>
+    /// The request itself, up to and including how a failure is classified: the silent token
+    /// renewal, the transport failures that leave a write in doubt, and the service's own
+    /// refusals. What comes back is the body as it arrived, for the caller to make what it
+    /// can of.
+    /// </summary>
+    private async Task<string> SendForPayloadAsync(
+        HttpMethod method, string url, object? body, CancellationToken ct, string? contentType)
     {
         // A 401 on a signed-in account usually means the cached token went stale while the
         // machine slept. One silent renewal is tried before calling the credential bad.
@@ -174,7 +196,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
                 continue;
             }
 
-            return await ReadAsync(response, ct);
+            return await ReadPayloadAsync(response, ct);
         }
     }
 
@@ -206,7 +228,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         status is HttpStatusCode.RequestTimeout
         || ((int)status >= 500 && status != HttpStatusCode.ServiceUnavailable);
 
-    private static async Task<JsonDocument> ReadAsync(HttpResponseMessage response, CancellationToken ct)
+    private static async Task<string> ReadPayloadAsync(HttpResponseMessage response, CancellationToken ct)
     {
         using (response)
         {
@@ -221,23 +243,37 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
                     ErrorKey = ReadErrorKey(payload),
                 };
 
-            // A sign-in redirect comes back as 200 plus HTML, which means the credential was rejected.
+            // A sign-in redirect comes back as 200 plus HTML, which means the credential was
+            // rejected and nothing was done. Judged on every answer rather than only on the
+            // ones read as data: a request whose answer is its status alone - a delete - would
+            // otherwise take that very page for the one 2xx nobody looks inside, and report a
+            // comment as removed while it is still on the discussion.
             if (payload.StartsWith('<'))
                 throw new AzureDevOpsException(
-                    "Azure DevOps returned a sign-in page instead of data. The token is likely expired or lacks the Work Items (Read) scope.");
+                    "Azure DevOps returned a sign-in page instead of an answer. The token is likely expired or lacks the Work Items scope this needs.");
 
-            try
-            {
-                return JsonDocument.Parse(payload);
-            }
-            catch (JsonException ex)
-            {
-                // The service said yes, so a write did happen - it is only the account of it
-                // that is missing.
-                throw new AzureDevOpsException(
-                    "Azure DevOps returned a response this app could not read. " + ex.Message, ex)
-                { Unanswered = true };
-            }
+            return payload;
+        }
+    }
+
+    /// <summary>
+    /// Makes a document of an answer that was asked for as data. Whether the body is an answer
+    /// at all is already settled by <see cref="ReadPayloadAsync"/>; all that is left here is
+    /// reading it.
+    /// </summary>
+    private static JsonDocument ReadAnswer(string payload)
+    {
+        try
+        {
+            return JsonDocument.Parse(payload);
+        }
+        catch (JsonException ex)
+        {
+            // The service said yes, so a write did happen - it is only the account of it
+            // that is missing.
+            throw new AzureDevOpsException(
+                "Azure DevOps returned a response this app could not read. " + ex.Message, ex)
+            { Unanswered = true };
         }
     }
 
@@ -873,7 +909,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     public async Task<List<WorkItemComment>> GetCommentsAsync(
         int id, string project, CancellationToken ct = default)
     {
-        var scope = string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);
+        var scope = CommentScope(project);
         if (string.IsNullOrWhiteSpace(scope))
             throw new AzureDevOpsException("A project is needed to read the discussion.");
 
@@ -901,7 +937,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         if (string.IsNullOrWhiteSpace(html))
             throw new AzureDevOpsException("Write something first.");
 
-        var scope = string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);
+        var scope = CommentScope(project);
         if (string.IsNullOrWhiteSpace(scope))
             throw new AzureDevOpsException("A project is needed to add to the discussion.");
 
@@ -911,6 +947,56 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
 
         return ReadComment(doc.RootElement);
     }
+
+    /// <summary>
+    /// Removes one comment from a work item's discussion, for taking back the note a booking
+    /// left when those hours are undone. Needs the Work Items (Read &amp; Write) scope, like
+    /// adding one.
+    ///
+    /// A 404 is neither a failure nor a removal, so it comes back as an answer of its own
+    /// rather than as silence. It is how Azure DevOps replies for a comment already gone - one
+    /// deleted in the browser, by a colleague, or by an earlier send of this whose answer never
+    /// came back - but it is equally how it replies when the address finds no such project or
+    /// work item, which a work item moved between projects and a project renamed since the note
+    /// went on will both produce. Telling the caller which of the two it was would take another
+    /// read of the discussion; telling it plainly that nothing was removed costs nothing and is
+    /// true either way.
+    ///
+    /// The project is taken as given, with no falling back to the selected one the way reading
+    /// and adding do: the point of a delete is not to guess what it lands on, and the project a
+    /// comment was posted under is kept beside its id for exactly this.
+    /// </summary>
+    public async Task<CommentRemoval> DeleteCommentAsync(
+        int id, string project, int commentId, CancellationToken ct = default)
+    {
+        if (commentId <= 0) throw new AzureDevOpsException("That note has no comment to remove.");
+
+        if (string.IsNullOrWhiteSpace(project))
+            throw new AzureDevOpsException(
+                "Slate did not write down which project that note was posted under, so it cannot address the comment.");
+
+        try
+        {
+            await SendNoAnswerAsync(HttpMethod.Delete,
+                $"{OrgUrl}/{Uri.EscapeDataString(project)}/_apis/wit/workItems/{id}/comments/{commentId}?api-version={CommentsApiVersion}",
+                ct);
+
+            return CommentRemoval.Removed;
+        }
+        catch (AzureDevOpsException ex) when (ex.Status == HttpStatusCode.NotFound)
+        {
+            return CommentRemoval.NotThere;
+        }
+    }
+
+    /// <summary>
+    /// The project segment the discussion is read and added to through: the one asked for, or
+    /// the selected project when nothing was. Empty when neither says anything, which both
+    /// callers refuse rather than sending an address with a hole in it. Removing a comment does
+    /// not come through here - see <see cref="DeleteCommentAsync"/>.
+    /// </summary>
+    private string CommentScope(string project) =>
+        string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);
 
     private static WorkItemComment ReadComment(JsonElement element) => new(
         element.TryGetProperty("id", out var id) ? id.GetInt32() : 0,

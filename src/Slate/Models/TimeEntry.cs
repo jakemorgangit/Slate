@@ -70,11 +70,37 @@ public sealed class TimeEntry
 
     /// <summary>
     /// The note posted to the work item's discussion when this time was booked, as it was
-    /// typed. Kept so the entry can say what the hours went on. Undoing the entry does not
-    /// retract the comment - a discussion is a record of what was said at the time, and
-    /// quietly deleting from it would lose somebody else's reply along with it.
+    /// typed. Kept so the entry can say what the hours went on.
     /// </summary>
     public string Comment { get; set; } = "";
+
+    /// <summary>
+    /// The id Azure DevOps gave that note in the work item's discussion, so undoing these
+    /// hours can offer to take the comment off with them: hours reversed while the note that
+    /// went with them still stands reads as work that was done.
+    ///
+    /// One comment can be several entries' note. A day booked in one pass posts a work item's
+    /// note once however many of its blocks are booked, and from this version on every entry it
+    /// covers is given the same id - so the note comes off with the last of the hours it speaks
+    /// for rather than with whichever happened to post it. The undo that finds others still
+    /// carrying the id says what the comment also stands for before offering to delete it.
+    ///
+    /// Zero whenever there is nothing here to remove with, which is not the same as there being
+    /// no note: an entry written before this was kept has the text and no id, so does one
+    /// written while only the posting entry was given it, so does one whose note never reached
+    /// the discussion, and so does one whose comment has already gone with an earlier undo of
+    /// another block the same note covered.
+    /// </summary>
+    public int CommentId { get; set; }
+
+    /// <summary>
+    /// The project the comment was posted under. The comments API is project-scoped and the
+    /// project used is not always the one on the block - an empty one falls back to whatever
+    /// project is selected - so it is kept as it was used rather than worked out again at the
+    /// undo, by which time the selection may have moved on and the address would name a
+    /// project the comment was never in.
+    /// </summary>
+    public string CommentProject { get; set; } = "";
 
     /// <summary>
     /// An undo of this entry that Azure DevOps never confirmed, kept with what was sent so the
@@ -212,6 +238,17 @@ public sealed record OrganizationRef(string Url, string Id)
     public static OrganizationRef For(string organizationUrl, string id) =>
         new(TimeEntry.NormaliseOrganization(organizationUrl), id.Trim());
 }
+
+/// <summary>
+/// The comment a booking's note was posted as, and the project it went under - between them,
+/// everything it takes to address it again.
+///
+/// Handed from the booking that posted a note to the rest of a batch that shares it, so every
+/// entry the one comment covers is written down carrying it. Never a default value: a note
+/// posted to no project could not be addressed at all, so "nothing posted" is a null of this
+/// rather than an instance saying nothing.
+/// </summary>
+public readonly record struct TimeNote(int CommentId, string Project);
 
 /// <summary>How a time write ended, as far as it can be told.</summary>
 public enum TimeWriteOutcome
