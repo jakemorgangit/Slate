@@ -4,7 +4,10 @@ using Slate.Models;
 
 namespace Slate.Services.Storage;
 
-/// <summary>Persists the set of time allocations. Writes are debounced and atomic.</summary>
+/// <summary>
+/// Persists the set of time allocations. Writes are atomic, and go through
+/// <see cref="DataFolder"/> so an update can hold them back while its new copy starts.
+/// </summary>
 public sealed class PlanStore
 {
     private static readonly JsonSerializerOptions Json = new()
@@ -111,10 +114,18 @@ public sealed class PlanStore
         }
     }
 
-    public void Save()
-    {
-        AppPaths.EnsureCreated();
+    public void Save() => DataFolder.Write(AppPaths.PlanFile, WriteFile);
 
+    /// <summary>
+    /// Writes the plan as it stands when this runs rather than as it stood when the save was
+    /// asked for, so a save held back while an update was starting still writes the newest
+    /// plan if the update is undone. Two threads cannot both be writing the one temp path and
+    /// promote each other's half-finished file over the plan: <see cref="DataFolder"/> makes
+    /// its writes one at a time.
+    /// </summary>
+    private void WriteFile()
+    {
+        string json;
         lock (_gate)
         {
             var current = Cached;
@@ -127,11 +138,9 @@ public sealed class PlanStore
                 Disowned = [.. current.Disowned],
             };
 
-            // Serializing inside the lock as well, so two threads cannot both be writing the
-            // one temp path and promote each other's half-finished file over the plan.
-            var temp = AppPaths.PlanFile + ".tmp";
-            File.WriteAllText(temp, JsonSerializer.Serialize(snapshot, Json));
-            File.Move(temp, AppPaths.PlanFile, overwrite: true);
+            json = JsonSerializer.Serialize(snapshot, Json);
         }
+
+        DataFolder.Replace(AppPaths.PlanFile, json);
     }
 }

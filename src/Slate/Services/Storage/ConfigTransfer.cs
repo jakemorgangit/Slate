@@ -125,7 +125,9 @@ public sealed class ConfigTransfer(SettingsStore store)
         if (applied.Count == 0)
             return new ImportResult(false, "That file did not contain any recognised settings.", []);
 
-        store.Save(settings);
+        if (!store.Save(settings))
+            return new ImportResult(false, WriteGate.ClosedReason, []);
+
         return new ImportResult(true, "Settings imported.", applied);
     }
 

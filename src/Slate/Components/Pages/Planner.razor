@@ -110,9 +110,13 @@
 
                 if (_visibleItems.Count == 0)
                 {
+                    @* Nothing loaded at all is not the same as a query that came back empty -
+                       after a change of connection there is no list until the new one loads. *@
                     <div class="empty-state" style="padding: 28px 12px">
                         <span class="glyph">◔</span>
-                        <p>@(State.WorkItems.Count == 0 ? "No work items came back from that query." : "Nothing matches these filters.")</p>
+                        <p>@(State.WorkItems.Count > 0 ? "Nothing matches these filters."
+                             : State.WorkItemsLoadedAt is null ? "Nothing loaded yet. Press ⟳ to load your work items."
+                             : "No work items came back from that query.")</p>
                     </div>
                 }
                 else
@@ -391,10 +395,10 @@
                                  Conflict="@State.HasConflict(selected.Start, selected.End)"
                                  SlotMinutes="SlotMinutes"
                                  OnClose="CloseInspector"
-                                 OnDurationChanged="m => Plan.Resize(selected.Id, m)"
-                                 OnNotesChanged="n => Plan.UpdateNotes(selected.Id, n)"
+                                 OnDurationChanged="m => ResizeBlock(selected.Id, m)"
+                                 OnNotesChanged="n => UpdateNotes(selected.Id, n)"
                                  OnDelete="() => DeleteAllocation(selected.Id)"
-                                 OnDetach="() => Plan.Detach(selected.Id)"
+                                 OnDetach="() => DetachBlock(selected.Id)"
                                  OnSendNow="() => SendOneAsync(selected.Id)"
                                  OnForget="() => ForgetBlock(selected)"
                                  Recorded="@Plan.RecordedMinutesForBlock(selected.Id)"
@@ -776,8 +780,13 @@
     {
         // A drag still held when an update began handing over lands on a plan that the new
         // copy may already have read, so it would be lost; better it visibly does nothing.
-        if (State.IsHandingOver) return;
+        // Counted rather than just checked, so a handover starting mid-drop waits for it.
+        State.TryEdit(() => Drop(kind, id, day, slotIndex, copy));
+        InvokeAsync(StateHasChanged);
+    }
 
+    private void Drop(string kind, string id, string day, int slotIndex, bool copy)
+    {
         if (!DateTime.TryParseExact(day, "yyyy-MM-dd", CultureInfo.InvariantCulture,
                 DateTimeStyles.None, out var date))
             return;
@@ -817,8 +826,6 @@
                 if (Plan.Find(allocationId) is { } moved) WarnIfConflict(moved);
             }
         }
-
-        InvokeAsync(StateHasChanged);
     }
 
     /// <summary>Opens the schedule dialog: next free gap, or a time of your choosing.</summary>
@@ -840,12 +847,22 @@
 
     // ---------------------------------------------------------------- allocation actions
 
+    // Every change to a block is made through State.TryEdit: counted, so an update starting at
+    // the same moment waits for it, and refused once one has begun, when the new copy may
+    // already have read the plan. A refused edit visibly does nothing.
+
     private void DeleteAllocation(Guid id)
     {
-        Plan.Remove(id);
+        if (!State.TryEdit(() => Plan.Remove(id))) return;
         State.SelectAllocation(null);
         _inspectorOpen = false;
     }
+
+    private void ResizeBlock(Guid id, int minutes) => State.TryEdit(() => Plan.Resize(id, minutes));
+
+    private void UpdateNotes(Guid id, string notes) => State.TryEdit(() => Plan.UpdateNotes(id, notes));
+
+    private void DetachBlock(Guid id) => State.TryEdit(() => Plan.Detach(id));
 
     private async Task SendOneAsync(Guid id)
     {
@@ -855,14 +872,23 @@
             return;
         }
 
-        if (await State.SyncOneAsync(id))
+        switch (await State.SyncOneAsync(id))
         {
-            Toasts.Success("Sent to Outlook");
-            await State.LoadEventsAsync();
-        }
-        else
-        {
-            Toasts.Error("Could not send that block", Plan.Find(id)?.LastError);
+            case AppState.SentOne.Sent:
+                Toasts.Success("Sent to Outlook");
+                await State.LoadEventsAsync();
+                break;
+
+            case AppState.SentOne.Refused:
+                Toasts.Error("Could not send that block", AppState.RestartingForUpdate);
+                break;
+
+            default:
+                // The block carries why it failed - unless it is no longer in the plan at all,
+                // which is the other way a send comes back with nothing to show for itself.
+                Toasts.Error("Could not send that block",
+                    Plan.Find(id)?.LastError ?? "That block is no longer in the plan.");
+                break;
         }
     }
 
@@ -881,15 +907,19 @@
         // Growing a block downwards can reach an existing calendar entry just as dropping one
         // can, so it is refused the same way rather than quietly booking over a meeting. A
         // resize finished during an update's handover is refused like a drop (see above).
-        var allocation = Plan.Find(id);
-        if (State.IsHandingOver
-            || allocation is not null && Reject(allocation.Start, allocation.Start.AddMinutes(minutes)))
+        var resized = false;
+        State.TryEdit(() =>
         {
-            InvokeAsync(StateHasChanged);
-            return;
-        }
+            var allocation = Plan.Find(id);
+            if (allocation is not null && Reject(allocation.Start, allocation.Start.AddMinutes(minutes))) return;
 
-        Plan.Resize(id, minutes);
+            Plan.Resize(id, minutes);
+            resized = true;
+        });
+
+        // Anything short of a resize has to redraw the block at its real size: the drag left
+        // it stretched, and nothing in the plan changed to redraw it otherwise.
+        if (!resized) InvokeAsync(StateHasChanged);
     }
 
     [JSInvokable]
@@ -902,26 +932,36 @@
 
     private void ToggleBusyOverlay()
     {
-        var settings = Settings.Current;
-        settings.Planning.ShowExistingEvents = !settings.Planning.ShowExistingEvents;
+        // Through Update, which is turned away before anything changes if an update is
+        // taking over, rather than editing the live settings and then being refused the save.
+        var saved = Settings.Update(settings =>
+        {
+            settings.Planning.ShowExistingEvents = !settings.Planning.ShowExistingEvents;
 
-        // Now it is a decision made with the calendar in front of you, so it stands.
-        settings.Planning.OverlayChosen = true;
-        Settings.Save(settings);
-        _ = State.LoadEventsAsync();
+            // Now it is a decision made with the calendar in front of you, so it stands.
+            settings.Planning.OverlayChosen = true;
+        });
+
+        if (saved) _ = State.LoadEventsAsync();
+        else Toasts.Error("Could not change what the calendar shows", AppState.RestartingForUpdate);
     }
 
     private void ToggleDensity()
     {
-        var settings = Settings.Current;
-        settings.Ui.CompactDensity = !settings.Ui.CompactDensity;
-        Settings.Save(settings);
+        if (!Settings.Update(settings => settings.Ui.CompactDensity = !settings.Ui.CompactDensity))
+            Toasts.Error("Could not change the density", AppState.RestartingForUpdate);
     }
 
     private void ClearWeek()
     {
-        var count = Plan.InRange(State.WeekStart, State.WeekStart.AddDays(7)).Count();
-        Plan.ClearRange(State.WeekStart, State.WeekStart.AddDays(7));
+        var count = 0;
+        var cleared = State.TryEdit(() =>
+        {
+            count = Plan.InRange(State.WeekStart, State.WeekStart.AddDays(7)).Count();
+            Plan.ClearRange(State.WeekStart, State.WeekStart.AddDays(7));
+        });
+        if (!cleared) return;
+
         State.SelectAllocation(null);
         Toasts.Info($"Cleared {count} block(s)",
             State.ShowOutlook ? "Press Send to Outlook to remove the matching events." : "");
@@ -1009,7 +1049,7 @@
     /// <summary>Sets the in-app priority. Zero clears it. Never leaves this machine.</summary>
     private void SetPriority(int workItemId, int priority)
     {
-        Plan.SetLocalPriority(workItemId, priority);
+        State.TryEdit(() => Plan.SetLocalPriority(workItemId, priority));
         CloseMenu();
     }
 
@@ -1061,7 +1101,9 @@
     private void DuplicateBlock(Allocation allocation)
     {
         CloseMenu();
-        var copy = Plan.Duplicate(allocation.Id, allocation.Start.AddMinutes(allocation.DurationMinutes));
+
+        Allocation? copy = null;
+        State.TryEdit(() => copy = Plan.Duplicate(allocation.Id, allocation.Start.AddMinutes(allocation.DurationMinutes)));
         if (copy is not null) State.SelectAllocation(copy.Id);
     }
 
@@ -1074,7 +1116,8 @@
     private void ForgetBlock(Allocation allocation)
     {
         CloseMenu();
-        Plan.ForgetMissing(allocation.Id);
+        if (!State.TryEdit(() => Plan.ForgetMissing(allocation.Id))) return;
+
         State.SelectAllocation(null);
         Toasts.Info("Removed from the plan", "The Outlook event was already gone.");
     }

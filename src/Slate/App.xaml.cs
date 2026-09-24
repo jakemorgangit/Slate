@@ -41,6 +41,7 @@ public partial class App : Application
         });
 
         // Storage + settings
+        services.AddSingleton<WriteGate>();
         services.AddSingleton<SecretProtector>();
         services.AddSingleton<SettingsStore>();
         services.AddSingleton<PlanStore>();
@@ -66,12 +67,69 @@ public partial class App : Application
 
         DispatcherUnhandledException += OnDispatcherUnhandledException;
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
             CrashLog.Write(args.ExceptionObject as Exception);
+            SelfUpdater.SettleBeforeExit("Slate crashed");
+        };
+        // Deliberately not ProcessExit as well. The three above reach every way this copy ends
+        // that runs any code at all - signing out, shutting down, and a crash - and ProcessExit
+        // is the one the runtime may cut short part way through, which for an update being put
+        // back means part way through renaming the .exe.
         TaskScheduler.UnobservedTaskException += (_, args) =>
         {
             CrashLog.Write(args.Exception);
             args.SetObserved();
         };
+    }
+
+    // ---------------------------------------------------------------- ending mid-update
+
+    /// <summary>
+    /// Signing out or shutting down ends this copy whatever the window says: WPF shuts down
+    /// straight after this returns, ignoring a refused close, and Windows may end the process
+    /// the moment it has answered. An update still waiting on its new copy is settled here and
+    /// now, before answering, rather than on the way out when there may be no time left.
+    ///
+    /// Windows is counting the seconds this takes - it offers to end an app that has not
+    /// answered in about five - so the settling is told to be quick about it, which is what
+    /// keeps it well inside that and out of being ended part way through putting the .exe back.
+    /// Quick about it includes giving up on a settling another thread is already doing rather
+    /// than queueing behind it, so this returning does not by itself mean the old .exe is back;
+    /// see <see cref="SelfUpdater.SettleBeforeExit"/>.
+    ///
+    /// Known and left as it is: Windows only asking is enough to close Slate. WPF answers the
+    /// question by shutting the app down before it returns, whether or not the sign-out then
+    /// goes ahead, so one another app refuses - or one the user cancels - still takes the
+    /// window away. It answers on a hidden window of its own making rather than this app's, so
+    /// nothing Slate hooks gets to the question first; taking it over means answering Windows
+    /// in Slate's own right and with it everything WPF then stops doing for the shutdown.
+    /// Nothing is lost when it happens - settings and the plan are written as they change, and
+    /// an update in flight is settled above, or left to the thread already settling it - so it
+    /// costs the user a restart.
+    ///
+    /// The consequence for whoever picks this up: nothing in Slate acts on a sign-out being
+    /// abandoned, because this copy is already shutting down by the time Windows says so.
+    /// <see cref="SelfUpdater.SessionEndAbandoned"/> exists and is wired up to the message
+    /// (MainWindow.WatchForAbandonedSessionEnd), but all it can do today is tidy a latch in a
+    /// copy that has moments to live, so nothing may be built on it until the question above is
+    /// answered in Slate's own right.
+    /// </summary>
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        SelfUpdater.SettleBeforeExit(
+            $"Windows began {(e.ReasonSessionEnding == ReasonSessionEnding.Shutdown ? "shutting down" : "signing out")}",
+            pressed: true);
+        base.OnSessionEnding(e);
+    }
+
+    /// <summary>
+    /// Any other shutdown that reaches this copy while an update waits on its new one - the
+    /// handover's own comes after it has settled, and so finds nothing to do.
+    /// </summary>
+    protected override void OnExit(ExitEventArgs e)
+    {
+        SelfUpdater.SettleBeforeExit("Slate was shut down");
+        base.OnExit(e);
     }
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)

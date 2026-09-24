@@ -449,6 +449,34 @@
                         <strong>Import config</strong> reads it back. The access token is never exported,
                         and importing keeps whichever one is already set up.</dd>
 
+                    <dt>An update did not install</dt>
+                    <dd>If something is still under way after 30 seconds, the folder the .exe is in cannot
+                        be written to, the file is locked, the download does not match its checksum, or the
+                        new version closes or has not shown its window within 90 seconds, the new version is
+                        stopped and the old one put back exactly as it was — or, if something is holding a
+                        file open and will not let go, Slate says so and names the <code>.old</code> beside
+                        it to rename back. Where the old one could only be put back by copying it, the
+                        <code>.old</code> it was copied from stays until you restart Slate, and the message
+                        says so. It carries on running either way, and the release page opens so
+                        you can download the update by hand. If you sign out or shut down while the new
+                        version is still starting, Slate stops it and puts the old one back there and then,
+                        with every step cut to a moment — Windows offers to end an app that has not
+                        answered in about five seconds. If the files were already moving when the sign-out
+                        arrived, Slate answers Windows rather than hold it up, and leaves the thread already
+                        doing that work to finish as the app closes — it is cutting the same steps short.
+                        Either way the usual outcome is the one you want: the old one is renamed back under
+                        its own name and is what opens next time, and no <code>.old</code> is left beside
+                        it, because renaming it back is what uses that file up. It is not a promise, though.
+                        If Windows would not let the files move at all, the new version is still where Slate
+                        runs from, with the one you were on beside it as <code>.old</code> to rename over
+                        it; if Slate was ended between the two renames, nothing is there at all, and the one
+                        you were on is in that folder as <code>.old</code> to rename back. And if the old
+                        one went back by being copied rather than renamed, it is back under its own name,
+                        with the <code>.old</code> it was copied from beside it until you next start Slate,
+                        as above. <code>crash.log</code> says which, whenever Slate was still running to
+                        write it down. A copy built with <code>dotnet build</code> only ever offers the
+                        link.</dd>
+
                     <dt>Something else</dt>
                     <dd>Anything unexpected is written to <code>crash.log</code> in the data folder below.</dd>
                 </dl>
@@ -470,12 +498,18 @@
                 </div>
 
                 <p class="muted" style="font-size: 12px">
-                    Slate asks GitHub once per launch whether there is a newer release. If there is,
-                    a yellow bar appears above the header with a link to it and, for a published
-                    build, <strong>Install and restart</strong>: the new .exe is downloaded next to
-                    this one, checked against GitHub's checksum, swapped in under the same name and
-                    started. If any step fails the old one is put back and the release page opens
-                    instead. If GitHub cannot be reached the check passes in silence.
+                    Slate asks GitHub once per launch whether there is a newer release; if GitHub
+                    cannot be reached the check passes in silence. If there is one, a yellow bar
+                    appears above the header with a link to it and, for a published build,
+                    <strong>Install and restart</strong>. That downloads the same flavour you are
+                    running (standalone or slim) next to this .exe, with progress and a Cancel
+                    button, while the app stays usable, and only uses it if it matches the checksum
+                    GitHub published. Anything already under way - time being recorded, a sync, a
+                    change to a work item, your plan or your settings, a sign-in - then finishes,
+                    and until the restart nothing more can be changed and the window will not close.
+                    The new .exe takes this one's name, so shortcuts and pins keep working, and
+                    starts; from then on this copy writes nothing more to the data folder, and it
+                    closes once the new window is up. Settings and the plan carry over.
                 </p>
 
                 <div class="banner">

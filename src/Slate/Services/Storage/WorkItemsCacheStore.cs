@@ -46,18 +46,19 @@ public sealed class WorkItemsCacheStore
     /// <summary>
     /// Saves the list that just loaded, atomically like <see cref="PlanStore"/> - a temp file
     /// then a rename, so a crash or a second launch mid-write can never leave a half-written
-    /// cache behind for the next read to trip over.
+    /// cache behind for the next read to trip over. Through <see cref="DataFolder"/> like it
+    /// too, so a load that lands while an update's new copy is starting cannot write over the
+    /// list that copy is about to save for itself.
     /// </summary>
     public void Save(string stamp, DateTimeOffset loadedAt, IReadOnlyList<WorkItem> items)
     {
+        // Serialized here, outside the data folder's gate, since a long list is the slow part;
+        // what is kept if the write is held back is then just the text.
+        var json = JsonSerializer.Serialize(new CacheContents(stamp, loadedAt, [.. items]), Json);
+
         try
         {
-            AppPaths.EnsureCreated();
-
-            var contents = new CacheContents(stamp, loadedAt, [.. items]);
-            var temp = AppPaths.WorkItemsCacheFile + ".tmp";
-            File.WriteAllText(temp, JsonSerializer.Serialize(contents, Json));
-            File.Move(temp, AppPaths.WorkItemsCacheFile, overwrite: true);
+            DataFolder.Write(AppPaths.WorkItemsCacheFile, () => DataFolder.Replace(AppPaths.WorkItemsCacheFile, json));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

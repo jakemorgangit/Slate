@@ -3,6 +3,7 @@
 
 @inject AppState State
 @inject SettingsStore Settings
+@inject ToastService Toasts
 @inject IJSRuntime Js
 
 @if (State.DetailWorkItemId is int id)
@@ -501,16 +502,30 @@
     private int RecordedMinutes =>
         State.DetailWorkItemId is int id ? State.Planner.RecordedMinutes(id) : 0;
 
+    /// <summary>
+    /// Read straight back from the settings, so a refused change - an update taking over - is
+    /// already back where it was by the next render. Said out loud all the same: a picker that
+    /// springs back on its own looks like a misclick rather than an answer.
+    /// </summary>
     private TextFormat CommentFormat
     {
         get => Settings.Current.Ui.CommentFormat;
-        set => Settings.Update(s => s.Ui.CommentFormat = value);
+        set
+        {
+            if (!Settings.Update(s => s.Ui.CommentFormat = value))
+                Toasts.Error("Could not change the format", AppState.RestartingForUpdate);
+        }
     }
 
+    /// <inheritdoc cref="CommentFormat"/>
     private TextFormat DescriptionFormat
     {
         get => Settings.Current.Ui.DescriptionFormat;
-        set => Settings.Update(s => s.Ui.DescriptionFormat = value);
+        set
+        {
+            if (!Settings.Update(s => s.Ui.DescriptionFormat = value))
+                Toasts.Error("Could not change the format", AppState.RestartingForUpdate);
+        }
     }
 
     private string CommentHint => CommentFormat switch
@@ -760,11 +775,14 @@
         if (await State.SaveDescriptionAsync(html)) _editingDescription = false;
     }
 
-    /// <summary>In-app only: this is never written back to Azure DevOps.</summary>
+    /// <summary>
+    /// In-app only: this is never written back to Azure DevOps. It is still written to the
+    /// plan, so it is counted like any other edit and refused while an update takes over.
+    /// </summary>
     private void SetLocalPriority(int priority)
     {
         if (State.DetailWorkItemId is not int id) return;
-        State.Planner.SetLocalPriority(id, priority);
+        State.TryEdit(() => State.Planner.SetLocalPriority(id, priority));
     }
 
     private void OpenInAdo()

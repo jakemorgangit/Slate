@@ -19,7 +19,8 @@ public sealed class AppState(
     PlannerService planner,
     MsalAuthService auth,
     ToastService toasts,
-    WorkItemsCacheStore workItemsCache)
+    WorkItemsCacheStore workItemsCache,
+    WriteGate writes)
 {
     private CancellationTokenSource? _workItemLoad;
     private CancellationTokenSource? _eventLoad;
@@ -34,39 +35,77 @@ public sealed class AppState(
         $"{Settings.Ado.OrganizationUrl}|{Settings.Ado.Project}|{Settings.Ado.AuthMode}";
 
     private string _cachedFor = "";
+    private readonly Lock _connectionGate = new();
+
+    /// <summary>
+    /// Notices a change of connection as soon as the settings are saved, so what was read
+    /// from the old one - its error above all - does not sit on screen until the next load.
+    /// </summary>
+    public void CheckConnection() => DropStaleCaches();
 
     /// <summary>
     /// Forgets anything read from a connection that is no longer the current one. Checked
-    /// at the start of every load rather than driven by a settings event, so it holds no
-    /// matter which of the many save paths changed the configuration.
+    /// at the start of every load as well as whenever settings are saved, so it holds no
+    /// matter which of the many save paths changed the configuration, or which thread - a
+    /// quiet poll runs on its own - notices first.
     /// </summary>
     private void DropStaleCaches()
     {
         var stamp = ConnectionStamp;
-        if (stamp == _cachedFor) return;
 
-        _cachedFor = stamp;
-        Identity = "";
-        Projects = [];
-        CreatableTypes = [];
-        AreaTree = null;
-        Members = [];
-        ado.ForgetPeople();
-
-        // A cached list is only ever a stand-in for this same connection's own list - once
-        // the connection has moved on, holding onto it would let a failed load for the new
-        // one keep showing the old one as if it were current, with the red banner suppressed
-        // to make room for the (now wrong) "showing a cached list" notice. Raised here, once,
-        // rather than left to each caller: a quiet poll or a background lookup like
-        // EnsureMembersAsync can be the one to drop it, and the UI still needs to hear about
-        // it even though neither of those otherwise has a reason to call Changed itself.
-        if (WorkItemsAreCached)
+        // Held across the whole clearing, not just the stamp. Published on its own, the stamp
+        // says "this connection's caches are dealt with" while they are still there to deal
+        // with, so a second caller arriving in between goes on believing that - and the load
+        // it then finishes puts a list where this one is about to wipe it, leaving "Nothing
+        // loaded yet" with no error to explain it. Nothing in here waits on anything, and
+        // nothing in here raises a change either: they are field assignments, and ForgetPeople
+        // only nulls two of its own.
+        lock (_connectionGate)
         {
-            WorkItems = [];
-            WorkItemsLoadedAt = null;
-            WorkItemsAreCached = false;
-            Changed?.Invoke();
+            if (stamp == _cachedFor) return;
+            _cachedFor = stamp;
+
+            Identity = "";
+            Projects = [];
+            CreatableTypes = [];
+            AreaTree = null;
+            AreaTreeError = null;
+            Members = [];
+            ado.ForgetPeople();
+
+            // The error on screen was about the old connection. Left up, it reports the new one
+            // failing before anything has asked it. The toast behind it goes too, below.
+            var hadError = WorkItemError is not null;
+            WorkItemError = null;
+
+            // A cached list is only ever a stand-in for this same connection's own list - once
+            // the connection has moved on, holding onto it would let a failed load for the new
+            // one keep showing the old one as if it were current, with the red banner suppressed
+            // to make room for the (now wrong) "showing a cached list" notice. A list the error
+            // banner was covering goes for the same reason: taking the banner away must not bring
+            // another connection's list back into view looking current. One on screen with no
+            // error over it stays until the new connection's own list replaces it, as it always
+            // has.
+            if (WorkItemsAreCached || hadError)
+            {
+                WorkItems = [];
+                WorkItemsLoadedAt = null;
+                WorkItemsAreCached = false;
+            }
         }
+
+        // Out here with the change below rather than in among the clearing: dismissing a toast
+        // raises ToastService.Changed, and a page answering that on this very thread - which is
+        // the window's thread whenever a settings save is what noticed - would render off
+        // half-cleared state. Nothing else reads the toast, so it is no worse a moment later.
+        // Reached only when the clearing above actually happened; the early return leaves.
+        ClearWorkItemErrorToast();
+
+        // Raised here, once, rather than left to each caller: a quiet poll or a background
+        // lookup like EnsureMembersAsync can be the one to notice, and the UI still needs to
+        // hear about it even though neither of those otherwise has a reason to call Changed.
+        // Outside the gate, so a render it sets off never reads these while they are half done.
+        Changed?.Invoke();
     }
     public PlannerService Planner => planner;
     public ToastService Toasts => toasts;
@@ -223,6 +262,11 @@ public sealed class AppState(
     {
         if (!Settings.IsAdoConfigured)
         {
+            // Recorded against the connection as it stands, so this error is only taken down
+            // again once the configuration actually moves on - not by the first save of
+            // something unrelated, such as the theme.
+            DropStaleCaches();
+
             // An unconfigured connection has nothing behind it to show as "cached" - and
             // without this, clearing the org URL would leave a previous connection's list
             // on screen under the "not configured" banner instead of showing no list at all.
@@ -241,6 +285,11 @@ public sealed class AppState(
         await _workItemLoad.CancelAndDisposeAsync();
         var cts = new CancellationTokenSource();
         _workItemLoad = cts;
+
+        // Before the error is cleared for this attempt, not after: an error on screen from a
+        // connection that has since changed is what tells DropStaleCaches the list under it
+        // was that connection's too.
+        DropStaleCaches();
 
         IsLoadingWorkItems = true;
         WorkItemError = null;
@@ -298,7 +347,25 @@ public sealed class AppState(
 
             if (cts.IsCancellationRequested) return;
 
-            if (stamp != ConnectionStamp)
+            // The check and the write are one step, under the gate the clearing is done under.
+            // Apart, CheckConnection can clear for a new connection in between the two, and
+            // this would then put the old connection's list straight back with the cached flag
+            // off - another organization's items on screen looking current, with neither the
+            // amber notice nor the red banner to say otherwise.
+            bool stale;
+            var loadedAt = DateTimeOffset.Now;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp;
+                if (!stale)
+                {
+                    WorkItems = items;
+                    WorkItemsLoadedAt = loadedAt;
+                    WorkItemsAreCached = false;
+                }
+            }
+
+            if (stale)
             {
                 // The connection moved on again between that last fetch starting and now - too
                 // late to judge this answer by it, and too late to just leave, since the old
@@ -310,12 +377,9 @@ public sealed class AppState(
                 return;
             }
 
-            WorkItems = items;
-            WorkItemsLoadedAt = DateTimeOffset.Now;
-            WorkItemsAreCached = false;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, loadedAt, items);
 
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
@@ -326,7 +390,19 @@ public sealed class AppState(
         }
         catch (Exception ex)
         {
-            if (stamp != ConnectionStamp)
+            // The check and the write are one step, under the same gate and for the same reason
+            // as the success path above: apart, CheckConnection can clear for a new connection
+            // in between the two, and this would then put the old connection's failure up as
+            // the new one's - the red banner over an organization nothing has asked yet, which
+            // is precisely what the clearing is there to prevent.
+            bool stale;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp;
+                if (!stale) WorkItemError = ex.Message;
+            }
+
+            if (stale)
             {
                 // Same reasoning as above: this failure was for a connection that is no longer
                 // current, so it is not this connection's error to show, and it is not this
@@ -336,7 +412,8 @@ public sealed class AppState(
                 return;
             }
 
-            WorkItemError = ex.Message;
+            // Outside the gate, like the clearing's own toast work: raising one tells the page
+            // to render, and rendering from in there would read this half written.
             ClearWorkItemErrorToast();
             _workItemErrorToast = toasts.Error("Could not load work items", ex.Message);
         }
@@ -381,7 +458,10 @@ public sealed class AppState(
     /// </summary>
     public async Task RefreshWorkItemsQuietlyAsync()
     {
-        if (!Settings.IsAdoConfigured || IsLoadingWorkItems) return;
+        // A tick already queued when a handover stopped the timer still arrives. The copy an
+        // update is starting reads the list for itself, and this one's result would only be
+        // held back unwritten (see DataFolder).
+        if (!Settings.IsAdoConfigured || IsLoadingWorkItems || IsHandingOver) return;
 
         try
         {
@@ -396,19 +476,30 @@ public sealed class AppState(
             // than being overwritten by this older answer. Either way, a cached list left
             // over from a connection nobody is looking at any more is not this poll's to keep:
             // drop it rather than leave it looking current with neither notice nor banner.
-            if (stamp != ConnectionStamp || IsLoadingWorkItems)
+            // Checked and written under the one gate, for the reason LoadWorkItemsAsync gives.
+            bool stale;
+            var loadedAt = DateTimeOffset.Now;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp || IsLoadingWorkItems;
+                if (!stale)
+                {
+                    WorkItems = items;
+                    WorkItemsLoadedAt = loadedAt;
+                    WorkItemsAreCached = false;
+                    WorkItemError = null;
+                }
+            }
+
+            if (stale)
             {
                 DropStaleCaches();
                 return;
             }
 
-            WorkItems = items;
-            WorkItemsLoadedAt = DateTimeOffset.Now;
-            WorkItemsAreCached = false;
-            WorkItemError = null;
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
-            workItemsCache.Save(stamp, WorkItemsLoadedAt.Value, items);
+            workItemsCache.Save(stamp, loadedAt, items);
             Changed?.Invoke();
         }
         catch (Exception)
@@ -699,15 +790,22 @@ public sealed class AppState(
     /// </summary>
     public void NudgeAutoSync()
     {
-        if (IsHandingOver || !AutoSyncOn || !CanUseOutlook) return;
-        if (IsSyncing || planner.PendingCount == 0) return;
+        // Under the same lock every timer is made and stopped under. The plan changes on
+        // whichever thread changed it - a calendar poll picking up a block runs on its own - so
+        // two nudges at once could otherwise each make a timer, and one made just as a handover
+        // stopped them all would carry on running through it and on past a rollback.
+        lock (_timers)
+        {
+            if (IsHandingOver || !AutoSyncOn || !CanUseOutlook) return;
+            if (IsSyncing || planner.PendingCount == 0) return;
 
-        var delay = TimeSpan.FromSeconds(Math.Clamp(Settings.Planning.AutoSyncSeconds, 1, 60));
+            var delay = TimeSpan.FromSeconds(Math.Clamp(Settings.Planning.AutoSyncSeconds, 1, 60));
 
-        if (_autoSync is null)
-            _autoSync = new Timer(_ => _ = AutoSyncNowAsync(), null, delay, Timeout.InfiniteTimeSpan);
-        else
-            _autoSync.Change(delay, Timeout.InfiniteTimeSpan);
+            if (_autoSync is null)
+                _autoSync = new Timer(_ => _ = AutoSyncNowAsync(), null, delay, Timeout.InfiniteTimeSpan);
+            else
+                _autoSync.Change(delay, Timeout.InfiniteTimeSpan);
+        }
     }
 
     /// <summary>
@@ -720,11 +818,12 @@ public sealed class AppState(
         if (IsSyncing || !CanUseOutlook || planner.PendingCount == 0) return;
         if (!TryBeginWrite()) return;
 
-        IsSyncing = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSyncing = true;
+            Changed?.Invoke();
+
             var summary = await planner.SyncAsync();
             _autoSyncFailed = summary.Failed > 0;
 
@@ -765,11 +864,12 @@ public sealed class AppState(
 
         if (!TryBeginWrite()) return;
 
-        IsSyncing = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSyncing = true;
+            Changed?.Invoke();
+
             var summary = await planner.SyncAsync();
             _autoSyncFailed = summary.Failed > 0;
 
@@ -793,18 +893,34 @@ public sealed class AppState(
         }
     }
 
+    /// <summary>What became of a single block that was sent on its own.</summary>
+    public enum SentOne
+    {
+        /// <summary>It reached Outlook.</summary>
+        Sent,
+
+        /// <summary>It was tried and did not get through. Why is on the block, if it is still there.</summary>
+        Failed,
+
+        /// <summary>It was never tried: an update is taking over and no write may start.</summary>
+        Refused,
+    }
+
     /// <summary>
     /// Sends a single block, for the inline "send to Outlook" action. Counted like the full
-    /// sync, because it too creates an event and only then writes down its id. False when it
-    /// did not go; the reason is on the block, unless an update is taking over.
+    /// sync, because it too creates an event and only then writes down its id.
+    ///
+    /// Three outcomes rather than two, because the caller has to tell the user which: a block
+    /// that was deleted between the click and the answer also comes back without an error on
+    /// it, and blaming an update for that names a restart that is not happening.
     /// </summary>
-    public async Task<bool> SyncOneAsync(Guid id)
+    public async Task<SentOne> SyncOneAsync(Guid id)
     {
-        if (!TryBeginWrite()) return false;
+        if (!TryBeginWrite()) return SentOne.Refused;
 
         try
         {
-            return await planner.SyncOneAsync(id);
+            return await planner.SyncOneAsync(id) ? SentOne.Sent : SentOne.Failed;
         }
         finally
         {
@@ -816,13 +932,14 @@ public sealed class AppState(
 
     /// <summary>
     /// Books the item into the first gap that fits, scanning forward from now across working
-    /// days. Returns null when nothing free turns up inside the search window.
+    /// days. Returns null when nothing free turns up inside the search window. Private, and
+    /// only ever run inside a write already counted in: it adds a block to the plan.
     /// </summary>
     /// <param name="minutes">
     /// How long the block should be. Null falls back to whatever is left on the estimate,
     /// which is what the callers with nowhere to ask the question want.
     /// </param>
-    public async Task<Allocation?> ScheduleNextFree(WorkItem item, int? minutes = null, int searchDays = 14)
+    private async Task<Allocation?> ScheduleNextFree(WorkItem item, int? minutes = null, int searchDays = 14)
     {
         var duration = minutes is > 0 ? minutes.Value : planner.SuggestedDuration(item);
         var p = Settings.Planning;
@@ -886,20 +1003,37 @@ public sealed class AppState(
     /// <summary>
     /// Books the next free gap. Reports for itself rather than leaving each caller to say the
     /// same thing three different ways.
+    ///
+    /// Counted from before the calendar is read, not just around the booking at the end: a
+    /// handover that began during the read waits for the block to be added and saved, rather
+    /// than the read coming back to a plan the new copy has already taken.
     /// </summary>
     public async Task<bool> ScheduleIntoNextFree(WorkItem item, int? minutes = null)
     {
-        var allocation = await ScheduleNextFree(item, minutes);
-
-        if (allocation is null)
+        if (!TryBeginWrite())
         {
-            toasts.Warning("No free slot in the next two weeks",
-                "Widen the hours work can be booked into in Settings, or pick a time yourself.");
+            toasts.Error("Could not book that time", RestartingForUpdate);
             return false;
         }
 
-        AfterScheduled(item, allocation, "Scheduled");
-        return true;
+        try
+        {
+            var allocation = await ScheduleNextFree(item, minutes);
+
+            if (allocation is null)
+            {
+                toasts.Warning("No free slot in the next two weeks",
+                    "Widen the hours work can be booked into in Settings, or pick a time yourself.");
+                return false;
+            }
+
+            AfterScheduled(item, allocation, "Scheduled");
+            return true;
+        }
+        finally
+        {
+            EndWrite();
+        }
     }
 
     /// <summary>
@@ -924,16 +1058,30 @@ public sealed class AppState(
             return false;
         }
 
-        if (Settings.Planning.PreventOverlap &&
-            IsBusy(await EventsCovering(placed, end), placed, end))
+        // Counted across the calendar read for the same reason as ScheduleIntoNextFree.
+        if (!TryBeginWrite())
         {
-            toasts.Warning("Something is already in the calendar then",
-                "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
+            toasts.Error("Could not book that time", RestartingForUpdate);
             return false;
         }
 
-        AfterScheduled(item, planner.Add(item, start, minutes), "Booked");
-        return true;
+        try
+        {
+            if (Settings.Planning.PreventOverlap &&
+                IsBusy(await EventsCovering(placed, end), placed, end))
+            {
+                toasts.Warning("Something is already in the calendar then",
+                    "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
+                return false;
+            }
+
+            AfterScheduled(item, planner.Add(item, start, minutes), "Booked");
+            return true;
+        }
+        finally
+        {
+            EndWrite();
+        }
     }
 
     private void AfterScheduled(WorkItem item, Allocation allocation, string verb)
@@ -1008,7 +1156,14 @@ public sealed class AppState(
 
         var draft = settingsStore.CreateDraft();
         draft.Ui.Mode = mode;
-        settingsStore.Save(draft);
+        if (!settingsStore.Save(draft))
+        {
+            // Said out loud, and the change raised all the same, so the switch goes back to
+            // the mode actually in force rather than sitting on one nothing was saved for.
+            toasts.Error("Could not change mode", RestartingForUpdate);
+            Changed?.Invoke();
+            return;
+        }
 
         // Basic has no Time tab; being left standing on it would show an empty page.
         Changed?.Invoke();
@@ -1094,11 +1249,21 @@ public sealed class AppState(
     {
         if (PriorityPrompt is not { } prompt || IsSavingPriority) return false;
 
-        IsSavingPriority = true;
-        Changed?.Invoke();
+        // Counted until the block snapshots it moves are saved, like every write to Azure DevOps.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not change the priority", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try, like every other repaint here: a subscriber that throws on the
+            // way out would otherwise leave this write counted in for the rest of the session,
+            // and every later update stuck behind a count that never reaches zero.
+            IsSavingPriority = true;
+            Changed?.Invoke();
+
             var updated = await ado.SetAdoPriorityAsync(prompt.WorkItemId, prompt.To);
 
             if (updated is not null)
@@ -1127,6 +1292,7 @@ public sealed class AppState(
         finally
         {
             IsSavingPriority = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1197,11 +1363,19 @@ public sealed class AppState(
         if (item is not null && string.Equals(item.State, state, StringComparison.OrdinalIgnoreCase))
             return true;
 
-        SavingStateFor = workItemId;
-        Changed?.Invoke();
+        // Counted until the blocks quoting the state are saved, like every write to Azure DevOps.
+        if (!TryBeginWrite())
+        {
+            toasts.Error($"Could not move #{workItemId} to {state}", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            SavingStateFor = workItemId;
+            Changed?.Invoke();
+
             var updated = await ado.SetStateAsync(workItemId, state);
 
             if (updated is not null)
@@ -1227,6 +1401,7 @@ public sealed class AppState(
         finally
         {
             SavingStateFor = null;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1271,7 +1446,13 @@ public sealed class AppState(
 
         var draft = settingsStore.CreateDraft();
         draft.Ado.OnlyMine = onlyMine;
-        settingsStore.Save(draft);
+
+        // Refused while an update takes over; the toggle then simply stays as it was.
+        if (!settingsStore.Save(draft))
+        {
+            Changed?.Invoke();
+            return;
+        }
 
         Changed?.Invoke();
         await LoadWorkItemsAsync();
@@ -1427,11 +1608,20 @@ public sealed class AppState(
     {
         if (Creating is not { } request || IsCreating) return null;
 
-        IsCreating = true;
-        Changed?.Invoke();
+        // Counted: cut off by the restart halfway, there would be no telling whether Azure
+        // DevOps had raised it, and raising it again from the new copy could make two.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not create that work item", RestartingForUpdate);
+            return null;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsCreating = true;
+            Changed?.Invoke();
+
             var created = await ado.CreateWorkItemAsync(request);
 
             // Put it on screen straight away rather than waiting for the next poll.
@@ -1450,6 +1640,7 @@ public sealed class AppState(
         finally
         {
             IsCreating = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1538,11 +1729,19 @@ public sealed class AppState(
         if (DetailWorkItemId is not int id || Detail is not { } detail) return false;
         if (IsSavingDescription || IsSavingTitle) return false;
 
-        setBusy(true);
-        Changed?.Invoke();
+        // Counted: an edit sent just as an update takes over is either seen through or refused.
+        if (!TryBeginWrite())
+        {
+            toasts.Error($"Could not save the {what.ToLowerInvariant()}", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            setBusy(true);
+            Changed?.Invoke();
+
             Detail = await ado.UpdateFieldsAsync(
                 id, detail.Rev, new Dictionary<string, object?> { [field] = value });
 
@@ -1561,6 +1760,7 @@ public sealed class AppState(
         finally
         {
             setBusy(false);
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1613,11 +1813,20 @@ public sealed class AppState(
         if (DetailWorkItemId is not int id || Detail is not { } detail) return false;
         if (string.IsNullOrWhiteSpace(text) || IsPostingComment) return false;
 
-        IsPostingComment = true;
-        Changed?.Invoke();
+        // Counted: cut off by the restart halfway, there would be no telling whether it went,
+        // and posting it again from the new copy could put it there twice.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not add that comment", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsPostingComment = true;
+            Changed?.Invoke();
+
             var comment = await ado.AddCommentAsync(id, detail.Project, Html.ToCommentHtml(text, format, mentioned));
             Comments = [.. Comments, comment];
             CommentError = null;
@@ -1632,6 +1841,7 @@ public sealed class AppState(
         finally
         {
             IsPostingComment = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1944,11 +2154,12 @@ public sealed class AppState(
             return false;
         }
 
-        IsSpawning = true;
-        Changed?.Invoke();
-
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSpawning = true;
+            Changed?.Invoke();
+
             var created = await ado.CreateChildAsync(parent, title, description, type, remainingHours);
 
             // Make it visible in the sidebar straight away; the query behind the list may
@@ -1983,79 +2194,135 @@ public sealed class AppState(
     private Timer? _workItemPoll;
 
     /// <summary>
-    /// Re-reads the calendar on a timer so changes made in Outlook show up without the user
-    /// having to ask. Safe to call repeatedly; it reconfigures itself from settings.
+    /// Every timer is made, replaced and stopped under this, and the handover flag is looked at
+    /// inside it. Settings are saved and the plan changes on whichever thread did it, so without
+    /// one lock a timer made at the very moment a handover stopped the rest would carry on
+    /// running through it, and a second made beside one already running would leave both
+    /// polling for good after a rollback.
     /// </summary>
+    private readonly Lock _timers = new();
+
     private bool _watchingPlan;
 
+    /// <summary>
+    /// Re-reads the calendar on a timer so changes made in Outlook show up without the user
+    /// having to ask. Safe to call repeatedly, from any thread; it reconfigures itself from
+    /// settings, and always ends with exactly one of each timer the settings ask for.
+    /// </summary>
     public void ConfigurePolling()
     {
-        // Stopped for a handover, and only started again if it is abandoned.
-        if (IsHandingOver) return;
-
-        // Every edit to the plan arms the debounce. Subscribed here because this is where the
-        // rest of the timers are set up, and guarded so repeated calls do not stack handlers.
-        if (!_watchingPlan)
+        lock (_timers)
         {
-            planner.Changed += NudgeAutoSync;
-            _watchingPlan = true;
-        }
+            // Stopped for a handover, and only started again if it is abandoned.
+            if (IsHandingOver) return;
 
+            // Every edit to the plan arms the debounce. Subscribed here because this is where
+            // the rest of the timers are set up, and guarded so repeated calls do not stack
+            // handlers.
+            if (!_watchingPlan)
+            {
+                planner.Changed += NudgeAutoSync;
+                _watchingPlan = true;
+            }
+
+            _poll?.Dispose();
+            _poll = null;
+
+            var minutes = Settings.Planning.RefreshMinutes;
+            if (minutes > 0 && Settings.IsCalendarConfigured)
+            {
+                var period = TimeSpan.FromMinutes(Math.Clamp(minutes, 1, 120));
+                _poll = new Timer(_ => _ = LoadEventsAsync(), null, period, period);
+            }
+
+            _workItemPoll?.Dispose();
+            _workItemPoll = null;
+
+            var seconds = Settings.Planning.WorkItemRefreshSeconds;
+            if (seconds > 0 && Settings.IsAdoConfigured)
+            {
+                var period = TimeSpan.FromSeconds(Math.Clamp(seconds, 15, 3600));
+                _workItemPoll = new Timer(_ => _ = RefreshWorkItemsQuietlyAsync(), null, period, period);
+            }
+        }
+    }
+
+    /// <summary>Stops every timer. Only called under <see cref="_timers"/>.</summary>
+    private void StopTimers()
+    {
         _poll?.Dispose();
         _poll = null;
-
-        var minutes = Settings.Planning.RefreshMinutes;
-        if (minutes > 0 && Settings.IsCalendarConfigured)
-        {
-            var period = TimeSpan.FromMinutes(Math.Clamp(minutes, 1, 120));
-            _poll = new Timer(_ => _ = LoadEventsAsync(), null, period, period);
-        }
-
         _workItemPoll?.Dispose();
         _workItemPoll = null;
-
-        var seconds = Settings.Planning.WorkItemRefreshSeconds;
-        if (seconds > 0 && Settings.IsAdoConfigured)
-        {
-            var period = TimeSpan.FromSeconds(Math.Clamp(seconds, 15, 3600));
-            _workItemPoll = new Timer(_ => _ = RefreshWorkItemsQuietlyAsync(), null, period, period);
-        }
+        _autoSync?.Dispose();
+        _autoSync = null;
     }
 
     // ---------------------------------------------------------------- handing over to an update
 
     /// <summary>Why something was refused while an update is taking over.</summary>
-    private const string RestartingForUpdate = "Slate is restarting to install an update.";
-
-    private volatile bool _handingOver;
-    private int _writesInFlight;
+    public const string RestartingForUpdate = WriteGate.ClosedReason;
 
     /// <summary>
     /// True from the moment an update starts putting a new copy in this one's place until
-    /// this copy exits, or the update is abandoned. Nothing new goes to Azure DevOps, Outlook
-    /// or the plan meanwhile: the new copy reads the plan as it starts, so a write made here
-    /// after that is lost to it - and a booking or an event made remotely but not yet written
-    /// down here is one the new copy would make a second time.
+    /// this copy exits, or the update is abandoned. Nothing new goes to Azure DevOps, Outlook,
+    /// the plan or the settings meanwhile: the new copy reads the plan and the settings as it
+    /// starts, so a write made here after that is lost to it - and a booking or an event made
+    /// remotely but not yet written down here is one the new copy would make a second time.
     /// </summary>
-    public bool IsHandingOver => _handingOver;
+    public bool IsHandingOver => writes.IsClosed;
 
     /// <summary>
-    /// Counts in a write to Azure DevOps, Outlook or the plan, unless a handover has begun;
-    /// every true must be paired with an <see cref="EndWrite"/>. Counting first and looking at
-    /// the flag second - the mirror image of <see cref="PrepareForHandoverAsync"/> - means a
-    /// write starting at the same instant as a handover is either refused here or waited for
-    /// there, whichever threads the two are on.
+    /// Counts in a write to Azure DevOps, Outlook, the plan or the settings, unless a handover
+    /// has begun; every true must be paired with an <see cref="EndWrite"/>. See
+    /// <see cref="WriteGate.TryEnter"/> for why a write starting at the same instant as a
+    /// handover is always either refused or waited for.
     /// </summary>
-    private bool TryBeginWrite()
-    {
-        Interlocked.Increment(ref _writesInFlight);
-        if (!_handingOver) return true;
+    private bool TryBeginWrite() => writes.TryEnter();
 
-        Interlocked.Decrement(ref _writesInFlight);
-        return false;
+    private void EndWrite() => writes.Exit();
+
+    /// <summary>
+    /// Makes a change to the plan straight from the page - a drop, a resize, a delete, a
+    /// triage priority - as one counted write. None of them waits on anything, but they run on
+    /// the window's thread while a handover starts on another, so a check of
+    /// <see cref="IsHandingOver"/> beforehand could still pass a moment before the handover
+    /// looked for writes in flight, and the edit then land on a plan the new copy had already
+    /// read. False, with nothing changed, when an update is taking over.
+    /// </summary>
+    public bool TryEdit(Action edit)
+    {
+        if (!TryBeginWrite()) return false;
+
+        try
+        {
+            edit();
+            return true;
+        }
+        finally
+        {
+            EndWrite();
+        }
     }
 
-    private void EndWrite() => Interlocked.Decrement(ref _writesInFlight);
+    /// <summary>
+    /// The same for something a page awaits, such as signing in, which writes the sign-in
+    /// cache. False when refused; an exception from <paramref name="write"/> is the caller's.
+    /// </summary>
+    public async Task<bool> TryWriteAsync(Func<Task> write)
+    {
+        if (!TryBeginWrite()) return false;
+
+        try
+        {
+            await write();
+            return true;
+        }
+        finally
+        {
+            EndWrite();
+        }
+    }
 
     /// <summary>
     /// Brings this copy to a standstill before an update moves any files: the timers stop,
@@ -2066,40 +2333,69 @@ public sealed class AppState(
     /// </summary>
     public async Task<bool> PrepareForHandoverAsync(TimeSpan timeout)
     {
-        // Seen by every thread before the count below is read; see TryBeginWrite.
-        _handingOver = true;
-        Interlocked.MemoryBarrier();
-
-        _poll?.Dispose();
-        _poll = null;
-        _workItemPoll?.Dispose();
-        _workItemPoll = null;
-        _autoSync?.Dispose();
-        _autoSync = null;
-        Changed?.Invoke();
-
-        var deadline = DateTime.UtcNow + timeout;
-        while (Volatile.Read(ref _writesInFlight) > 0)
+        // Closed before the timers are stopped, and they are stopped under the lock they are
+        // made under: a ConfigurePolling or NudgeAutoSync racing this either finished first,
+        // so what it made is stopped here, or finds the gate closed and makes nothing.
+        writes.Close();
+        lock (_timers)
         {
-            if (DateTime.UtcNow > deadline) return false;
-            await Task.Delay(100);
+            _preparedForHandover = true;
+            StopTimers();
         }
 
-        return true;
+        Changed?.Invoke();
+
+        return await writes.WaitForWritesAsync(timeout);
     }
 
     /// <summary>
+    /// Set from the moment this copy is brought to a standstill for an update until it is let
+    /// out of it again, and what <see cref="ResumeAfterFailedHandover"/> goes by.
+    ///
+    /// The gate being closed would serve as the test too - the resume comes from two places
+    /// now, wherever the updater put the update back and the install's own way out, and the
+    /// first to arrive reopens the gate and restores the timers under the one lock, so the
+    /// second finds it open and rightly does nothing. The flag is kept because it names what
+    /// is actually being undone: a standstill, of which the gate is only one part. Going by
+    /// the gate would tie this method to the gate staying the only thing the standstill closes,
+    /// and a later change to either side would quietly make the resume skip the timers or
+    /// restore them twice.
+    /// </summary>
+    private bool _preparedForHandover;
+
+    /// <summary>
     /// Picks up where <see cref="PrepareForHandoverAsync"/> left off when the update did not
-    /// go ahead, so this copy carries on exactly as before: the timers come back, and any
-    /// edit that was waiting to reach Outlook is sent.
+    /// go ahead, so this copy carries on exactly as before: writes are allowed again, the
+    /// timers come back, and any edit that was waiting to reach Outlook is sent. Safe to call
+    /// more than once, or when no handover was ever started.
     /// </summary>
     public void ResumeAfterFailedHandover()
     {
-        if (!_handingOver) return;
+        // Never after the update went through. Nothing reaches here that way today - the one
+        // caller that could checks first - but this copy would be replaying its held plan,
+        // settings and cache writes over the files the new copy has already read and is now
+        // writing, which is the one thing the whole handover exists to prevent.
+        if (SelfUpdater.HasHandedOver) return;
 
-        _handingOver = false;
-        ConfigurePolling();
-        NudgeAutoSync();
+        lock (_timers)
+        {
+            if (!_preparedForHandover) return;
+            _preparedForHandover = false;
+
+            // Before the gate reopens: an update that did not go ahead leaves the data folder
+            // this copy's again, and a gate open over a frozen folder would take every save
+            // and write none of them. The updater thaws it itself as it puts things back; this
+            // is the second pair of hands, since nothing else would ever notice. Inside the
+            // guard, because a folder frozen at all means this copy was prepared for a
+            // handover - Freeze only ever runs after that - and outside it, a thaw is only
+            // ever a thaw of a folder somebody else is now using.
+            DataFolder.Thaw();
+
+            writes.Open();
+            ConfigurePolling();
+            NudgeAutoSync();
+        }
+
         Changed?.Invoke();
     }
 
