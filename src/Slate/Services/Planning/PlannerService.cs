@@ -26,13 +26,23 @@ public sealed record SyncSummary(int Created, int Updated, int Deleted, int Fail
 /// </summary>
 public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, SettingsStore settings)
 {
-    /// <summary>
-    /// Event ids whose allocation was deleted but whose calendar event still needs removing.
-    /// Kept in the plan file, so closing the app before the next send does not strand them.
-    /// </summary>
-    private List<string> PendingDeletes => store.PendingDeletes;
-
     public event Action? Changed;
+
+    /// <summary>
+    /// Whether changes to the plan actually reach the disk - see <see cref="PlanStore.CanSave"/>.
+    /// False for the whole session when the file that is there could not be read and must not
+    /// be written over, which is why a time write is refused while it holds: the hours would go
+    /// on the work item with nothing anywhere to say they had.
+    /// </summary>
+    public bool CanSave => store.CanSave;
+
+    /// <summary>
+    /// Whether the plan that was on disk could be read at all - see
+    /// <see cref="PlanStore.PlanWasUnreadable"/>. True for the whole session when it could
+    /// not, even though saving works again once the old file has been put aside: what was
+    /// outstanding is in that file and nowhere else, so a time write is refused on this too.
+    /// </summary>
+    public bool PlanWasUnreadable => store.PlanWasUnreadable;
 
     public IReadOnlyList<Allocation> Allocations => store.All;
 
@@ -41,11 +51,21 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     public IEnumerable<Allocation> ForDay(DateTime day) => InRange(day.Date, day.Date.AddDays(1));
 
-    public int PendingCount => store.All.Count(a => a.State is SyncState.Draft or SyncState.Modified or SyncState.Failed)
-                               + PendingDeletes.Count;
-
-    /// <summary>Blocks whose Outlook event was deleted there and which need a decision.</summary>
-    public int MissingCount => store.All.Count(a => a.MissingInOutlook);
+    /// <summary>
+    /// How much is waiting to go to Outlook: the blocks with unsent changes, and the events of
+    /// deleted blocks still to be removed.
+    ///
+    /// Counted under the store's lock, because this is asked off the UI thread as well as from
+    /// the header - the auto-sync timer's callback, and every Changed a Persist raises, which
+    /// includes the ones the calendar poll makes. Counting enumerates the blocks while the UI
+    /// thread can be taking one out of the same list, and what that throws - "Collection was
+    /// modified", or a torn read of the list - lands somewhere that swallows it: an auto-sync
+    /// round silently skipped, or the calendar load's catch, which clears the events already on
+    /// screen and shows an error for something that never went wrong.
+    /// </summary>
+    public int PendingCount => store.Edit(file =>
+        file.Allocations.Count(a => a.State is SyncState.Draft or SyncState.Modified or SyncState.Failed)
+        + file.PendingDeletes.Count);
 
     // ---------------------------------------------------------------- mutations
 
@@ -63,7 +83,12 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             DurationMinutes = Math.Max(settings.Current.Planning.SlotMinutes, durationMinutes),
         };
 
-        store.All.Add(allocation);
+        // Through the store, under the lock a save holds. Every list in the plan file is
+        // written from the UI thread and copied by a save running on one of the polling
+        // timers' thread-pool callbacks, and a copy reads the count and then takes the items:
+        // a list that grew in between no longer fits and the save comes apart with it. On the
+        // calendar path that exception is swallowed, taking whatever was being saved with it.
+        store.Edit(file => file.Allocations.Add(allocation));
         Persist();
         return allocation;
     }
@@ -104,16 +129,22 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null) return;
 
-        if (allocation.OutlookEventId is { Length: > 0 } eventId)
+        // Both lists in one pass under the store's lock, so no save can copy a plan that has
+        // let go of the block but not yet remembered its event.
+        store.Edit(file =>
         {
-            // Either the event goes too, or it stays and has to be remembered as one this
-            // plan has finished with - otherwise the stamp it still carries would have the
-            // next refresh adopt it straight back.
-            if (settings.Current.Calendar.DeleteEventWithAllocation) PendingDeletes.Add(eventId);
-            else Disown(eventId);
-        }
+            if (allocation.OutlookEventId is { Length: > 0 } eventId)
+            {
+                // Either the event goes too, or it stays and has to be remembered as one this
+                // plan has finished with - otherwise the stamp it still carries would have the
+                // next refresh adopt it straight back.
+                if (settings.Current.Calendar.DeleteEventWithAllocation) file.PendingDeletes.Add(eventId);
+                else Disown(file, eventId);
+            }
 
-        store.All.Remove(allocation);
+            file.Allocations.Remove(allocation);
+        });
+
         Persist();
     }
 
@@ -123,18 +154,22 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null) return;
 
-        // Unlinking is the whole point here, so the event has to be remembered as let go of.
-        if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(eventId);
+        store.Edit(file =>
+        {
+            // Unlinking is the whole point here, so the event has to be remembered as let go of.
+            if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(file, eventId);
 
-        store.All.Remove(allocation);
+            file.Allocations.Remove(allocation);
+        });
+
         Persist();
     }
 
     /// <summary>Remembers an event this plan has finished with, so adoption leaves it alone.</summary>
-    private void Disown(string eventId)
+    private static void Disown(PlanFile file, string eventId)
     {
-        if (!store.Disowned.Contains(eventId, StringComparer.Ordinal))
-            store.Disowned.Add(eventId);
+        if (!file.Disowned.Contains(eventId, StringComparer.Ordinal))
+            file.Disowned.Add(eventId);
     }
 
     public Allocation? Duplicate(Guid id, DateTime newStart)
@@ -150,7 +185,40 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         copy.SyncedFingerprint = null;
         copy.LastError = null;
 
-        store.All.Add(copy);
+        // The copy has no event, so nothing that describes one can be true of it. The first
+        // says the event this block had was deleted in Outlook, and a block's state is read
+        // from it before the event id is looked at at all: left on, the copy is born Missing,
+        // so every send skips it, nothing ever clears it - reconciling only judges blocks that
+        // have an event id - and the inspector offers to send again an event that never was.
+        // The second says the full title and notes are on the event and this shortened copy
+        // must never be written over them; there is no other side to protect here, and the
+        // event body is built without a subject or a body while it is set, on the create as
+        // much as on every update, so the copy would go onto the calendar blank. Every block
+        // adopted from a marker-only event carries that one, which makes it ordinary.
+        copy.MissingInOutlook = false;
+        copy.TextIsPartial = false;
+
+        // Nothing has ever been booked from a block that did not exist a moment ago. These say
+        // the opposite - hours already recorded against this block somewhere else - and nothing
+        // refreshes them for the copy: its own event goes out with a recorded total of zero,
+        // read from the entries, which is where recording lives. Left on, Record day showed the
+        // copy as part-recorded and took that off what it would book, silently booking nothing
+        // at all for a copy of a fully recorded block, and the single dialog told the user hours
+        // had gone on it from another machine. The third is the running total old plans kept on
+        // the block: it is only ever read to migrate one, and a copy carrying it would be
+        // migrated into a time entry for hours nobody booked.
+        copy.RecordedElsewhereMinutes = 0;
+        copy.LastRecordedAt = null;
+        copy.RecordedMinutes = 0;
+
+        // Cleared for the same reason as the ones above, and with more reason: a newer Slate's
+        // per-block members are exactly what this copy cannot read, so it cannot tell which of
+        // them say what that one block is - an event, a send, hours already booked. Clearing
+        // also gives the copy its own dictionary, which Clone does not: it copies the
+        // reference, and the two blocks would write each other's members for the session.
+        copy.Extra = [];
+
+        store.Edit(file => file.Allocations.Add(copy));
         Persist();
         return copy;
     }
@@ -211,7 +279,9 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var byId = items.ToDictionary(i => i.Id);
         var dirty = false;
 
-        foreach (var allocation in store.All)
+        // Copied under the store's lock: this runs from the work item poll as well as from
+        // the UI thread, and enumerating the live list while the other adds to it throws.
+        foreach (var allocation in store.Edit(file => file.Allocations.ToList()))
         {
             if (!byId.TryGetValue(allocation.WorkItemId, out var item)) continue;
             if (allocation.WorkItemTitle == item.Title &&
@@ -238,12 +308,14 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     {
         int created = 0, updated = 0, deleted = 0, failed = 0;
 
-        foreach (var eventId in PendingDeletes.ToList())
+        // Both copies taken under the store's lock: this runs from the auto-sync timer, so
+        // the UI thread can be adding to either list while it does.
+        foreach (var eventId in store.Edit(file => file.PendingDeletes.ToList()))
         {
             try
             {
                 await graph.DeleteEventAsync(eventId, ct);
-                PendingDeletes.Remove(eventId);
+                store.Edit(file => { file.PendingDeletes.Remove(eventId); });
                 deleted++;
             }
             catch (Exception)
@@ -254,7 +326,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
         try
         {
-            foreach (var allocation in store.All.ToList())
+            foreach (var allocation in store.Edit(file => file.Allocations.ToList()))
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -268,7 +340,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
                 {
                     if (allocation.OutlookEventId is null)
                     {
-                        allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                        allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
                         created++;
                     }
                     else if (!await graph.EventExistsAsync(allocation.OutlookEventId, ct))
@@ -279,7 +351,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
                     }
                     else
                     {
-                        await graph.UpdateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                        await graph.UpdateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
                         updated++;
                     }
 
@@ -313,9 +385,9 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         try
         {
             if (allocation.OutlookEventId is null || !await graph.EventExistsAsync(allocation.OutlookEventId, ct))
-                allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                allocation.OutlookEventId = await graph.CreateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
             else
-                await graph.UpdateEventAsync(allocation, RecordedMinutesForBlock(allocation.Id), ct);
+                await graph.UpdateEventAsync(allocation, RecordedMinutesForBlockLocked(allocation.Id), ct);
 
             allocation.MissingInOutlook = false;
 
@@ -343,17 +415,20 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     public void SetLocalPriority(int workItemId, int priority)
     {
-        if (priority is < 1 or > 4)
-            store.Priorities.Remove(workItemId);
-        else
-            store.Priorities[workItemId] = priority;
+        // A dictionary is copied by enumerating it, so a save running on a polling thread
+        // while this writes brings the whole save down - see PlanStore.Edit.
+        store.Edit(file =>
+        {
+            if (priority is < 1 or > 4) file.Priorities.Remove(workItemId);
+            else file.Priorities[workItemId] = priority;
+        });
 
         Persist();
     }
 
     public void ClearLocalPriority(int workItemId)
     {
-        if (store.Priorities.Remove(workItemId)) Persist();
+        if (store.Edit(file => file.Priorities.Remove(workItemId))) Persist();
     }
 
     // ---------------------------------------------------------------- two-way sync
@@ -379,15 +454,19 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// </summary>
     public int AdoptOrphanEvents(IReadOnlyList<ExistingEvent> events)
     {
-        var known = store.All.Select(a => a.Id).ToHashSet();
-        var claimed = store.All
-            .Where(a => a.OutlookEventId is not null)
-            .Select(a => a.OutlookEventId!)
-            .ToHashSet(StringComparer.Ordinal);
-
-        // Both are lists on disk; lifted out of the loop because every event tests against them.
-        var pending = store.PendingDeletes.ToHashSet(StringComparer.Ordinal);
-        var disowned = store.Disowned.ToHashSet(StringComparer.Ordinal);
+        // All four taken together under the store's lock. This runs from the calendar poll's
+        // timer callback while the UI thread can be adding blocks and disowning events, and
+        // each of these copies reads a count and then takes the items - see PlanStore.Edit.
+        // The last two are lists on disk, lifted out of the loop because every event tests
+        // against them.
+        var (known, claimed, pending, disowned) = store.Edit(file => (
+            file.Allocations.Select(a => a.Id).ToHashSet(),
+            file.Allocations
+                .Where(a => a.OutlookEventId is not null)
+                .Select(a => a.OutlookEventId!)
+                .ToHashSet(StringComparer.Ordinal),
+            file.PendingDeletes.ToHashSet(StringComparer.Ordinal),
+            file.Disowned.ToHashSet(StringComparer.Ordinal)));
 
         var adopted = new List<Allocation>();
 
@@ -447,7 +526,9 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
         int moved = 0, newlyMissing = 0, restored = 0, readopted = 0;
 
-        foreach (var allocation in store.All)
+        // Copied under the store's lock, for the same reason adoption takes its own copies:
+        // this runs from the calendar poll and the UI thread adds to the same list.
+        foreach (var allocation in store.Edit(file => file.Allocations.ToList()))
         {
             if (allocation.OutlookEventId is null) continue;
 
@@ -524,12 +605,16 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
         var allocation = Find(id);
         if (allocation is null || !allocation.MissingInOutlook) return;
 
-        // The event is believed gone, but "believed" is doing work there: it was judged
-        // missing from one week's worth of calendar. If it turns up again, it is still one
-        // this plan has finished with.
-        if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(eventId);
+        store.Edit(file =>
+        {
+            // The event is believed gone, but "believed" is doing work there: it was judged
+            // missing from one week's worth of calendar. If it turns up again, it is still one
+            // this plan has finished with.
+            if (allocation.OutlookEventId is { Length: > 0 } eventId) Disown(file, eventId);
 
-        store.All.Remove(allocation);
+            file.Allocations.Remove(allocation);
+        });
+
         Persist();
     }
 
@@ -537,12 +622,16 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
 
     public IReadOnlyList<TimeEntry> TimeEntries => store.TimeEntries;
 
-    /// <summary>Records that time was booked against the work item from this block.</summary>
-    public TimeEntry AddTimeEntry(
-        Allocation allocation, double hours, bool reducedRemaining,
+    /// <summary>
+    /// The entry a booking from this block makes, not yet filed. The organization is passed
+    /// in rather than read from the settings: its id comes from Azure DevOps itself, and this
+    /// is the stamp a later Undo, check or settle judges the work item by.
+    /// </summary>
+    public TimeEntry BuildTimeEntry(
+        Allocation allocation, OrganizationRef organization, double hours, bool reducedRemaining,
         double appliedCompleted = 0, double appliedRemaining = 0, string comment = "")
     {
-        var entry = new TimeEntry
+        return new TimeEntry
         {
             AllocationId = allocation.Id,
             WorkItemId = allocation.WorkItemId,
@@ -550,6 +639,8 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             WorkItemType = allocation.WorkItemType,
             WorkItemUrl = allocation.WorkItemUrl,
             Project = allocation.Project,
+            Organization = organization.Url,
+            OrganizationId = organization.Id,
             Date = allocation.Start.Date,
             Start = allocation.Start,
             BlockMinutes = allocation.DurationMinutes,
@@ -561,15 +652,457 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             Notes = allocation.Notes,
             Comment = comment.Trim(),
         };
-
-        store.TimeEntries.Add(entry);
-        Persist();
-        return entry;
     }
 
-    public void RemoveTimeEntry(Guid entryId)
+    /// <summary>
+    /// Writes down which comment a booking's note was posted as, so undoing those hours can
+    /// offer to take the note off with them. The project goes down beside the id because that
+    /// is how the comment is addressed, and the project selected here can move on afterwards.
+    ///
+    /// This is the entry that posted it, written down once the discussion has answered with an
+    /// id. Every entry the comment covers carries it, not only that one: a day booked in one
+    /// pass posts a work item's note once and books several blocks behind it, and an id on the
+    /// posting entry alone would let that entry's undo delete a comment still speaking for
+    /// hours that are staying - and leave the rest with a note nothing here could ever take
+    /// off. The rest are stamped before their own write instead of afterwards, so a booking
+    /// Azure DevOps never confirms carries it too; see
+    /// <see cref="AppState.RecordTimeSilentAsync"/>. Shared, the comment goes with the last of
+    /// the hours it covers; see <see cref="OthersSharingNote"/>, which is what tells an undo it
+    /// is not the last.
+    /// </summary>
+    public void SetTimeNote(Guid entryId, int commentId, string project)
     {
-        if (store.TimeEntries.RemoveAll(e => e.Id == entryId) > 0) Persist();
+        // Through the store, under the lock a save holds - this follows a time write, which
+        // can be going on while a polling timer saves the plan on another thread.
+        var set = store.Edit(file =>
+        {
+            if (file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is not { } entry) return false;
+
+            entry.CommentId = commentId;
+            entry.CommentProject = project;
+            return true;
+        });
+
+        if (set) Persist();
+    }
+
+    /// <summary>
+    /// The other entries whose note is this very comment - the rest of a day booked in one
+    /// pass, which posts a work item's note once and stamps its id onto each entry behind it.
+    /// Empty when this entry is the only one left carrying it, which is what makes it the one
+    /// that may take the comment off without leaving hours behind it unexplained.
+    ///
+    /// Matched on the work item as well as the id: comment ids are numbered within a work item,
+    /// so the same small number belongs to a different comment on every other one - and within
+    /// the entry's own organization, because a work item number means nothing outside it and
+    /// the ids are small and sequential, so an entry left over from a previous organization
+    /// would otherwise be counted as a sibling of hours it has nothing to do with.
+    ///
+    /// An entry that says nothing about where it came from is counted in, the way
+    /// <see cref="SameOrganizationAs"/> leaves it in everywhere: here the worse of the two
+    /// mistakes is missing a sibling, which is what lets a note come off the discussion while
+    /// the hours it also speaks for stand.
+    /// </summary>
+    public IReadOnlyList<TimeEntry> OthersSharingNote(TimeEntry entry)
+    {
+        if (entry.CommentId <= 0) return [];
+
+        var confined = SameOrganizationAs(entry);
+        return [.. store.TimeEntries.Where(e => e.Id != entry.Id
+                                                && e.CommentId == entry.CommentId
+                                                && e.WorkItemId == entry.WorkItemId
+                                                && confined(e))];
+    }
+
+    /// <summary>
+    /// Forgets a comment on every entry still carrying its id, once it has actually been taken
+    /// off the discussion by an undo of one of the entries it covered. The same match
+    /// <see cref="OthersSharingNote"/> makes, so exactly the entries that were named as sharing
+    /// it are the ones that stop claiming it.
+    ///
+    /// Without this those entries go on offering to remove a comment that has gone: their undo
+    /// would say the note also covers hours that are staying and turn the tick off to protect
+    /// it, which is a false reason once nothing is there. The text stays - it is what the hours
+    /// went on - so the dialog can still say why the note cannot come off.
+    ///
+    /// The project goes with the id because the two are one record: a project with no id to go
+    /// with addresses nothing.
+    /// </summary>
+    public void ForgetTimeNote(TimeEntry entry)
+    {
+        if (entry.CommentId <= 0) return;
+
+        var confined = SameOrganizationAs(entry);
+
+        // Through the store, under the lock a save holds: this follows an undo, which can be
+        // going on while a polling timer saves the plan on another thread.
+        var cleared = store.Edit(file =>
+        {
+            var any = false;
+
+            foreach (var other in file.TimeEntries)
+            {
+                if (other.Id == entry.Id || other.CommentId != entry.CommentId
+                    || other.WorkItemId != entry.WorkItemId || !confined(other)) continue;
+
+                other.CommentId = 0;
+                other.CommentProject = "";
+                any = true;
+            }
+
+            return any;
+        });
+
+        if (cleared) Persist();
+    }
+
+    // ---------------------------------------------------------------- unconfirmed bookings
+
+    /// <summary>
+    /// Writes a booking down before it is sent, pinned to the revision it tests against, and
+    /// again for each further send of the same one so the record always names the change that
+    /// is actually out there. Nothing counts it as recorded: it may not be on the work item.
+    ///
+    /// Before the send rather than after the answer, because a copy that goes away in between
+    /// would otherwise leave hours on a work item with nothing here pointing at them, and the
+    /// block offered again as if it had never been booked.
+    /// </summary>
+    public void PinUnconfirmed(UnconfirmedBooking booking, TimeWritePlan plan)
+    {
+        booking.Plan = plan;
+        booking.InFlight = true;
+
+        // Both fields clamp at zero, so what the change actually moves is only known once it
+        // has been worked out against the item as it stands.
+        booking.Entry.AppliedCompleted = plan.AppliedCompleted;
+        booking.Entry.AppliedRemaining = plan.AppliedRemaining;
+
+        // Through the store, under the lock a save holds: this runs from a time write, which
+        // can be going on while a polling timer is saving the plan on another thread.
+        store.Edit(file =>
+        {
+            if (!file.UnconfirmedBookings.Contains(booking)) file.UnconfirmedBookings.Add(booking);
+        });
+
+        Persist();
+    }
+
+    /// <summary>
+    /// The write came back unanswered, so what was written down before it went out is now a
+    /// genuinely unconfirmed booking: something to tell the user about, and to check later.
+    /// </summary>
+    public void LeaveUnconfirmed(UnconfirmedBooking booking)
+    {
+        booking.InFlight = false;
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Files a booking that did go through as the entry it makes, lets go of anything its
+    /// write overtook, and takes it off the unconfirmed list - all in one save. Two saves
+    /// would leave a moment where a copy that died had both the entry and the booking, and
+    /// the next settle would file the same hours a second time.
+    /// </summary>
+    public TimeEntry Confirm(UnconfirmedBooking booking, TimeRecordResult result)
+    {
+        booking.InFlight = false;
+        booking.Entry.AppliedCompleted = result.AppliedCompleted;
+        booking.Entry.AppliedRemaining = result.AppliedRemaining;
+
+        store.Edit(file =>
+        {
+            file.UnconfirmedBookings.Remove(booking);
+            file.TimeEntries.Add(booking.Entry);
+            if (result.Plan is { } landed) DropOvertaken(file, landed, booking.Entry);
+        });
+
+        Persist();
+        return booking.Entry;
+    }
+
+    /// <summary>Lets go of a booking that certainly never reached the work item.</summary>
+    public void DropUnconfirmed(UnconfirmedBooking booking)
+    {
+        booking.InFlight = false;
+        if (store.Edit(file => file.UnconfirmedBookings.Remove(booking))) Persist();
+    }
+
+    /// <summary>
+    /// The bookings still to be settled. Ones whose write is still going in this copy are not
+    /// among them: until it comes back there is nothing to say and nothing to check, and the
+    /// block it belongs to is claimed by that write anyway.
+    /// </summary>
+    public IReadOnlyList<UnconfirmedBooking> UnconfirmedBookings =>
+        [.. store.UnconfirmedBookings.Where(b => !b.InFlight)];
+
+    /// <summary>The unsettled bookings from one block, oldest first.</summary>
+    public IReadOnlyList<UnconfirmedBooking> UnconfirmedForBlock(Guid allocationId) =>
+        [.. store.UnconfirmedBookings
+            .Where(b => !b.InFlight && b.Entry.AllocationId == allocationId)
+            .OrderBy(b => b.Entry.RecordedAt)];
+
+    public bool HasUnconfirmed(Guid allocationId) =>
+        store.UnconfirmedBookings.Any(b => !b.InFlight && b.Entry.AllocationId == allocationId);
+
+    /// <summary>Still waiting to be settled, rather than filed or let go since it was read.</summary>
+    public bool IsUnsettled(UnconfirmedBooking booking) => store.UnconfirmedBookings.Contains(booking);
+
+    /// <summary>
+    /// Settles one unconfirmed booking: filed as an entry when it turned out to have landed,
+    /// otherwise simply let go. False when it had already gone.
+    /// </summary>
+    public bool SettleUnconfirmed(UnconfirmedBooking booking, bool landed)
+    {
+        // Removing it is also the test that it was still there to settle: whether another
+        // check or the quiet settle got here first is only knowable inside the same lock that
+        // takes it off the list.
+        var settled = store.Edit(file =>
+        {
+            if (!file.UnconfirmedBookings.Remove(booking)) return false;
+
+            if (landed)
+            {
+                file.TimeEntries.Add(booking.Entry);
+                if (booking.Plan is { } plan) DropOvertaken(file, plan, booking.Entry);
+            }
+
+            return true;
+        });
+
+        if (settled) Persist();
+        return settled;
+    }
+
+    /// <summary>
+    /// Lets go of everything a write that did land has overtaken: bookings and undos alike
+    /// pinned to the same revision of the same work item. Only one write can ever become the
+    /// revision after it, so none of the others can land now - and checking one later would
+    /// find this write's change sitting there and claim it, which for an undo means dropping
+    /// an entry whose hours are still on the work item.
+    ///
+    /// Both lists together, because the two are pinned the same way and a booking can just as
+    /// easily overtake an undo as another booking: zero-clamping alone makes any two changes
+    /// that drive Completed Work to nothing from the same place identical.
+    ///
+    /// Only within the organization the write that landed belongs to, which
+    /// <paramref name="from"/> carries - see <see cref="SameOrganizationAs"/>. A work item
+    /// number and a revision mean nothing outside one organization, so without that a booking
+    /// made before a switch would be let go on the strength of a revision of some other
+    /// organization's #7 - and its hours could still be sitting on the item it really went to.
+    ///
+    /// An overtaken pin left behind is the worse of the two mistakes here, which is why what
+    /// says nothing about where it came from is left in: a later check would find this write's
+    /// change sitting on the work item and file the same hours a second time.
+    /// </summary>
+    private static bool DropOvertaken(PlanFile file, TimeWritePlan landed, TimeEntry from)
+    {
+        var confined = SameOrganizationAs(from);
+
+        var dropped = file.UnconfirmedBookings.RemoveAll(
+            b => b.Plan is { } plan && Overtaken(plan, landed) && confined(b.Entry)) > 0;
+
+        foreach (var entry in file.TimeEntries)
+        {
+            if (entry.UnconfirmedUndo is not { } undo || !Overtaken(undo, landed)) continue;
+            if (!confined(entry)) continue;
+
+            entry.UnconfirmedUndo = null;
+            dropped = true;
+        }
+
+        return dropped;
+    }
+
+    /// <summary>
+    /// Whether another set of hours came from the same Azure DevOps organization as these -
+    /// the test every match on a work item number has to be confined by, because that number
+    /// means a different item in every other organization.
+    ///
+    /// An entry written before the stamp existed carries no organization at all, and an empty
+    /// one matches everything - which is no confinement whatever. Those are judged on the work
+    /// item link they were kept with instead: it is built from the organization address, so
+    /// two links to the same work item number from the same organization are the same address
+    /// and one from another organization plainly is not.
+    ///
+    /// Anything that still says nothing about where it came from is left in, as everything was
+    /// before there was a stamp to go by. Both callers want it that way: for an overtaken pin
+    /// and for a note two entries share, the mistake that costs something is leaving one out.
+    /// </summary>
+    private static Func<TimeEntry, bool> SameOrganizationAs(TimeEntry from)
+    {
+        var where = OrganizationRef.For(from.Organization, from.OrganizationId);
+
+        // Only used when the stamp says nothing, which is the case BelongsTo cannot confine.
+        var here = where.Url.Length == 0 && where.Id.Length == 0
+            ? TimeEntry.NormaliseOrganization(from.WorkItemUrl)
+            : "";
+
+        return entry =>
+        {
+            if (here.Length == 0) return entry.BelongsTo(where);
+
+            // The candidate's own address: its stamp when it has one, its work item link when
+            // it does not. Either way the link above starts with it, unless the two are from
+            // different organizations.
+            var there = TimeEntry.NormaliseOrganization(
+                entry.Organization.Length > 0 ? entry.Organization : entry.WorkItemUrl);
+
+            return there.Length == 0
+                   || there == here
+                   || here.StartsWith(there + "/", StringComparison.Ordinal);
+        };
+    }
+
+    private static bool Overtaken(TimeWritePlan pending, TimeWritePlan landed) =>
+        pending.WorkItemId == landed.WorkItemId && pending.Rev == landed.Rev;
+
+    /// <summary>Writes down, or clears, an undo of this entry that was never confirmed.</summary>
+    public void SetUnconfirmedUndo(Guid entryId, TimeWritePlan? plan)
+    {
+        var set = store.Edit(file =>
+        {
+            if (file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is not { } entry) return false;
+
+            entry.UnconfirmedUndo = plan;
+            return true;
+        });
+
+        if (set) Persist();
+    }
+
+    /// <summary>
+    /// Settles an undo that was never confirmed, against the very pin it was judged by.
+    ///
+    /// The pin is checked here rather than by the caller because the caller had to await
+    /// Azure DevOps to learn the answer, and in that time another undo of the same work item
+    /// can land and sweep this pin away - which says this one did not land, whatever the
+    /// history seemed to say a moment ago. Checked and acted on inside one lock, so there is
+    /// no gap between the two: false means somebody else has already settled it.
+    ///
+    /// Landed, the entry goes and everything its revision overtook goes with it, in one save.
+    /// Not landed, only the pin is let go: the hours are still on the work item and the entry
+    /// still stands for them.
+    /// </summary>
+    public bool SettleUnconfirmedUndo(Guid entryId, TimeWritePlan expected, bool landed)
+    {
+        var settled = store.Edit(file =>
+        {
+            if (file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is not { } entry) return false;
+            if (entry.UnconfirmedUndo != expected) return false;
+
+            if (landed)
+            {
+                file.TimeEntries.Remove(entry);
+                DropOvertaken(file, expected, entry);
+            }
+            else
+            {
+                entry.UnconfirmedUndo = null;
+            }
+
+            return true;
+        });
+
+        if (settled) Persist();
+        return settled;
+    }
+
+    /// <summary>
+    /// Drops an entry, and in the same save lets go of whatever the write that took it off
+    /// overtook. One save, so no copy can die holding the entry gone and the sweep undone.
+    /// </summary>
+    public void RemoveTimeEntry(Guid entryId, TimeWritePlan? landed = null)
+    {
+        var changed = store.Edit(file =>
+        {
+            var gone = file.TimeEntries.FirstOrDefault(e => e.Id == entryId);
+            var removed = gone is not null && file.TimeEntries.Remove(gone);
+            var swept = landed is { } plan && gone is not null && DropOvertaken(file, plan, gone);
+            return removed || swept;
+        });
+
+        if (changed) Persist();
+    }
+
+    /// <summary>
+    /// Says that a block's unsettled bookings were made against this organization after all,
+    /// whatever address they were stamped with: a rename, Microsoft's move to dev.azure.com,
+    /// or a server answering to a new name all leave hours stranded behind a stamp that no
+    /// longer matches anything, and the old address may not even exist to switch back to.
+    ///
+    /// Only the stamp changes. Nothing is written to Azure DevOps, and the booking is no more
+    /// settled than it was - it can simply be checked and answered for again. Returns how many
+    /// were brought over.
+    ///
+    /// Only the bookings that are actually refused, and of those only the ones the service has
+    /// not already ruled on. A block can hold one made before an organization was switched and
+    /// one made after, and the user saying that the old address is this organization says
+    /// nothing about the one that was already here - re-stamping that one too would quietly
+    /// move a booking nobody asked about.
+    /// </summary>
+    public int AdoptOrganization(Guid allocationId, OrganizationRef organization)
+    {
+        var stamped = store.Edit(file =>
+        {
+            var count = 0;
+            foreach (var booking in file.UnconfirmedBookings)
+            {
+                if (booking.Entry.AllocationId != allocationId) continue;
+                if (booking.Entry.BelongsTo(organization)) continue;
+
+                // Never over Azure DevOps' own word. The callers refuse such a claim with a
+                // reason before they get here; this is the ledger itself keeping the rule, so
+                // no future opening onto it can write an organization onto hours the service
+                // has already placed elsewhere.
+                if (!booking.Entry.CouldBelongTo(organization)) continue;
+
+                if (Stamp(booking.Entry, organization)) count++;
+            }
+
+            return count;
+        });
+
+        if (stamped > 0) Persist();
+        return stamped;
+    }
+
+    /// <summary>
+    /// The same for one filed entry, whose undo is the thing being refused - and held to the
+    /// same rule, that an entry Azure DevOps has already placed elsewhere is not moved.
+    /// </summary>
+    public bool AdoptOrganizationForEntry(Guid entryId, OrganizationRef organization)
+    {
+        var stamped = store.Edit(file =>
+            file.TimeEntries.FirstOrDefault(e => e.Id == entryId) is { } entry
+            && entry.CouldBelongTo(organization)
+            && Stamp(entry, organization));
+
+        if (stamped) Persist();
+        return stamped;
+    }
+
+    /// <summary>
+    /// Writes the organization onto one entry, keeping whatever of its id is worth keeping.
+    ///
+    /// The address is the whole point of adopting and is simply replaced. The id is not: it is
+    /// the one part of an organization that a rename or a new address leaves alone, and it is
+    /// empty until connectionData has been read for the address Slate is pointed at now. The
+    /// callers read it first where they can, so what is left here is a connection that will
+    /// not say who it is at all. Writing that emptiness over the id the entry already carries
+    /// would throw away the very thing the stamp exists to hold, and the next rename would
+    /// strand the entry all over again. So a known id is only ever replaced by another known
+    /// one; saying these hours are this organization's while it cannot say which organization
+    /// that is leaves the id they were booked with standing.
+    /// </summary>
+    private static bool Stamp(TimeEntry entry, OrganizationRef organization)
+    {
+        var id = organization.Id.Length > 0 ? organization.Id : entry.OrganizationId;
+
+        if (entry.Organization == organization.Url && entry.OrganizationId == id) return false;
+
+        entry.Organization = organization.Url;
+        entry.OrganizationId = id;
+        return true;
     }
 
     public TimeEntry? FindTimeEntry(Guid entryId) =>
@@ -595,9 +1128,30 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     public int RecordedMinutes(int workItemId) =>
         store.TimeEntries.Where(e => e.WorkItemId == workItemId).Sum(e => e.Minutes);
 
-    /// <summary>Total minutes recorded from one calendar block.</summary>
+    /// <summary>
+    /// Total minutes recorded from one calendar block, read without taking the plan's lock.
+    ///
+    /// For the UI thread, which asks this of every block on the grid several times a render
+    /// and of a dialog's rows as they are built. The lock stays off this path because a save
+    /// holds it across serialising the whole plan and writing it to disk, and putting a render
+    /// behind that for every block is not a trade worth making for a number that is only shown.
+    ///
+    /// Anything reading it from another thread wants
+    /// <see cref="RecordedMinutesForBlockLocked"/>: the sum enumerates the entries, and an
+    /// entry filed while it does brings the reader down.
+    /// </summary>
     public int RecordedMinutesForBlock(Guid allocationId) =>
         store.TimeEntries.Where(e => e.AllocationId == allocationId).Sum(e => e.Minutes);
+
+    /// <summary>
+    /// The same total, taken under the lock a save holds - for the two sync paths, which run
+    /// from the calendar timer's thread-pool callback while a booking is being filed from the
+    /// UI thread or from the quiet settle. The enumeration throws when that happens, and the
+    /// throw lands on one allocation as a sync failure reading "Collection was modified",
+    /// whose event is then not sent until the next pass.
+    /// </summary>
+    private int RecordedMinutesForBlockLocked(Guid allocationId) =>
+        store.Edit(file => file.TimeEntries.Where(e => e.AllocationId == allocationId).Sum(e => e.Minutes));
 
     // ---------------------------------------------------------------- helpers
 

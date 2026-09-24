@@ -324,11 +324,16 @@ window.planner = (() => {
 
         const combo = (e.ctrlKey ? 'ctrl+' : '') + (e.shiftKey ? 'shift+' : '') + e.key.toLowerCase();
         const handled = [
-            'arrowleft', 'arrowright', 't', 'r', 'delete', 'escape', 'f', '/', 'ctrl+s', 'ctrl+f',
+            'arrowleft', 'arrowright', 't', 'r', 'delete', 'escape', 'f', '/', 'ctrl+s', 'ctrl+f', 'ctrl+r',
         ];
 
         if (!handled.includes(combo)) return;
         e.preventDefault();
+
+        // A dialog marked as handling its own Escape has already closed itself. Passing the
+        // key on too would close what it was opened over as well - Record day included.
+        if (combo === 'escape' && e.target.closest && e.target.closest('[data-own-escape]')) return;
+
         shortcutRef.invokeMethodAsync('OnShortcut', combo);
     }
 

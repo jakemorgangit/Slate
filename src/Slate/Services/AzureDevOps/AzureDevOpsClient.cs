@@ -2,7 +2,6 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Slate.Models;
@@ -11,7 +10,7 @@ using Slate.Services.Storage;
 
 namespace Slate.Services.AzureDevOps;
 
-public sealed class AzureDevOpsException(string message, Exception? inner = null) : Exception(message, inner)
+public class AzureDevOpsException(string message, Exception? inner = null) : Exception(message, inner)
 {
     /// <summary>
     /// The HTTP status behind this failure, when there was a response to read one from.
@@ -25,6 +24,30 @@ public sealed class AzureDevOpsException(string message, Exception? inner = null
     /// Nothing is wrong with the credential or the configuration.
     /// </summary>
     public bool IsTransient { get; init; }
+
+    /// <summary>
+    /// The request may have reached the service, and no answer came back that says whether
+    /// it was carried out: the connection dropped or timed out after it was sent, the service
+    /// failed while handling it, or it said yes in a form that could not be read. A write
+    /// that ends like this may or may not have happened. False when it was turned down, or
+    /// never left this machine - both of which mean nothing was done.
+    /// </summary>
+    public bool Unanswered { get; init; }
+
+    /// <summary>Azure DevOps' own name for the failure (its typeKey), when it gave one.</summary>
+    public string? ErrorKey { get; init; }
+}
+
+/// <summary>
+/// A change to a work item's time that went out without an answer, where looking at the work
+/// item afterwards could not settle whether it landed either. Distinct from a failure, which
+/// is safe to try again: this one may already be on the work item.
+/// </summary>
+public sealed class TimeWriteUnconfirmedException(string message, TimeWritePlan plan, Exception? inner = null)
+    : AzureDevOpsException(message, inner)
+{
+    /// <summary>What was sent, so a later check can still look for it.</summary>
+    public TimeWritePlan Plan { get; } = plan;
 }
 
 /// <summary>
@@ -43,49 +66,9 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     {
         AutomaticDecompression = DecompressionMethods.All,
         PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-        ConnectCallback = ConnectPreferringIPv4Async,
+        ConnectCallback = PreferIPv4.ConnectAsync,
     })
     { Timeout = TimeSpan.FromSeconds(60) };
-
-    /// <summary>
-    /// Opens the connection over IPv4 when the host has an IPv4 address, and only falls back
-    /// to IPv6 when it has none or IPv4 cannot connect.
-    ///
-    /// Azure DevOps is reachable on both, and Windows offers IPv6 first. On some networks the
-    /// IPv6 route to Azure DevOps accepts the connection and then resets it partway through
-    /// the TLS handshake - "The SSL connection could not be established" - on every attempt,
-    /// while IPv4 to the same service works and Graph and sign-in work over IPv6. The reset
-    /// arrives after the connection is made, too late for anything to fall back on its own.
-    /// </summary>
-    private static async ValueTask<Stream> ConnectPreferringIPv4Async(
-        SocketsHttpConnectionContext context, CancellationToken ct)
-    {
-        var endpoint = context.DnsEndPoint;
-        var addresses = await Dns.GetHostAddressesAsync(endpoint.Host, ct);
-        Exception? last = null;
-
-        foreach (var address in addresses.OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1))
-        {
-            var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            try
-            {
-                await socket.ConnectAsync(address, endpoint.Port, ct);
-                return new NetworkStream(socket, ownsSocket: true);
-            }
-            catch (SocketException ex)
-            {
-                socket.Dispose();
-                last = ex;
-            }
-            catch
-            {
-                socket.Dispose();
-                throw;
-            }
-        }
-
-        throw last ?? new SocketException((int)SocketError.HostNotFound);
-    }
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -151,7 +134,29 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     }
 
     private async Task<JsonDocument> SendAsync(
-        HttpMethod method, string url, object? body, CancellationToken ct, string? contentType = null)
+        HttpMethod method, string url, object? body, CancellationToken ct, string? contentType = null) =>
+        ReadAnswer(await SendForPayloadAsync(method, url, body, ct, contentType));
+
+    /// <summary>
+    /// The same send with nothing read back, for a request whose answer is the status alone -
+    /// a delete, which Azure DevOps replies to with an empty body. Parsing that as JSON would
+    /// report a delete that plainly worked as an answer this app could not read.
+    ///
+    /// Nothing read back is not nothing checked: the sign-in page a rejected credential is
+    /// answered 2xx with is turned away inside the send itself, so this is no more willing to
+    /// call a request a success than any other here.
+    /// </summary>
+    private async Task SendNoAnswerAsync(HttpMethod method, string url, CancellationToken ct) =>
+        await SendForPayloadAsync(method, url, null, ct, null);
+
+    /// <summary>
+    /// The request itself, up to and including how a failure is classified: the silent token
+    /// renewal, the transport failures that leave a write in doubt, and the service's own
+    /// refusals. What comes back is the body as it arrived, for the caller to make what it
+    /// can of.
+    /// </summary>
+    private async Task<string> SendForPayloadAsync(
+        HttpMethod method, string url, object? body, CancellationToken ct, string? contentType)
     {
         // A 401 on a signed-in account usually means the cached token went stale while the
         // machine slept. One silent renewal is tried before calling the credential bad.
@@ -174,12 +179,15 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             }
             catch (HttpRequestException ex)
             {
-                throw new AzureDevOpsException($"Could not reach {OrgUrl}. {ex.Message}", ex) { IsTransient = true };
+                throw new AzureDevOpsException($"Could not reach {OrgUrl}. {ex.Message}", ex)
+                { IsTransient = true, Unanswered = !NeverSent(ex) };
             }
             catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
             {
-                // HttpClient's own timeout, not the caller cancelling.
-                throw new AzureDevOpsException($"Timed out reaching {OrgUrl}.", ex) { IsTransient = true };
+                // HttpClient's own timeout, not the caller cancelling. The request may be
+                // sitting at the service still, and may yet be carried out.
+                throw new AzureDevOpsException($"Timed out reaching {OrgUrl}.", ex)
+                { IsTransient = true, Unanswered = true };
             }
 
             if (response.StatusCode == HttpStatusCode.Unauthorized && canRenew && !renewed)
@@ -188,9 +196,17 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
                 continue;
             }
 
-            return await ReadAsync(response, ct);
+            return await ReadPayloadAsync(response, ct);
         }
     }
+
+    /// <summary>
+    /// Failures that happen before the request is on its way: nothing reached the service, so
+    /// nothing can have been done there.
+    /// </summary>
+    private static bool NeverSent(HttpRequestException ex) => ex.HttpRequestError is
+        HttpRequestError.NameResolutionError or HttpRequestError.ConnectionError
+        or HttpRequestError.SecureConnectionError or HttpRequestError.ProxyTunnelError;
 
     private static readonly HashSet<HttpStatusCode> BusyStatuses =
     [
@@ -198,7 +214,21 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         HttpStatusCode.BadGateway, HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout,
     ];
 
-    private static async Task<JsonDocument> ReadAsync(HttpResponseMessage response, CancellationToken ct)
+    /// <summary>
+    /// Statuses that leave a write in doubt: the service failed while handling the request, or
+    /// a gateway gave up while it carried on, so it may yet be carried out.
+    ///
+    /// "Service unavailable" is not one of them, and neither is throttling: those are the front
+    /// door turning the request away before it reaches anything that could act on it. Counting
+    /// them as doubtful would turn an ordinary outage - where every call fails and nothing at
+    /// all happens - into hours that may already be booked and a block nobody can record until
+    /// the work item can be read again.
+    /// </summary>
+    private static bool LeavesWritesInDoubt(HttpStatusCode status) =>
+        status is HttpStatusCode.RequestTimeout
+        || ((int)status >= 500 && status != HttpStatusCode.ServiceUnavailable);
+
+    private static async Task<string> ReadPayloadAsync(HttpResponseMessage response, CancellationToken ct)
     {
         using (response)
         {
@@ -206,22 +236,60 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
 
             if (!response.IsSuccessStatusCode)
                 throw new AzureDevOpsException(DescribeFailure(response, payload))
-                { Status = response.StatusCode, IsTransient = BusyStatuses.Contains(response.StatusCode) };
+                {
+                    Status = response.StatusCode,
+                    IsTransient = BusyStatuses.Contains(response.StatusCode),
+                    Unanswered = LeavesWritesInDoubt(response.StatusCode),
+                    ErrorKey = ReadErrorKey(payload),
+                };
 
-            // A sign-in redirect comes back as 200 plus HTML, which means the credential was rejected.
+            // A sign-in redirect comes back as 200 plus HTML, which means the credential was
+            // rejected and nothing was done. Judged on every answer rather than only on the
+            // ones read as data: a request whose answer is its status alone - a delete - would
+            // otherwise take that very page for the one 2xx nobody looks inside, and report a
+            // comment as removed while it is still on the discussion.
             if (payload.StartsWith('<'))
                 throw new AzureDevOpsException(
-                    "Azure DevOps returned a sign-in page instead of data. The token is likely expired or lacks the Work Items (Read) scope.");
+                    "Azure DevOps returned a sign-in page instead of an answer. The token is likely expired or lacks the Work Items scope this needs.");
 
-            try
-            {
-                return JsonDocument.Parse(payload);
-            }
-            catch (JsonException ex)
-            {
-                throw new AzureDevOpsException(
-                    "Azure DevOps returned a response this app could not read. " + ex.Message, ex);
-            }
+            return payload;
+        }
+    }
+
+    /// <summary>
+    /// Makes a document of an answer that was asked for as data. Whether the body is an answer
+    /// at all is already settled by <see cref="ReadPayloadAsync"/>; all that is left here is
+    /// reading it.
+    /// </summary>
+    private static JsonDocument ReadAnswer(string payload)
+    {
+        try
+        {
+            return JsonDocument.Parse(payload);
+        }
+        catch (JsonException ex)
+        {
+            // The service said yes, so a write did happen - it is only the account of it
+            // that is missing.
+            throw new AzureDevOpsException(
+                "Azure DevOps returned a response this app could not read. " + ex.Message, ex)
+            { Unanswered = true };
+        }
+    }
+
+    private static string? ReadErrorKey(string payload)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                   && doc.RootElement.TryGetProperty("typeKey", out var key) && key.ValueKind == JsonValueKind.String
+                ? key.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
         }
     }
 
@@ -823,17 +891,14 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             id, rev, new Dictionary<string, object?> { ["System.Description"] = html ?? "" }, ct);
     }
 
-    /// <summary>Who the current credential belongs to, used to decide what is editable here.</summary>
-    public async Task<string> GetAuthenticatedUserAsync(CancellationToken ct = default)
-    {
-        using var doc = await SendAsync(HttpMethod.Get,
-            $"{OrgUrl}/_apis/connectionData?api-version={ApiVersion}-preview", null, ct);
-
-        return doc.RootElement.TryGetProperty("authenticatedUser", out var user) &&
-               user.TryGetProperty("providerDisplayName", out var name)
-            ? name.GetString() ?? ""
-            : "";
-    }
+    /// <summary>
+    /// Who the current credential belongs to, used to decide what is editable here. Read
+    /// through the same connectionData call the time writes use, so the one thing that says
+    /// which organization this is and whose hand a revision was is read once and agreed on.
+    /// Empty when it could not be read, which is how it has always been treated here.
+    /// </summary>
+    public async Task<string> GetAuthenticatedUserAsync(CancellationToken ct = default) =>
+        (await ReadConnectionAsync(refresh: false, ct))?.DisplayName ?? "";
 
     // ---------------------------------------------------------------- discussion
 
@@ -844,7 +909,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     public async Task<List<WorkItemComment>> GetCommentsAsync(
         int id, string project, CancellationToken ct = default)
     {
-        var scope = string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);
+        var scope = CommentScope(project);
         if (string.IsNullOrWhiteSpace(scope))
             throw new AzureDevOpsException("A project is needed to read the discussion.");
 
@@ -872,7 +937,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         if (string.IsNullOrWhiteSpace(html))
             throw new AzureDevOpsException("Write something first.");
 
-        var scope = string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);
+        var scope = CommentScope(project);
         if (string.IsNullOrWhiteSpace(scope))
             throw new AzureDevOpsException("A project is needed to add to the discussion.");
 
@@ -882,6 +947,56 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
 
         return ReadComment(doc.RootElement);
     }
+
+    /// <summary>
+    /// Removes one comment from a work item's discussion, for taking back the note a booking
+    /// left when those hours are undone. Needs the Work Items (Read &amp; Write) scope, like
+    /// adding one.
+    ///
+    /// A 404 is neither a failure nor a removal, so it comes back as an answer of its own
+    /// rather than as silence. It is how Azure DevOps replies for a comment already gone - one
+    /// deleted in the browser, by a colleague, or by an earlier send of this whose answer never
+    /// came back - but it is equally how it replies when the address finds no such project or
+    /// work item, which a work item moved between projects and a project renamed since the note
+    /// went on will both produce. Telling the caller which of the two it was would take another
+    /// read of the discussion; telling it plainly that nothing was removed costs nothing and is
+    /// true either way.
+    ///
+    /// The project is taken as given, with no falling back to the selected one the way reading
+    /// and adding do: the point of a delete is not to guess what it lands on, and the project a
+    /// comment was posted under is kept beside its id for exactly this.
+    /// </summary>
+    public async Task<CommentRemoval> DeleteCommentAsync(
+        int id, string project, int commentId, CancellationToken ct = default)
+    {
+        if (commentId <= 0) throw new AzureDevOpsException("That note has no comment to remove.");
+
+        if (string.IsNullOrWhiteSpace(project))
+            throw new AzureDevOpsException(
+                "Slate did not write down which project that note was posted under, so it cannot address the comment.");
+
+        try
+        {
+            await SendNoAnswerAsync(HttpMethod.Delete,
+                $"{OrgUrl}/{Uri.EscapeDataString(project)}/_apis/wit/workItems/{id}/comments/{commentId}?api-version={CommentsApiVersion}",
+                ct);
+
+            return CommentRemoval.Removed;
+        }
+        catch (AzureDevOpsException ex) when (ex.Status == HttpStatusCode.NotFound)
+        {
+            return CommentRemoval.NotThere;
+        }
+    }
+
+    /// <summary>
+    /// The project segment the discussion is read and added to through: the one asked for, or
+    /// the selected project when nothing was. Empty when neither says anything, which both
+    /// callers refuse rather than sending an address with a hole in it. Removing a comment does
+    /// not come through here - see <see cref="DeleteCommentAsync"/>.
+    /// </summary>
+    private string CommentScope(string project) =>
+        string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);
 
     private static WorkItemComment ReadComment(JsonElement element) => new(
         element.TryGetProperty("id", out var id) ? id.GetInt32() : 0,
@@ -893,74 +1008,6 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     private static DateTimeOffset? ReadDate(JsonElement element, string name) =>
         element.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String &&
         DateTimeOffset.TryParse(v.GetString(), out var parsed) ? parsed : null;
-
-    /// <summary>Books time against a work item.</summary>
-    public Task<TimeRecordResult> RecordTimeAsync(
-        int id, double hours, bool reduceRemaining, CancellationToken ct = default)
-    {
-        if (hours <= 0) throw new AzureDevOpsException("Enter a number of hours greater than zero.");
-        return AdjustTimeAsync(id, hours, reduceRemaining ? -hours : 0, ct);
-    }
-
-    /// <summary>
-    /// Takes a previous booking back off the work item. Reverses the changes that were
-    /// actually applied rather than the hours that were asked for: recording clamps at
-    /// zero, so undoing by the asked-for hours hands back work that was never there.
-    /// </summary>
-    public Task<TimeRecordResult> UndoTimeAsync(
-        int id, double appliedCompleted, double appliedRemaining, CancellationToken ct = default)
-    {
-        if (appliedCompleted == 0 && appliedRemaining == 0)
-            throw new AzureDevOpsException("Nothing to undo.");
-
-        return AdjustTimeAsync(id, -appliedCompleted, -appliedRemaining, ct);
-    }
-
-    /// <summary>
-    /// Moves Completed Work and Remaining Work by signed amounts, reporting what it managed
-    /// to apply as well as where the fields ended up. Uses a rev test so a concurrent edit
-    /// fails loudly instead of being clobbered.
-    /// </summary>
-    private async Task<TimeRecordResult> AdjustTimeAsync(
-        int id, double completedDelta, double remainingDelta, CancellationToken ct)
-    {
-
-        double completed, remaining;
-        int rev;
-
-        using (var current = await SendAsync(HttpMethod.Get,
-                   $"{OrgUrl}/_apis/wit/workitems/{id}?api-version={ApiVersion}", null, ct))
-        {
-            var fields = current.RootElement.GetProperty("fields");
-            rev = current.RootElement.GetProperty("rev").GetInt32();
-            completed = Num(fields, "Microsoft.VSTS.Scheduling.CompletedWork") ?? 0;
-            remaining = Num(fields, "Microsoft.VSTS.Scheduling.RemainingWork") ?? 0;
-        }
-
-        var adjustRemaining = remainingDelta != 0;
-        var newCompleted = Math.Round(Math.Max(0, completed + completedDelta), 2);
-        var newRemaining = Math.Round(Math.Max(0, remaining + remainingDelta), 2);
-
-        var patch = new List<object>
-        {
-            new { op = "test", path = "/rev", value = rev },
-            new { op = "add", path = "/fields/Microsoft.VSTS.Scheduling.CompletedWork", value = newCompleted },
-        };
-
-        if (adjustRemaining)
-            patch.Add(new { op = "add", path = "/fields/Microsoft.VSTS.Scheduling.RemainingWork", value = newRemaining });
-
-        using var updated = await SendAsync(HttpMethod.Patch,
-            $"{OrgUrl}/_apis/wit/workitems/{id}?api-version={ApiVersion}",
-            patch, ct, "application/json-patch+json");
-
-        var result = updated.RootElement.GetProperty("fields");
-        return new TimeRecordResult(
-            Num(result, "Microsoft.VSTS.Scheduling.CompletedWork") ?? newCompleted,
-            Num(result, "Microsoft.VSTS.Scheduling.RemainingWork") ?? (adjustRemaining ? newRemaining : remaining),
-            newCompleted - completed,
-            adjustRemaining ? newRemaining - remaining : 0);
-    }
 
     /// <summary>Renders any field value as display text.</summary>
     private static string Describe(JsonElement value) => value.ValueKind switch

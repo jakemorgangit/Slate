@@ -3,12 +3,16 @@
 
 @inject AppState State
 @inject SettingsStore Settings
+@inject ToastService Toasts
 @inject IJSRuntime Js
 
 @if (State.DetailWorkItemId is int id)
 {
-    @* Handles its own Escape so closing never depends on another component's shortcuts. *@
-    <div class="modal-scrim" @onclick="Close" @onkeydown="OnKeyDown" tabindex="-1">
+    @* Handles its own Escape so closing never depends on another component's shortcuts, and
+       data-own-escape keeps the calendar's Escape shortcut from also closing whatever this
+       was opened over - Record day, when it came from one of its rows. *@
+    <div id="wi-modal-scrim" class="modal-scrim" data-own-escape
+         @onclick="Close" @onkeydown="OnKeyDown" tabindex="-1">
         <div class="modal" @onclick:stopPropagation="true">
 
             <div class="modal-head">
@@ -498,16 +502,30 @@
     private int RecordedMinutes =>
         State.DetailWorkItemId is int id ? State.Planner.RecordedMinutes(id) : 0;
 
+    /// <summary>
+    /// Read straight back from the settings, so a refused change - an update taking over - is
+    /// already back where it was by the next render. Said out loud all the same: a picker that
+    /// springs back on its own looks like a misclick rather than an answer.
+    /// </summary>
     private TextFormat CommentFormat
     {
         get => Settings.Current.Ui.CommentFormat;
-        set => Settings.Update(s => s.Ui.CommentFormat = value);
+        set
+        {
+            if (!Settings.Update(s => s.Ui.CommentFormat = value))
+                Toasts.Error("Could not change the format", AppState.RestartingForUpdate);
+        }
     }
 
+    /// <inheritdoc cref="CommentFormat"/>
     private TextFormat DescriptionFormat
     {
         get => Settings.Current.Ui.DescriptionFormat;
-        set => Settings.Update(s => s.Ui.DescriptionFormat = value);
+        set
+        {
+            if (!Settings.Update(s => s.Ui.DescriptionFormat = value))
+                Toasts.Error("Could not change the format", AppState.RestartingForUpdate);
+        }
     }
 
     private string CommentHint => CommentFormat switch
@@ -575,13 +593,14 @@
             if (State.DetailWorkItemId is not null) _ = State.EnsureMembersAsync();
         }
 
-        // Focus the scrim so it receives key events as soon as it opens.
+        // Focus the scrim so it receives key events as soon as it opens. By id: opened from
+        // Record day, the first scrim on the page is that dialog's, not this one.
         if (State.DetailWorkItemId is not null && _focusedFor != State.DetailWorkItemId)
         {
             _focusedFor = State.DetailWorkItemId;
             try
             {
-                await Js.InvokeVoidAsync("planner.focusSelector", ".modal-scrim");
+                await Js.InvokeVoidAsync("planner.focusSelector", "#wi-modal-scrim");
             }
             catch (Exception ex) when (ex is JSDisconnectedException or InvalidOperationException)
             {
@@ -756,11 +775,14 @@
         if (await State.SaveDescriptionAsync(html)) _editingDescription = false;
     }
 
-    /// <summary>In-app only: this is never written back to Azure DevOps.</summary>
+    /// <summary>
+    /// In-app only: this is never written back to Azure DevOps. It is still written to the
+    /// plan, so it is counted like any other edit and refused while an update takes over.
+    /// </summary>
     private void SetLocalPriority(int priority)
     {
         if (State.DetailWorkItemId is not int id) return;
-        State.Planner.SetLocalPriority(id, priority);
+        State.TryEdit(() => State.Planner.SetLocalPriority(id, priority));
     }
 
     private void OpenInAdo()

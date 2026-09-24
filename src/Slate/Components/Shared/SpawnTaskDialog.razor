@@ -4,6 +4,7 @@
 
 @inject AppState State
 @inject SettingsStore Settings
+@inject ToastService Toasts
 
 @* Two steps: the notice that this type cannot carry time, then the form to spawn a task. *@
 
@@ -163,11 +164,18 @@
 
     private void OnStopAskingChanged(ChangeEventArgs e)
     {
-        _stopAsking = e.Value is true or "true" or "on";
+        var stopAsking = e.Value is true or "true" or "on";
 
-        var settings = Settings.Current;
-        settings.Planning.OfferTaskForUntrackable = !_stopAsking;
-        Settings.Save(settings);
+        // Only taken up once it is stored. Refused - an update is taking over - the box goes
+        // back to what is actually saved on the next render, with a word to say why, rather
+        // than showing a choice that was never kept.
+        if (!Settings.Update(s => s.Planning.OfferTaskForUntrackable = !stopAsking))
+        {
+            Toasts.Error("Could not save that choice", AppState.RestartingForUpdate);
+            return;
+        }
+
+        _stopAsking = stopAsking;
     }
 
     private void ShowForm() => _showForm = true;
@@ -181,12 +189,8 @@
     private async Task CreateAsync()
     {
         // Remember the type so the next spawn starts from the same place.
-        var settings = Settings.Current;
-        if (settings.Planning.SpawnedTaskType != TypeName)
-        {
-            settings.Planning.SpawnedTaskType = TypeName;
-            Settings.Save(settings);
-        }
+        if (Settings.Current.Planning.SpawnedTaskType != TypeName)
+            Settings.Update(s => s.Planning.SpawnedTaskType = TypeName);
 
         if (await State.SpawnTaskAsync(_title, _description, TypeName, _hours))
             _primedFor = Guid.Empty;

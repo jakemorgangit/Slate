@@ -68,7 +68,9 @@
         </div>
 
         <div class="sidebar-list">
-            @if (State.WorkItemError is { } error)
+            @* A cached list on screen never loses its place to the big red banner below - a
+               compact line above the list says the same thing without hiding what is loaded. *@
+            @if (State.WorkItemError is { } error && !State.WorkItemsAreCached)
             {
                 <div class="banner error">
                     <span>✕</span>
@@ -90,26 +92,47 @@
             {
                 <p class="muted" style="padding: 12px">Loading work items…</p>
             }
-            else if (_visibleItems.Count == 0)
-            {
-                <div class="empty-state" style="padding: 28px 12px">
-                    <span class="glyph">◔</span>
-                    <p>@(State.WorkItems.Count == 0 ? "No work items came back from that query." : "Nothing matches these filters.")</p>
-                </div>
-            }
             else
             {
-                @foreach (var item in _visibleItems)
+                @if (State.StaleWorkItemsNotice is { } notice)
                 {
-                    <WorkItemCard @key="item.Id"
-                                  Item="item"
-                                  Allocated="@Plan.AllocatedMinutes(item.Id)"
-                                  Recorded="@Plan.RecordedMinutes(item.Id)"
-                                  Priority="@Plan.LocalPriority(item.Id)"
-                                  OnSelect="item => State.ShowWorkItemAsync(item.Id)"
-                                  OnDragStarted="BeginItemDragAsync"
-                                  OnContextMenu="OpenItemMenu"
-                                  OnSchedule="ScheduleNextFree" />
+                    <div class="banner warn compact">
+                        <span class="grow">@notice</span>
+                        @if (State.WorkItemError is not null)
+                        {
+                            <button class="btn btn-sm" disabled="@State.IsLoadingWorkItems"
+                                    @onclick="() => State.LoadWorkItemsAsync(showToast: true)">
+                                Re-check
+                            </button>
+                        }
+                    </div>
+                }
+
+                if (_visibleItems.Count == 0)
+                {
+                    @* Nothing loaded at all is not the same as a query that came back empty -
+                       after a change of connection there is no list until the new one loads. *@
+                    <div class="empty-state" style="padding: 28px 12px">
+                        <span class="glyph">◔</span>
+                        <p>@(State.WorkItems.Count > 0 ? "Nothing matches these filters."
+                             : State.WorkItemsLoadedAt is null ? "Nothing loaded yet. Press ⟳ to load your work items."
+                             : "No work items came back from that query.")</p>
+                    </div>
+                }
+                else
+                {
+                    @foreach (var item in _visibleItems)
+                    {
+                        <WorkItemCard @key="item.Id"
+                                      Item="item"
+                                      Allocated="@Plan.AllocatedMinutes(item.Id)"
+                                      Recorded="@Plan.RecordedMinutes(item.Id)"
+                                      Priority="@Plan.LocalPriority(item.Id)"
+                                      OnSelect="item => State.ShowWorkItemAsync(item.Id)"
+                                      OnDragStarted="BeginItemDragAsync"
+                                      OnContextMenu="OpenItemMenu"
+                                      OnSchedule="ScheduleNextFree" />
+                    }
                 }
             }
         </div>
@@ -175,6 +198,14 @@
             <button class="chip @(Settings.Current.Ui.CompactDensity ? "on" : "")"
                     title="Fit more hours on screen" @onclick="ToggleDensity">Compact</button>
 
+            @if (State.CanRecordTime && TodayMinutes > 0)
+            {
+                <button class="btn btn-sm" title="Book time for everything planned today (Ctrl+R)"
+                        @onclick="() => State.BeginRecordDay(DateTime.Today)">
+                    <span style="color: var(--danger)"><ClockIcon Size="13" /></span> Record today
+                </button>
+            }
+
             @if (WeekMinutes > 0)
             {
                 <button class="btn btn-sm btn-danger" title="Remove every allocation in this week"
@@ -194,9 +225,21 @@
                     <div class="col-head @(day.Date == DateTime.Today ? "today" : "")" @key="@("h" + day.Ticks)">
                         <div class="dow">@day.ToString("ddd")</div>
                         <div class="dom">@day.Day</div>
-                        <div class="load @(minutes > CapacityMinutes ? "heavy" : "")">
-                            @(minutes == 0 ? "—" : Ui.Duration(minutes))
-                        </div>
+                        @if (State.CanRecordTime && minutes > 0)
+                        {
+                            <button class="record-day @(minutes > CapacityMinutes ? "heavy" : "")"
+                                    title="Record time for @Ui.RelativeDay(day).ToLowerInvariant()"
+                                    @onclick="() => State.BeginRecordDay(day)">
+                                <ClockIcon Size="10" />
+                                <span>@Ui.Duration(minutes)</span>
+                            </button>
+                        }
+                        else
+                        {
+                            <div class="load @(minutes > CapacityMinutes ? "heavy" : "")">
+                                @(minutes == 0 ? "—" : Ui.Duration(minutes))
+                            </div>
+                        }
                     </div>
                 }
 
@@ -352,10 +395,10 @@
                                  Conflict="@State.HasConflict(selected.Start, selected.End)"
                                  SlotMinutes="SlotMinutes"
                                  OnClose="CloseInspector"
-                                 OnDurationChanged="m => Plan.Resize(selected.Id, m)"
-                                 OnNotesChanged="n => Plan.UpdateNotes(selected.Id, n)"
+                                 OnDurationChanged="m => ResizeBlock(selected.Id, m)"
+                                 OnNotesChanged="n => UpdateNotes(selected.Id, n)"
                                  OnDelete="() => DeleteAllocation(selected.Id)"
-                                 OnDetach="() => Plan.Detach(selected.Id)"
+                                 OnDetach="() => DetachBlock(selected.Id)"
                                  OnSendNow="() => SendOneAsync(selected.Id)"
                                  OnForget="() => ForgetBlock(selected)"
                                  Recorded="@Plan.RecordedMinutesForBlock(selected.Id)"
@@ -381,7 +424,17 @@
             </button>
             @if (Plan.LatestEntryForBlock(block.Allocation.Id) is { } lastEntry)
             {
-                <button title="Take this booking back off the work item in Azure DevOps"
+                @* Off for hours booked against an organization Slate is not on: #7 over there
+                   is a different work item, so the undo is refused the moment it is asked for.
+                   Said in the item rather than found out by pressing it, and the way out comes
+                   from the same place the Time tab's does, so the two cannot disagree about
+                   whether there is one. *@
+                var organization = State.CurrentOrganization;
+                var canUndo = lastEntry.BelongsTo(organization);
+                <button disabled="@(!canUndo)"
+                        title="@(canUndo
+                                 ? "Take this booking back off the work item in Azure DevOps"
+                                 : AppState.WhyUndoIsOff(lastEntry, organization, onTimeTab: false))"
                         @onclick="() => UndoRecordedTime(lastEntry)">
                     <span class="glyph">↺</span> Undo recorded time (@Ui.DecimalHours(lastEntry.Minutes)h)
                 </button>
@@ -534,11 +587,16 @@
     }
 </ContextMenu>
 
+@* Every dialog shares one z-index, so the later one here is the one on top. Record day comes
+   first because it is the one others open over: a work item opened from one of its rows, and
+   whatever that goes on to open, has to land above it rather than dimmed out behind it. *@
+<RecordDayDialog />
 <WorkItemModal OnSchedule="ScheduleNextFree" />
 <RecordTimeDialog />
 <ScheduleDialog />
 <SpawnTaskDialog />
 <PriorityDialog />
+<UndoTimeDialog />
 <NewWorkItemDialog OnSchedule="BookNextFree" />
 
 @code {
@@ -590,6 +648,8 @@
     private int WeekMinutes => _days.Sum(DayMinutes);
 
     private int DayMinutes(DateTime day) => Plan.ForDay(day).Sum(a => a.DurationMinutes);
+
+    private int TodayMinutes => DayMinutes(DateTime.Today);
 
     private int? NowOffsetPx
     {
@@ -729,6 +789,15 @@
     [JSInvokable]
     public void OnPointerDrop(string kind, string id, string day, int slotIndex, bool copy)
     {
+        // A drag still held when an update began handing over lands on a plan that the new
+        // copy may already have read, so it would be lost; better it visibly does nothing.
+        // Counted rather than just checked, so a handover starting mid-drop waits for it.
+        State.TryEdit(() => Drop(kind, id, day, slotIndex, copy));
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void Drop(string kind, string id, string day, int slotIndex, bool copy)
+    {
         if (!DateTime.TryParseExact(day, "yyyy-MM-dd", CultureInfo.InvariantCulture,
                 DateTimeStyles.None, out var date))
             return;
@@ -768,8 +837,6 @@
                 if (Plan.Find(allocationId) is { } moved) WarnIfConflict(moved);
             }
         }
-
-        InvokeAsync(StateHasChanged);
     }
 
     /// <summary>Opens the schedule dialog: next free gap, or a time of your choosing.</summary>
@@ -791,12 +858,22 @@
 
     // ---------------------------------------------------------------- allocation actions
 
+    // Every change to a block is made through State.TryEdit: counted, so an update starting at
+    // the same moment waits for it, and refused once one has begun, when the new copy may
+    // already have read the plan. A refused edit visibly does nothing.
+
     private void DeleteAllocation(Guid id)
     {
-        Plan.Remove(id);
+        if (!State.TryEdit(() => Plan.Remove(id))) return;
         State.SelectAllocation(null);
         _inspectorOpen = false;
     }
+
+    private void ResizeBlock(Guid id, int minutes) => State.TryEdit(() => Plan.Resize(id, minutes));
+
+    private void UpdateNotes(Guid id, string notes) => State.TryEdit(() => Plan.UpdateNotes(id, notes));
+
+    private void DetachBlock(Guid id) => State.TryEdit(() => Plan.Detach(id));
 
     private async Task SendOneAsync(Guid id)
     {
@@ -806,14 +883,23 @@
             return;
         }
 
-        if (await Plan.SyncOneAsync(id))
+        switch (await State.SyncOneAsync(id))
         {
-            Toasts.Success("Sent to Outlook");
-            await State.LoadEventsAsync();
-        }
-        else
-        {
-            Toasts.Error("Could not send that block", Plan.Find(id)?.LastError);
+            case AppState.SentOne.Sent:
+                Toasts.Success("Sent to Outlook");
+                await State.LoadEventsAsync();
+                break;
+
+            case AppState.SentOne.Refused:
+                Toasts.Error("Could not send that block", AppState.RestartingForUpdate);
+                break;
+
+            default:
+                // The block carries why it failed - unless it is no longer in the plan at all,
+                // which is the other way a send comes back with nothing to show for itself.
+                Toasts.Error("Could not send that block",
+                    Plan.Find(id)?.LastError ?? "That block is no longer in the plan.");
+                break;
         }
     }
 
@@ -830,15 +916,21 @@
         if (!Guid.TryParse(allocationId, out var id)) return;
 
         // Growing a block downwards can reach an existing calendar entry just as dropping one
-        // can, so it is refused the same way rather than quietly booking over a meeting.
-        var allocation = Plan.Find(id);
-        if (allocation is not null && Reject(allocation.Start, allocation.Start.AddMinutes(minutes)))
+        // can, so it is refused the same way rather than quietly booking over a meeting. A
+        // resize finished during an update's handover is refused like a drop (see above).
+        var resized = false;
+        State.TryEdit(() =>
         {
-            InvokeAsync(StateHasChanged);
-            return;
-        }
+            var allocation = Plan.Find(id);
+            if (allocation is not null && Reject(allocation.Start, allocation.Start.AddMinutes(minutes))) return;
 
-        Plan.Resize(id, minutes);
+            Plan.Resize(id, minutes);
+            resized = true;
+        });
+
+        // Anything short of a resize has to redraw the block at its real size: the drag left
+        // it stretched, and nothing in the plan changed to redraw it otherwise.
+        if (!resized) InvokeAsync(StateHasChanged);
     }
 
     [JSInvokable]
@@ -851,26 +943,36 @@
 
     private void ToggleBusyOverlay()
     {
-        var settings = Settings.Current;
-        settings.Planning.ShowExistingEvents = !settings.Planning.ShowExistingEvents;
+        // Through Update, which is turned away before anything changes if an update is
+        // taking over, rather than editing the live settings and then being refused the save.
+        var saved = Settings.Update(settings =>
+        {
+            settings.Planning.ShowExistingEvents = !settings.Planning.ShowExistingEvents;
 
-        // Now it is a decision made with the calendar in front of you, so it stands.
-        settings.Planning.OverlayChosen = true;
-        Settings.Save(settings);
-        _ = State.LoadEventsAsync();
+            // Now it is a decision made with the calendar in front of you, so it stands.
+            settings.Planning.OverlayChosen = true;
+        });
+
+        if (saved) _ = State.LoadEventsAsync();
+        else Toasts.Error("Could not change what the calendar shows", AppState.RestartingForUpdate);
     }
 
     private void ToggleDensity()
     {
-        var settings = Settings.Current;
-        settings.Ui.CompactDensity = !settings.Ui.CompactDensity;
-        Settings.Save(settings);
+        if (!Settings.Update(settings => settings.Ui.CompactDensity = !settings.Ui.CompactDensity))
+            Toasts.Error("Could not change the density", AppState.RestartingForUpdate);
     }
 
     private void ClearWeek()
     {
-        var count = Plan.InRange(State.WeekStart, State.WeekStart.AddDays(7)).Count();
-        Plan.ClearRange(State.WeekStart, State.WeekStart.AddDays(7));
+        var count = 0;
+        var cleared = State.TryEdit(() =>
+        {
+            count = Plan.InRange(State.WeekStart, State.WeekStart.AddDays(7)).Count();
+            Plan.ClearRange(State.WeekStart, State.WeekStart.AddDays(7));
+        });
+        if (!cleared) return;
+
         State.SelectAllocation(null);
         Toasts.Info($"Cleared {count} block(s)",
             State.ShowOutlook ? "Press Send to Outlook to remove the matching events." : "");
@@ -881,6 +983,9 @@
     [JSInvokable]
     public async Task OnShortcut(string combo)
     {
+        // The overlay shown during an update's handover stops clicks, not keys.
+        if (State.IsHandingOver) return;
+
         switch (combo)
         {
             case "arrowleft": State.GoToWeek(-1); break;
@@ -888,13 +993,22 @@
             case "t": State.GoToToday(); break;
             case "r": await State.LoadWorkItemsAsync(showToast: true); break;
             case "ctrl+s": if (State.CanUseOutlook) await State.SyncAsync(); break;
+            case "ctrl+r": State.BeginRecordDay(DateTime.Today); break;
             case "delete":
                 if (State.SelectedAllocationId is Guid id) DeleteAllocation(id);
                 break;
             case "escape":
+                // Record day sits under whatever was opened from it, so Escape takes that off
+                // first and only reaches Record day once nothing covers it - its edits intact.
+                var recordDayCovered = State.DetailWorkItemId is not null
+                                       || State.SchedulingFor is not null
+                                       || State.PriorityPrompt is not null
+                                       || State.UndoingPrompt is not null;
                 CloseMenu();
                 State.CloseWorkItem();
                 State.CancelRecordTime();
+                State.CancelUndoTimeEntry();
+                if (!recordDayCovered) State.CancelRecordDay();
                 State.CancelSchedule();
                 State.SelectAllocation(null);
                 _inspectorOpen = false;
@@ -948,7 +1062,7 @@
     /// <summary>Sets the in-app priority. Zero clears it. Never leaves this machine.</summary>
     private void SetPriority(int workItemId, int priority)
     {
-        Plan.SetLocalPriority(workItemId, priority);
+        State.TryEdit(() => Plan.SetLocalPriority(workItemId, priority));
         CloseMenu();
     }
 
@@ -972,16 +1086,21 @@
         State.BeginRecordTime(allocation);
     }
 
-    private async Task UndoRecordedTime(TimeEntry entry)
+    /// <summary>
+    /// Asks about the undo rather than doing it: the note these hours put on the discussion
+    /// goes with them or stays, and the dialog is where that is answered - the same one the
+    /// Time tab opens, so an undo is asked the same way wherever it starts.
+    /// </summary>
+    private void UndoRecordedTime(TimeEntry entry)
     {
         CloseMenu();
-        await State.UndoTimeEntryAsync(entry);
+        State.BeginUndoTimeEntry(entry);
     }
 
-    private async Task UndoLatestFor(Allocation allocation)
+    private void UndoLatestFor(Allocation allocation)
     {
         if (Plan.LatestEntryForBlock(allocation.Id) is not { } entry) return;
-        await State.UndoTimeEntryAsync(entry);
+        State.BeginUndoTimeEntry(entry);
     }
 
     private void ShowTimeView()
@@ -1000,7 +1119,9 @@
     private void DuplicateBlock(Allocation allocation)
     {
         CloseMenu();
-        var copy = Plan.Duplicate(allocation.Id, allocation.Start.AddMinutes(allocation.DurationMinutes));
+
+        Allocation? copy = null;
+        State.TryEdit(() => copy = Plan.Duplicate(allocation.Id, allocation.Start.AddMinutes(allocation.DurationMinutes)));
         if (copy is not null) State.SelectAllocation(copy.Id);
     }
 
@@ -1013,7 +1134,8 @@
     private void ForgetBlock(Allocation allocation)
     {
         CloseMenu();
-        Plan.ForgetMissing(allocation.Id);
+        if (!State.TryEdit(() => Plan.ForgetMissing(allocation.Id))) return;
+
         State.SelectAllocation(null);
         Toasts.Info("Removed from the plan", "The Outlook event was already gone.");
     }

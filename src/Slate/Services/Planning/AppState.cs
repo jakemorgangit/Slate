@@ -18,7 +18,9 @@ public sealed class AppState(
     GraphCalendarClient graph,
     PlannerService planner,
     MsalAuthService auth,
-    ToastService toasts)
+    ToastService toasts,
+    WorkItemsCacheStore workItemsCache,
+    WriteGate writes)
 {
     private CancellationTokenSource? _workItemLoad;
     private CancellationTokenSource? _eventLoad;
@@ -33,24 +35,77 @@ public sealed class AppState(
         $"{Settings.Ado.OrganizationUrl}|{Settings.Ado.Project}|{Settings.Ado.AuthMode}";
 
     private string _cachedFor = "";
+    private readonly Lock _connectionGate = new();
+
+    /// <summary>
+    /// Notices a change of connection as soon as the settings are saved, so what was read
+    /// from the old one - its error above all - does not sit on screen until the next load.
+    /// </summary>
+    public void CheckConnection() => DropStaleCaches();
 
     /// <summary>
     /// Forgets anything read from a connection that is no longer the current one. Checked
-    /// at the start of every load rather than driven by a settings event, so it holds no
-    /// matter which of the many save paths changed the configuration.
+    /// at the start of every load as well as whenever settings are saved, so it holds no
+    /// matter which of the many save paths changed the configuration, or which thread - a
+    /// quiet poll runs on its own - notices first.
     /// </summary>
     private void DropStaleCaches()
     {
         var stamp = ConnectionStamp;
-        if (stamp == _cachedFor) return;
 
-        _cachedFor = stamp;
-        Identity = "";
-        Projects = [];
-        CreatableTypes = [];
-        AreaTree = null;
-        Members = [];
-        ado.ForgetPeople();
+        // Held across the whole clearing, not just the stamp. Published on its own, the stamp
+        // says "this connection's caches are dealt with" while they are still there to deal
+        // with, so a second caller arriving in between goes on believing that - and the load
+        // it then finishes puts a list where this one is about to wipe it, leaving "Nothing
+        // loaded yet" with no error to explain it. Nothing in here waits on anything, and
+        // nothing in here raises a change either: they are field assignments, and ForgetPeople
+        // only nulls two of its own.
+        lock (_connectionGate)
+        {
+            if (stamp == _cachedFor) return;
+            _cachedFor = stamp;
+
+            Identity = "";
+            Projects = [];
+            CreatableTypes = [];
+            AreaTree = null;
+            AreaTreeError = null;
+            Members = [];
+            ado.ForgetPeople();
+
+            // The error on screen was about the old connection. Left up, it reports the new one
+            // failing before anything has asked it. The toast behind it goes too, below.
+            var hadError = WorkItemError is not null;
+            WorkItemError = null;
+
+            // A cached list is only ever a stand-in for this same connection's own list - once
+            // the connection has moved on, holding onto it would let a failed load for the new
+            // one keep showing the old one as if it were current, with the red banner suppressed
+            // to make room for the (now wrong) "showing a cached list" notice. A list the error
+            // banner was covering goes for the same reason: taking the banner away must not bring
+            // another connection's list back into view looking current. One on screen with no
+            // error over it stays until the new connection's own list replaces it, as it always
+            // has.
+            if (WorkItemsAreCached || hadError)
+            {
+                WorkItems = [];
+                WorkItemsLoadedAt = null;
+                WorkItemsAreCached = false;
+            }
+        }
+
+        // Out here with the change below rather than in among the clearing: dismissing a toast
+        // raises ToastService.Changed, and a page answering that on this very thread - which is
+        // the window's thread whenever a settings save is what noticed - would render off
+        // half-cleared state. Nothing else reads the toast, so it is no worse a moment later.
+        // Reached only when the clearing above actually happened; the early return leaves.
+        ClearWorkItemErrorToast();
+
+        // Raised here, once, rather than left to each caller: a quiet poll or a background
+        // lookup like EnsureMembersAsync can be the one to notice, and the UI still needs to
+        // hear about it even though neither of those otherwise has a reason to call Changed.
+        // Outside the gate, so a render it sets off never reads these while they are half done.
+        Changed?.Invoke();
     }
     public PlannerService Planner => planner;
     public ToastService Toasts => toasts;
@@ -65,6 +120,24 @@ public sealed class AppState(
     public bool IsLoadingWorkItems { get; private set; }
     public string? WorkItemError { get; private set; }
     public DateTimeOffset? WorkItemsLoadedAt { get; private set; }
+
+    /// <summary>
+    /// True while what is in <see cref="WorkItems"/> is left over from a previous run rather
+    /// than something this session actually fetched. Cleared the moment a load succeeds, so a
+    /// manual refresh of an already-fresh list is never mistaken for this.
+    /// </summary>
+    public bool WorkItemsAreCached { get; private set; }
+
+    /// <summary>
+    /// What to say about a cached list while its own refresh is still in flight or has just
+    /// failed - null once there is nothing stale to explain, which is what lets the sidebar
+    /// fall back to its ordinary loading and error handling.
+    /// </summary>
+    public string? StaleWorkItemsNotice =>
+        !WorkItemsAreCached ? null
+        : IsLoadingWorkItems ? $"Showing list from {Ui.Ago(WorkItemsLoadedAt)} · refreshing…"
+        : WorkItemError is not null ? $"Showing list from {Ui.Ago(WorkItemsLoadedAt)} · couldn't refresh"
+        : null;
 
     public string Search { get; set; } = "";
     public HashSet<string> TypeFilter { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -189,6 +262,21 @@ public sealed class AppState(
     {
         if (!Settings.IsAdoConfigured)
         {
+            // Recorded against the connection as it stands, so this error is only taken down
+            // again once the configuration actually moves on - not by the first save of
+            // something unrelated, such as the theme.
+            DropStaleCaches();
+
+            // An unconfigured connection has nothing behind it to show as "cached" - and
+            // without this, clearing the org URL would leave a previous connection's list
+            // on screen under the "not configured" banner instead of showing no list at all.
+            if (WorkItemsAreCached)
+            {
+                WorkItems = [];
+                WorkItemsLoadedAt = null;
+                WorkItemsAreCached = false;
+            }
+
             WorkItemError = "Azure DevOps is not configured yet.";
             Changed?.Invoke();
             return;
@@ -198,18 +286,48 @@ public sealed class AppState(
         var cts = new CancellationTokenSource();
         _workItemLoad = cts;
 
+        // Before the error is cleared for this attempt, not after: an error on screen from a
+        // connection that has since changed is what tells DropStaleCaches the list under it
+        // was that connection's too.
+        DropStaleCaches();
+
         IsLoadingWorkItems = true;
         WorkItemError = null;
         Changed?.Invoke();
 
+        // Which connection this fetch is actually for. Declared out here rather than just
+        // inside the try, so a failure below can still tell a stale attempt apart from a
+        // current one; reassigned throughout, since a retry can span a settings change.
+        var stamp = ConnectionStamp;
+
         try
         {
             DropStaleCaches();
+            stamp = ConnectionStamp;
+
+            // Before the network is even asked: if this is the first load of the session and
+            // a previous run left a list behind for this same connection, show it right away
+            // rather than sitting on "Loading work items…" while a network that is often still
+            // coming up - after a reboot, on waking, or on a new release - catches up.
+            if (atStartup && WorkItems.Count == 0 && workItemsCache.TryLoad(stamp) is { } cached)
+            {
+                WorkItems = cached.Items;
+                WorkItemsLoadedAt = cached.LoadedAt;
+                WorkItemsAreCached = true;
+                Changed?.Invoke();
+            }
 
             var retries = atStartup ? PatientRetries : QuickRetries;
             List<WorkItem> items;
             for (var attempt = 0; ; attempt++)
             {
+                // Re-checked on every attempt, not just once before the loop: a retry can span
+                // a settings change, and GetWorkItemsAsync always fetches for whatever
+                // connection is current by then, so what it returns must be judged - and
+                // saved - against that same connection, not the one this load started for.
+                DropStaleCaches();
+                stamp = ConnectionStamp;
+
                 try
                 {
                     items = await ado.GetWorkItemsAsync(cts.Token);
@@ -227,10 +345,48 @@ public sealed class AppState(
             // first on a network that is not up yet, nobody would ever be told who we are.
             await EnsureIdentityAsync(cts.Token);
 
-            WorkItems = items;
-            WorkItemsLoadedAt = DateTimeOffset.Now;
+            if (cts.IsCancellationRequested) return;
+
+            // The check and the write are one step, under the gate the clearing is done under.
+            // Apart, CheckConnection can clear for a new connection in between the two, and
+            // this would then put the old connection's list straight back with the cached flag
+            // off - another organization's items on screen looking current, with neither the
+            // amber notice nor the red banner to say otherwise.
+            bool stale;
+            var loadedAt = DateTimeOffset.Now;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp;
+                if (!stale)
+                {
+                    WorkItems = items;
+                    WorkItemsLoadedAt = loadedAt;
+                    WorkItemsAreCached = false;
+                }
+            }
+
+            if (stale)
+            {
+                // The connection moved on again between that last fetch starting and now - too
+                // late to judge this answer by it, and too late to just leave, since the old
+                // connection's list would otherwise sit on screen looking current with neither
+                // the amber notice nor the red banner. Drop it and let a fresh load for
+                // whichever connection is current now pick this back up.
+                DropStaleCaches();
+                _ = LoadWorkItemsAsync(showToast, atStartup);
+                return;
+            }
+
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
+            workItemsCache.Save(stamp, loadedAt, items);
+
+            // Once a session, now that Azure DevOps is known to be answering.
+            if (!_settledUnconfirmed)
+            {
+                _settledUnconfirmed = true;
+                _ = SettleUnconfirmedQuietlyAsync();
+            }
 
             if (showToast)
                 toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
@@ -241,7 +397,30 @@ public sealed class AppState(
         }
         catch (Exception ex)
         {
-            WorkItemError = ex.Message;
+            // The check and the write are one step, under the same gate and for the same reason
+            // as the success path above: apart, CheckConnection can clear for a new connection
+            // in between the two, and this would then put the old connection's failure up as
+            // the new one's - the red banner over an organization nothing has asked yet, which
+            // is precisely what the clearing is there to prevent.
+            bool stale;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp;
+                if (!stale) WorkItemError = ex.Message;
+            }
+
+            if (stale)
+            {
+                // Same reasoning as above: this failure was for a connection that is no longer
+                // current, so it is not this connection's error to show, and it is not this
+                // connection's cached list sitting underneath it either.
+                DropStaleCaches();
+                _ = LoadWorkItemsAsync(showToast, atStartup);
+                return;
+            }
+
+            // Outside the gate, like the clearing's own toast work: raising one tells the page
+            // to render, and rendering from in there would read this half written.
             ClearWorkItemErrorToast();
             _workItemErrorToast = toasts.Error("Could not load work items", ex.Message);
         }
@@ -286,24 +465,56 @@ public sealed class AppState(
     /// </summary>
     public async Task RefreshWorkItemsQuietlyAsync()
     {
-        if (!Settings.IsAdoConfigured || IsLoadingWorkItems) return;
+        // A tick already queued when a handover stopped the timer still arrives. The copy an
+        // update is starting reads the list for itself, and this one's result would only be
+        // held back unwritten (see DataFolder).
+        if (!Settings.IsAdoConfigured || IsLoadingWorkItems || IsHandingOver) return;
 
         try
         {
             DropStaleCaches();
+            var stamp = ConnectionStamp;
+
             var items = await ado.GetWorkItemsAsync(CancellationToken.None);
             await EnsureIdentityAsync(CancellationToken.None);
 
-            WorkItems = items;
-            WorkItemsLoadedAt = DateTimeOffset.Now;
-            WorkItemError = null;
+            // The connection may have changed while this quiet poll was in flight - and a
+            // foreground load that started after it, for a newer connection, must win rather
+            // than being overwritten by this older answer. Either way, a cached list left
+            // over from a connection nobody is looking at any more is not this poll's to keep:
+            // drop it rather than leave it looking current with neither notice nor banner.
+            // Checked and written under the one gate, for the reason LoadWorkItemsAsync gives.
+            bool stale;
+            var loadedAt = DateTimeOffset.Now;
+            lock (_connectionGate)
+            {
+                stale = stamp != ConnectionStamp || IsLoadingWorkItems;
+                if (!stale)
+                {
+                    WorkItems = items;
+                    WorkItemsLoadedAt = loadedAt;
+                    WorkItemsAreCached = false;
+                    WorkItemError = null;
+                }
+            }
+
+            if (stale)
+            {
+                DropStaleCaches();
+                return;
+            }
+
             planner.RefreshSnapshots(items);
             ClearWorkItemErrorToast();
+            workItemsCache.Save(stamp, loadedAt, items);
             Changed?.Invoke();
         }
         catch (Exception)
         {
-            // A background poll must stay silent; the manual Refresh reports failures.
+            // A background poll must stay silent about the failure itself, but a connection
+            // change that happened during it still needs its stale cache dropped - and
+            // DropStaleCaches raises Changed on its own once it actually clears one.
+            DropStaleCaches();
         }
     }
 
@@ -373,6 +584,9 @@ public sealed class AppState(
 
     public async Task LoadEventsAsync()
     {
+        // The copy an update is starting reads the calendar for itself.
+        if (IsHandingOver) return;
+
         AdoptOverlayDefault();
 
         // Fetched whenever the calendar can be reached, not only when the overlay is on.
@@ -404,19 +618,30 @@ public sealed class AppState(
 
             ExistingEvents = events;
 
-            // Adoption is not two-way sync: it is this plan meeting its own blocks for the
-            // first time, and a machine that has never seen them has nothing to reconcile
-            // against. It runs whichever way that setting is turned.
-            var adopted = planner.AdoptOrphanEvents(events);
-            if (adopted > 0)
+            // Both of these write the plan. A handover that began while the calendar was
+            // being read skips them: the new copy may already have read the plan, and would
+            // never see what was written here.
+            if (!TryBeginWrite()) return;
+            try
             {
-                toasts.Info(
-                    adopted == 1 ? "Picked up 1 block from your calendar" : $"Picked up {adopted} blocks from your calendar",
-                    "Planned on another machine. You can move or delete them here as usual.");
-            }
+                // Adoption is not two-way sync: it is this plan meeting its own blocks for the
+                // first time, and a machine that has never seen them has nothing to reconcile
+                // against. It runs whichever way that setting is turned.
+                var adopted = planner.AdoptOrphanEvents(events);
+                if (adopted > 0)
+                {
+                    toasts.Info(
+                        adopted == 1 ? "Picked up 1 block from your calendar" : $"Picked up {adopted} blocks from your calendar",
+                        "Planned on another machine. You can move or delete them here as usual.");
+                }
 
-            if (Settings.Planning.TwoWaySync)
-                ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
+                if (Settings.Planning.TwoWaySync)
+                    ReportReconcile(planner.ReconcileFromOutlook(events, windowStart, windowEnd));
+            }
+            finally
+            {
+                EndWrite();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -572,15 +797,22 @@ public sealed class AppState(
     /// </summary>
     public void NudgeAutoSync()
     {
-        if (!AutoSyncOn || !CanUseOutlook) return;
-        if (IsSyncing || planner.PendingCount == 0) return;
+        // Under the same lock every timer is made and stopped under. The plan changes on
+        // whichever thread changed it - a calendar poll picking up a block runs on its own - so
+        // two nudges at once could otherwise each make a timer, and one made just as a handover
+        // stopped them all would carry on running through it and on past a rollback.
+        lock (_timers)
+        {
+            if (IsHandingOver || !AutoSyncOn || !CanUseOutlook) return;
+            if (IsSyncing || planner.PendingCount == 0) return;
 
-        var delay = TimeSpan.FromSeconds(Math.Clamp(Settings.Planning.AutoSyncSeconds, 1, 60));
+            var delay = TimeSpan.FromSeconds(Math.Clamp(Settings.Planning.AutoSyncSeconds, 1, 60));
 
-        if (_autoSync is null)
-            _autoSync = new Timer(_ => _ = AutoSyncNowAsync(), null, delay, Timeout.InfiniteTimeSpan);
-        else
-            _autoSync.Change(delay, Timeout.InfiniteTimeSpan);
+            if (_autoSync is null)
+                _autoSync = new Timer(_ => _ = AutoSyncNowAsync(), null, delay, Timeout.InfiniteTimeSpan);
+            else
+                _autoSync.Change(delay, Timeout.InfiniteTimeSpan);
+        }
     }
 
     /// <summary>
@@ -591,12 +823,14 @@ public sealed class AppState(
     private async Task AutoSyncNowAsync()
     {
         if (IsSyncing || !CanUseOutlook || planner.PendingCount == 0) return;
-
-        IsSyncing = true;
-        Changed?.Invoke();
+        if (!TryBeginWrite()) return;
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSyncing = true;
+            Changed?.Invoke();
+
             var summary = await planner.SyncAsync();
             _autoSyncFailed = summary.Failed > 0;
 
@@ -614,13 +848,14 @@ public sealed class AppState(
         finally
         {
             IsSyncing = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
 
     public async Task SyncAsync()
     {
-        if (IsSyncing) return;
+        if (IsSyncing || IsHandingOver) return;
 
         if (!Settings.IsCalendarConfigured)
         {
@@ -634,11 +869,14 @@ public sealed class AppState(
             return;
         }
 
-        IsSyncing = true;
-        Changed?.Invoke();
+        if (!TryBeginWrite()) return;
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSyncing = true;
+            Changed?.Invoke();
+
             var summary = await planner.SyncAsync();
             _autoSyncFailed = summary.Failed > 0;
 
@@ -657,7 +895,43 @@ public sealed class AppState(
         finally
         {
             IsSyncing = false;
+            EndWrite();
             Changed?.Invoke();
+        }
+    }
+
+    /// <summary>What became of a single block that was sent on its own.</summary>
+    public enum SentOne
+    {
+        /// <summary>It reached Outlook.</summary>
+        Sent,
+
+        /// <summary>It was tried and did not get through. Why is on the block, if it is still there.</summary>
+        Failed,
+
+        /// <summary>It was never tried: an update is taking over and no write may start.</summary>
+        Refused,
+    }
+
+    /// <summary>
+    /// Sends a single block, for the inline "send to Outlook" action. Counted like the full
+    /// sync, because it too creates an event and only then writes down its id.
+    ///
+    /// Three outcomes rather than two, because the caller has to tell the user which: a block
+    /// that was deleted between the click and the answer also comes back without an error on
+    /// it, and blaming an update for that names a restart that is not happening.
+    /// </summary>
+    public async Task<SentOne> SyncOneAsync(Guid id)
+    {
+        if (!TryBeginWrite()) return SentOne.Refused;
+
+        try
+        {
+            return await planner.SyncOneAsync(id) ? SentOne.Sent : SentOne.Failed;
+        }
+        finally
+        {
+            EndWrite();
         }
     }
 
@@ -665,13 +939,14 @@ public sealed class AppState(
 
     /// <summary>
     /// Books the item into the first gap that fits, scanning forward from now across working
-    /// days. Returns null when nothing free turns up inside the search window.
+    /// days. Returns null when nothing free turns up inside the search window. Private, and
+    /// only ever run inside a write already counted in: it adds a block to the plan.
     /// </summary>
     /// <param name="minutes">
     /// How long the block should be. Null falls back to whatever is left on the estimate,
     /// which is what the callers with nowhere to ask the question want.
     /// </param>
-    public async Task<Allocation?> ScheduleNextFree(WorkItem item, int? minutes = null, int searchDays = 14)
+    private async Task<Allocation?> ScheduleNextFree(WorkItem item, int? minutes = null, int searchDays = 14)
     {
         var duration = minutes is > 0 ? minutes.Value : planner.SuggestedDuration(item);
         var p = Settings.Planning;
@@ -735,20 +1010,37 @@ public sealed class AppState(
     /// <summary>
     /// Books the next free gap. Reports for itself rather than leaving each caller to say the
     /// same thing three different ways.
+    ///
+    /// Counted from before the calendar is read, not just around the booking at the end: a
+    /// handover that began during the read waits for the block to be added and saved, rather
+    /// than the read coming back to a plan the new copy has already taken.
     /// </summary>
     public async Task<bool> ScheduleIntoNextFree(WorkItem item, int? minutes = null)
     {
-        var allocation = await ScheduleNextFree(item, minutes);
-
-        if (allocation is null)
+        if (!TryBeginWrite())
         {
-            toasts.Warning("No free slot in the next two weeks",
-                "Widen the hours work can be booked into in Settings, or pick a time yourself.");
+            toasts.Error("Could not book that time", RestartingForUpdate);
             return false;
         }
 
-        AfterScheduled(item, allocation, "Scheduled");
-        return true;
+        try
+        {
+            var allocation = await ScheduleNextFree(item, minutes);
+
+            if (allocation is null)
+            {
+                toasts.Warning("No free slot in the next two weeks",
+                    "Widen the hours work can be booked into in Settings, or pick a time yourself.");
+                return false;
+            }
+
+            AfterScheduled(item, allocation, "Scheduled");
+            return true;
+        }
+        finally
+        {
+            EndWrite();
+        }
     }
 
     /// <summary>
@@ -773,16 +1065,30 @@ public sealed class AppState(
             return false;
         }
 
-        if (Settings.Planning.PreventOverlap &&
-            IsBusy(await EventsCovering(placed, end), placed, end))
+        // Counted across the calendar read for the same reason as ScheduleIntoNextFree.
+        if (!TryBeginWrite())
         {
-            toasts.Warning("Something is already in the calendar then",
-                "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
+            toasts.Error("Could not book that time", RestartingForUpdate);
             return false;
         }
 
-        AfterScheduled(item, planner.Add(item, start, minutes), "Booked");
-        return true;
+        try
+        {
+            if (Settings.Planning.PreventOverlap &&
+                IsBusy(await EventsCovering(placed, end), placed, end))
+            {
+                toasts.Warning("Something is already in the calendar then",
+                    "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
+                return false;
+            }
+
+            AfterScheduled(item, planner.Add(item, start, minutes), "Booked");
+            return true;
+        }
+        finally
+        {
+            EndWrite();
+        }
     }
 
     private void AfterScheduled(WorkItem item, Allocation allocation, string verb)
@@ -857,7 +1163,14 @@ public sealed class AppState(
 
         var draft = settingsStore.CreateDraft();
         draft.Ui.Mode = mode;
-        settingsStore.Save(draft);
+        if (!settingsStore.Save(draft))
+        {
+            // Said out loud, and the change raised all the same, so the switch goes back to
+            // the mode actually in force rather than sitting on one nothing was saved for.
+            toasts.Error("Could not change mode", RestartingForUpdate);
+            Changed?.Invoke();
+            return;
+        }
 
         // Basic has no Time tab; being left standing on it would show an empty page.
         Changed?.Invoke();
@@ -943,11 +1256,21 @@ public sealed class AppState(
     {
         if (PriorityPrompt is not { } prompt || IsSavingPriority) return false;
 
-        IsSavingPriority = true;
-        Changed?.Invoke();
+        // Counted until the block snapshots it moves are saved, like every write to Azure DevOps.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not change the priority", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try, like every other repaint here: a subscriber that throws on the
+            // way out would otherwise leave this write counted in for the rest of the session,
+            // and every later update stuck behind a count that never reaches zero.
+            IsSavingPriority = true;
+            Changed?.Invoke();
+
             var updated = await ado.SetAdoPriorityAsync(prompt.WorkItemId, prompt.To);
 
             if (updated is not null)
@@ -976,6 +1299,7 @@ public sealed class AppState(
         finally
         {
             IsSavingPriority = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1046,11 +1370,19 @@ public sealed class AppState(
         if (item is not null && string.Equals(item.State, state, StringComparison.OrdinalIgnoreCase))
             return true;
 
-        SavingStateFor = workItemId;
-        Changed?.Invoke();
+        // Counted until the blocks quoting the state are saved, like every write to Azure DevOps.
+        if (!TryBeginWrite())
+        {
+            toasts.Error($"Could not move #{workItemId} to {state}", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            SavingStateFor = workItemId;
+            Changed?.Invoke();
+
             var updated = await ado.SetStateAsync(workItemId, state);
 
             if (updated is not null)
@@ -1076,6 +1408,7 @@ public sealed class AppState(
         finally
         {
             SavingStateFor = null;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1120,7 +1453,13 @@ public sealed class AppState(
 
         var draft = settingsStore.CreateDraft();
         draft.Ado.OnlyMine = onlyMine;
-        settingsStore.Save(draft);
+
+        // Refused while an update takes over; the toggle then simply stays as it was.
+        if (!settingsStore.Save(draft))
+        {
+            Changed?.Invoke();
+            return;
+        }
 
         Changed?.Invoke();
         await LoadWorkItemsAsync();
@@ -1276,11 +1615,20 @@ public sealed class AppState(
     {
         if (Creating is not { } request || IsCreating) return null;
 
-        IsCreating = true;
-        Changed?.Invoke();
+        // Counted: cut off by the restart halfway, there would be no telling whether Azure
+        // DevOps had raised it, and raising it again from the new copy could make two.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not create that work item", RestartingForUpdate);
+            return null;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsCreating = true;
+            Changed?.Invoke();
+
             var created = await ado.CreateWorkItemAsync(request);
 
             // Put it on screen straight away rather than waiting for the next poll.
@@ -1299,6 +1647,7 @@ public sealed class AppState(
         finally
         {
             IsCreating = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1387,11 +1736,19 @@ public sealed class AppState(
         if (DetailWorkItemId is not int id || Detail is not { } detail) return false;
         if (IsSavingDescription || IsSavingTitle) return false;
 
-        setBusy(true);
-        Changed?.Invoke();
+        // Counted: an edit sent just as an update takes over is either seen through or refused.
+        if (!TryBeginWrite())
+        {
+            toasts.Error($"Could not save the {what.ToLowerInvariant()}", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            setBusy(true);
+            Changed?.Invoke();
+
             Detail = await ado.UpdateFieldsAsync(
                 id, detail.Rev, new Dictionary<string, object?> { [field] = value });
 
@@ -1410,6 +1767,7 @@ public sealed class AppState(
         finally
         {
             setBusy(false);
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1462,11 +1820,20 @@ public sealed class AppState(
         if (DetailWorkItemId is not int id || Detail is not { } detail) return false;
         if (string.IsNullOrWhiteSpace(text) || IsPostingComment) return false;
 
-        IsPostingComment = true;
-        Changed?.Invoke();
+        // Counted: cut off by the restart halfway, there would be no telling whether it went,
+        // and posting it again from the new copy could put it there twice.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not add that comment", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsPostingComment = true;
+            Changed?.Invoke();
+
             var comment = await ado.AddCommentAsync(id, detail.Project, Html.ToCommentHtml(text, format, mentioned));
             Comments = [.. Comments, comment];
             CommentError = null;
@@ -1481,6 +1848,7 @@ public sealed class AppState(
         finally
         {
             IsPostingComment = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1493,11 +1861,52 @@ public sealed class AppState(
 
     public Allocation? RecordingFor { get; private set; }
 
+    /// <summary>
+    /// Opens the single-block recording dialog.
+    ///
+    /// Only from the calendar itself, the same rule "Record today" goes by: from under another
+    /// dialog this one would open behind it, and under a Record day pass it would read the
+    /// block as unrecorded while that pass was still writing it. The two being asymmetric is
+    /// the kind of difference that turns into a way of booking a block twice.
+    /// </summary>
     public void BeginRecordTime(Allocation allocation)
     {
-        if (!CanRecordTime) return;
+        if (!CanRecordTime || IsHandingOver) return;
+        if (RecordDayFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
+            || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
+            || UndoingPrompt is not null) return;
 
         RecordingFor = allocation;
+        Changed?.Invoke();
+    }
+
+    /// <summary>The day the "Record today" dialog is open for, or null while it is closed.</summary>
+    public DateTime? RecordDayFor { get; private set; }
+
+    /// <summary>
+    /// Opens the whole-day recording dialog for the given day - "today" by default, but any
+    /// day the calendar has on screen works the same way.
+    ///
+    /// Only over the calendar itself: Ctrl+R is ignored while any other dialog is open. They
+    /// are all drawn above this one, so that a work item opened from one of its rows lands on
+    /// top, which means this opened from under one of them would sit hidden behind it. Under
+    /// "Record time…" it would also read that block as unrecorded before the booking went in.
+    /// </summary>
+    public void BeginRecordDay(DateTime day)
+    {
+        if (!CanRecordTime || IsHandingOver) return;
+        if (RecordingFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
+            || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
+            || UndoingPrompt is not null) return;
+
+        RecordDayFor = day.Date;
+        Changed?.Invoke();
+    }
+
+    public void CancelRecordDay()
+    {
+        if (RecordDayFor is null) return;
+        RecordDayFor = null;
         Changed?.Invoke();
     }
 
@@ -1516,73 +1925,1684 @@ public sealed class AppState(
     /// the point of this operation and they are already written by then, so a discussion
     /// that will not take the note says so and leaves the booking standing rather than
     /// unwinding a good write over a failed extra.
+    ///
+    /// The dialog is closed only while it is still showing this block: shut and reopened for
+    /// another one while this went through, that one is left open.
     /// </summary>
-    public async Task<bool> RecordTimeAsync(
+    public async Task<TimeWriteOutcome> RecordTimeAsync(
         Allocation allocation, double hours, bool reduceRemaining,
         string note = "", TextFormat noteFormat = TextFormat.Markdown)
     {
+        if (TryClaimBlock(allocation.Id) is { } refused)
+        {
+            toasts.Error("Could not record that time", refused);
+            return TimeWriteOutcome.Failed;
+        }
+
         try
         {
-            var result = await ado.RecordTimeAsync(allocation.WorkItemId, hours, reduceRemaining);
-
-            planner.AddTimeEntry(allocation, hours, reduceRemaining,
-                result.AppliedCompleted, result.AppliedRemaining, note);
-
-            var noted = await PostTimeNoteAsync(allocation, note, noteFormat);
+            var (result, entry) = await WriteTimeAsync(allocation, hours, reduceRemaining, note);
+            var noted = await PostTimeNoteAsync(allocation, note, noteFormat, entry.Id) is not null;
 
             toasts.Success($"Recorded {hours:0.##}h on #{allocation.WorkItemId}",
                 $"Completed Work is now {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h."
                 + (noted ? " Your note is on the discussion." : ""));
 
-            RecordingFor = null;
+            if (RecordingFor?.Id == allocation.Id) RecordingFor = null;
             Changed?.Invoke();
 
             // Re-read the item in the background. It only refreshes the numbers already
             // shown, so the dialog must not sit on "Saving..." waiting for it.
             _ = RefreshWorkItemAsync(allocation.WorkItemId);
-            return true;
+            return TimeWriteOutcome.Recorded;
+        }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            // An error rather than a warning, so it stays until dismissed: the dialog it came
+            // from may already be shut, and this is something to act on.
+            toasts.Error($"{hours:0.##}h on #{allocation.WorkItemId} may already be booked",
+                ex.Message + (string.IsNullOrWhiteSpace(note) ? "" : " Your note has not been posted."));
+            Changed?.Invoke();
+            return TimeWriteOutcome.Unconfirmed;
+        }
+        catch (BlockUnsettledException ex)
+        {
+            // Nothing was sent, and nothing should be until the earlier booking is settled -
+            // so this is not a failure to try again.
+            toasts.Error("Could not record that time", ex.Message);
+            Changed?.Invoke();
+            return TimeWriteOutcome.Unconfirmed;
         }
         catch (Exception ex)
         {
             toasts.Error("Could not record that time", ex.Message);
-            return false;
+            return TimeWriteOutcome.Failed;
+        }
+        finally
+        {
+            ReleaseBlock(allocation.Id);
         }
     }
 
     /// <summary>
-    /// Adds the note that came with a time booking to the work item's discussion. Returns
-    /// whether anything was posted: an empty note is the normal case, not a failure.
+    /// The batch counterpart to <see cref="RecordTimeAsync"/>, used by "Record today" to book
+    /// several blocks in one pass. Same write, same time entry, same note - it just hands the
+    /// outcome back instead of toasting it, so a run of many rows can show its own per-row
+    /// result and end in one summary toast rather than one per block.
+    ///
+    /// The note is kept on the time entry every time, but <paramref name="postNote"/> decides
+    /// whether it also goes to the discussion: a day with two blocks of the same item books
+    /// both, and the item should still get the comment once. The comment that was posted comes
+    /// back for the caller to hand to the rest of the rows it speaks for, as
+    /// <paramref name="shared"/> - one comment, the same id on every entry it covers, so it
+    /// only leaves the discussion with the last of those hours. It goes onto the entry before
+    /// that row's own write is sent, so a row Azure DevOps never confirms is still filed
+    /// carrying it when it is settled; see <see cref="WriteTimeAsync"/>.
+    /// </summary>
+    public async Task<(TimeWriteOutcome Outcome, string? Error, TimeNote? Posted)> RecordTimeSilentAsync(
+        Allocation allocation, double hours, bool reduceRemaining,
+        string note = "", TextFormat noteFormat = TextFormat.Markdown, bool postNote = true,
+        TimeNote? shared = null)
+    {
+        // A row still to come when an update starts taking over is left for the new copy,
+        // which shows it as not yet recorded.
+        if (TryClaimBlock(allocation.Id) is { } refused) return (TimeWriteOutcome.Failed, refused, null);
+
+        try
+        {
+            // The note an earlier row of this run put on the discussion speaks for these hours
+            // too, so the write carries it onto the entry it makes before it is sent. A row
+            // that posts its own note has nothing to carry yet - its id comes back from the
+            // discussion afterwards.
+            var (_, entry) = await WriteTimeAsync(
+                allocation, hours, reduceRemaining, note, postNote ? null : shared);
+
+            var posted = postNote ? await PostTimeNoteAsync(allocation, note, noteFormat, entry.Id) : null;
+
+            Changed?.Invoke();
+            _ = RefreshWorkItemAsync(allocation.WorkItemId);
+            return (TimeWriteOutcome.Recorded, null, posted);
+        }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            Changed?.Invoke();
+            return (TimeWriteOutcome.Unconfirmed, ex.Message, null);
+        }
+        catch (BlockUnsettledException ex)
+        {
+            // The row is left the way a row whose own booking went unconfirmed is left -
+            // unticked, with a check offered - because that is exactly what it is now.
+            Changed?.Invoke();
+            return (TimeWriteOutcome.Unconfirmed, ex.Message, null);
+        }
+        catch (Exception ex)
+        {
+            return (TimeWriteOutcome.Failed, ex.Message, null);
+        }
+        finally
+        {
+            ReleaseBlock(allocation.Id);
+        }
+    }
+
+    /// <summary>
+    /// Blocks with a booking - or a check on one - on its way to Azure DevOps at this moment,
+    /// whichever dialog sent it. A block's entry only exists once its write is back, so
+    /// without this "Record time…" could book a block a Record day pass left running behind a
+    /// closed dialog was still writing, or the other way round.
+    /// </summary>
+    private readonly HashSet<Guid> _recordingBlocks = [];
+
+    private const string BlockBusy =
+        "This block is already being recorded. Wait for that to finish, then check what it booked before recording any more.";
+
+    private const string BlockUnsettled =
+        "A booking from this block was never confirmed and may already be on the work item. Check it before recording any more against this block.";
+
+    /// <summary>
+    /// Why time cannot be written while the plan file cannot be. Azure DevOps would take the
+    /// hours either way; the record that says it did - the pin written before the send, the
+    /// entry written after it - has nowhere to go, so the block would be offered again as
+    /// never booked and the same hours would go on twice.
+    /// </summary>
+    private const string PlanUnwritable =
+        "Your plan cannot be written at the moment, so time booked now could not be recorded here and could go on the work item twice. Close Slate, make sure nothing else is holding the plan file, and start it again.";
+
+    /// <summary>
+    /// Why time cannot be written after a plan that would not parse was put aside. Saving
+    /// works again - it is a new, empty plan - but the bookings Azure DevOps never confirmed
+    /// were in the old file and nowhere else, while the blocks come back from their Outlook
+    /// events reading as never recorded. Recording one of those is how hours already on a work
+    /// item go on it a second time, and nothing here can tell which blocks those are.
+    /// </summary>
+    private const string PlanUnreadable =
+        "Your plan could not be read when Slate started, so it cannot tell which hours are already on a work item. The old file is kept beside it in the Slate data folder: sort that out, then start Slate again.";
+
+    /// <summary>
+    /// A time write refused here, before anything went to Azure DevOps, because the block
+    /// already has a booking nothing has settled. Its own kind, so every caller can tell it
+    /// apart from a failure and offer the check rather than a one-click retry.
+    /// </summary>
+    private sealed class BlockUnsettledException() : Exception(BlockUnsettled);
+
+    /// <summary>
+    /// Counts a time write in, or says why it cannot go ahead. Every null must be paired with
+    /// an <see cref="EndWrite"/>.
+    ///
+    /// Three refusals, for the three ways a write would end up on a work item with nothing
+    /// here to show for it: a handover, where the copy that will carry on has already read the
+    /// plan; a plan file that cannot be written at all, where nothing is read back by anybody;
+    /// and one that could not be read this time, where what was outstanding is in a file
+    /// nothing will open again. Every path that books, undoes, checks or answers for time goes
+    /// through this or through <see cref="TryClaimBlock"/>, which starts here.
+    /// </summary>
+    private string? TryBeginTimeWrite()
+    {
+        if (!TryBeginWrite()) return RestartingForUpdate;
+        if (planner.CanSave && !planner.PlanWasUnreadable) return null;
+
+        EndWrite();
+        return planner.CanSave ? PlanUnreadable : PlanUnwritable;
+    }
+
+    /// <summary>
+    /// Counts a time write in and claims its block, or says why it cannot go ahead. Every
+    /// null must be paired with a <see cref="ReleaseBlock"/>.
+    /// </summary>
+    private string? TryClaimBlock(Guid allocationId)
+    {
+        if (TryBeginTimeWrite() is { } refused) return refused;
+
+        lock (_recordingBlocks)
+        {
+            if (_recordingBlocks.Add(allocationId)) return null;
+        }
+
+        EndWrite();
+        return BlockBusy;
+    }
+
+    private void ReleaseBlock(Guid allocationId)
+    {
+        lock (_recordingBlocks) _recordingBlocks.Remove(allocationId);
+        EndWrite();
+    }
+
+    /// <summary>
+    /// The write itself: books the hours in Azure DevOps and keeps the local entry for it -
+    /// or, when Azure DevOps could not say whether they went on, leaves the booking standing
+    /// as unconfirmed, so the block is not offered again as though nothing had happened.
+    /// Callers claim the block with <see cref="TryClaimBlock"/>, which also counts the write
+    /// in: a copy that exits between the two halves leaves hours booked that the plan knows
+    /// nothing about, and the next copy offers to book them again.
+    ///
+    /// The booking is written to the plan before each send rather than once the answer is
+    /// back, so the gap the claim cannot cover - a copy that dies with the PATCH already on
+    /// its way - leaves the next one something it can settle against the work item.
+    ///
+    /// The entry comes back beside the result so the note posted afterwards can be written
+    /// onto the very entry these hours made, which is what lets an undo of them offer to
+    /// take the note off too.
+    ///
+    /// <paramref name="shared"/> is a note already on the discussion that these hours are
+    /// covered by as well - the rest of a day recorded in one pass. It goes onto the entry
+    /// here, before the send, rather than onto the filed entry afterwards: a write Azure
+    /// DevOps never answers for leaves this entry standing as an unconfirmed booking, and the
+    /// settle files it exactly as it is. Stamped after the answer instead, those hours would
+    /// be filed carrying no comment, the sharing would be invisible to every other entry's
+    /// undo, and the note would come off the discussion with hours still on the work item.
+    /// Nothing escapes that way either: a booking that turns out never to have landed is let
+    /// go rather than filed, so the id only ever survives on hours that are really there.
+    /// </summary>
+    private async Task<(TimeRecordResult Result, TimeEntry Entry)> WriteTimeAsync(
+        Allocation allocation, double hours, bool reduceRemaining, string note, TimeNote? shared = null)
+    {
+        // A booking from this block that nothing has settled may be on the work item already,
+        // so more hours on top of it are exactly how the same time goes on twice. Refused here
+        // rather than in each dialog, so no caller can get past it - a list built before the
+        // booking existed, a form that was already open, a retry beside a failed row. Settling
+        // it, by a check or by hand, is the way out.
+        if (planner.HasUnconfirmed(allocation.Id)) throw new BlockUnsettledException();
+
+        var entry = planner.BuildTimeEntry(allocation, CurrentOrganization, hours, reduceRemaining, comment: note);
+
+        if (shared is { CommentId: > 0 } already)
+        {
+            entry.CommentId = already.CommentId;
+            entry.CommentProject = already.Project;
+        }
+
+        var pending = new UnconfirmedBooking { Entry = entry };
+
+        TimeRecordResult result;
+        try
+        {
+            result = await ado.RecordTimeAsync(allocation.WorkItemId, hours, reduceRemaining,
+                plan => PinQuietly(() => planner.PinUnconfirmed(pending, plan), allocation.WorkItemId));
+        }
+        catch (TimeWriteUnconfirmedException)
+        {
+            // Already written down, pinned to what went out. All that is left is to stop
+            // calling it in flight, so the dialogs start saying so.
+            planner.LeaveUnconfirmed(pending);
+            throw;
+        }
+        catch (AzureDevOpsException)
+        {
+            // Turned away, or never sent: this one certainly is not on the work item, so what
+            // was written down for it has nothing to settle and would only lock the block.
+            PinQuietly(() => planner.DropUnconfirmed(pending), allocation.WorkItemId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Anything else is not a refusal this code understands, so it is not taken as one.
+            // Once something has gone out, the only answer that cannot end in the same hours
+            // going on twice is the unconfirmed one - which is also what stops the caller
+            // offering the block back with a one-click retry.
+            planner.LeaveUnconfirmed(pending);
+
+            if (pending.Plan is not { } pinned) throw;
+
+            throw new TimeWriteUnconfirmedException(
+                $"Something went wrong after the change to #{allocation.WorkItemId} had gone out, so whether it " +
+                $"landed could not be settled: {ex.Message} Check the work item before trying again.", pinned, ex);
+        }
+
+        // The hours are on the work item by now, so a plan file that will not take the entry
+        // must not be reported as a failure: that is a one-click retry of hours already booked.
+        PinQuietly(() => planner.Confirm(pending, result), allocation.WorkItemId);
+        return (result, pending.Entry);
+    }
+
+    /// <summary>
+    /// Runs one of the plan-file steps around a time write. A plan that cannot be saved costs
+    /// the safety net for this one write, and says so in the log; it must never stop the hours
+    /// going on, and never turn an unconfirmed booking into a failure that invites a retry.
+    /// The change is in memory either way, so this session carries on knowing about it.
+    /// </summary>
+    private static void PinQuietly(Action step, int workItemId)
+    {
+        try
+        {
+            step();
+        }
+        catch (Exception ex)
+        {
+            // Deliberately broad: nothing this does is worth losing the outcome of a write.
+            CrashLog.WriteLine($"Could not write the plan down around the time write on #{workItemId}: {ex}");
+        }
+    }
+
+    /// <summary>
+    /// Looks again, without writing anything, for the bookings from a block that Azure DevOps
+    /// never confirmed. One that turns out to have landed is filed as the entry it would have
+    /// made; one that did not is let go, and the block can be booked again. Its note is not
+    /// posted either way: arriving this late, whether it is still wanted is the user's call.
+    ///
+    /// Null when there was nothing left to check - the quiet settle, or another dialog, got
+    /// there first. That is not the same as nothing having landed, and a caller that treated
+    /// it as such would tick the block for booking and then refuse the booking.
+    /// </summary>
+    public async Task<TimeWriteOutcome?> CheckUnconfirmedAsync(Guid allocationId)
+    {
+        if (TryClaimBlock(allocationId) is { } refused)
+        {
+            toasts.Error("Could not check that booking", refused);
+            return TimeWriteOutcome.Unconfirmed;
+        }
+
+        try
+        {
+            var bookings = planner.UnconfirmedForBlock(allocationId);
+            if (bookings.Count == 0)
+            {
+                toasts.Info("Nothing left to check on that block",
+                    "It had already been settled - what is shown here is up to date.");
+                return null;
+            }
+
+            var workItemId = bookings[0].Entry.WorkItemId;
+
+            // Judged one booking at a time, inside the settle. A block can hold bookings made
+            // before and after an organization was switched, and taking the oldest one's
+            // answer for all of them put every later booking permanently out of reach.
+            var settled = await SettleBlockAsync(bookings);
+
+            if (settled.LandedMinutes > 0)
+                toasts.Success($"{Ui.Hours(settled.LandedMinutes)} did go on #{workItemId}",
+                    "It is recorded here now as well."
+                    + (settled.SharedNote
+                        ? " Its note is already on the discussion: it went on with another block of the same day."
+                        : "")
+                    + (settled.UnpostedNote
+                        ? " Its note is kept on the entry; nothing was posted to the discussion for it just now, " +
+                          "so look at the work item if that note should be on it."
+                        : ""));
+
+            if (settled.Elsewhere is { } elsewhere)
+                toasts.Error($"That booking on #{workItemId} is not from this organization", elsewhere);
+            else if (settled.Unsure > 0)
+                toasts.Error($"Still cannot tell whether that time went on #{workItemId}",
+                    "Azure DevOps could not be asked, or the change may still be on its way. Look at the work " +
+                    "item itself, or check again in a few minutes. If it is not there, use \"Never went on\" to let it go.");
+            else if (settled.LandedMinutes == 0)
+                toasts.Info($"Nothing was booked on #{workItemId}",
+                    "That time never reached the work item, so it can be recorded again.");
+
+            return settled.Unsure > 0 ? TimeWriteOutcome.Unconfirmed
+                : settled.LandedMinutes > 0 ? TimeWriteOutcome.Recorded
+                : TimeWriteOutcome.Failed;
+        }
+        catch (Exception ex)
+        {
+            toasts.Error("Could not check that booking", ex.Message);
+            return TimeWriteOutcome.Unconfirmed;
+        }
+        finally
+        {
+            ReleaseBlock(allocationId);
+        }
+    }
+
+    /// <summary>
+    /// The Azure DevOps organization hours are being booked to at this moment: the address it
+    /// is reached at, and the id the service gives it once it has been read. Both are stamped
+    /// onto every entry, and both are what a later undo, check or settle judges by.
+    /// </summary>
+    public OrganizationRef CurrentOrganization =>
+        OrganizationRef.For(Settings.Ado.OrganizationUrl, ado.OrganizationId);
+
+    /// <summary>
+    /// Why this entry's hours are not this connection's to act on, or null when they are.
+    /// Work item numbers only mean anything within one organization, so an undo or a check
+    /// run after switching would otherwise read, and change, a different item altogether.
+    ///
+    /// The way out is named as well as the refusal, and only where one exists. An organization
+    /// that was renamed or moved has no old address left to switch back to, so someone who
+    /// knows it is the same organization can say so from the Time tab instead. Neither way out
+    /// fits every refusal: there is nowhere to switch back to when the hours were booked at
+    /// this very address - see <see cref="SameAddressAs"/> - and nothing to say when Azure
+    /// DevOps' own ids have already answered the question, which is what
+    /// <see cref="TimeEntry.CouldBelongTo"/> tests.
+    /// </summary>
+    private string? WrongConnection(TimeEntry entry)
+    {
+        var organization = CurrentOrganization;
+        if (entry.BelongsTo(organization)) return null;
+
+        var where = BookedAgainst(entry);
+
+        // Refused on the organization's own id while the address is the one Slate is pointed
+        // at, which a Server collection rebuilt where another one used to answer produces.
+        // Reached only when both ids are known and differ - an entry whose id is unknown is
+        // judged on the address, and this address matches - so "same organization" is a claim
+        // the service has already refused, and neither way out is offered here. Nothing is
+        // said about where the hours went, either: the address on the entry is the one Slate
+        // is on, and the id is all that is actually known about the difference.
+        if (SameAddressAs(entry, organization))
+            return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" carries a different Azure DevOps " +
+                   $"organization id from the one the service gives {where}, which Slate is on now, so " +
+                   $"#{entry.WorkItemId} here is a different work item. An id is the one part of an " +
+                   "organization that a rename or a new address leaves alone, so these are two " +
+                   "organizations however alike the addresses look, and nothing here can settle those hours.";
+
+        var here = organization.Url is { Length: > 0 } url ? url : "somewhere else";
+
+        return $"#{entry.WorkItemId} \"{entry.WorkItemTitle}\" was booked against {where}, and Slate is " +
+               $"connected to {here} now, where #{entry.WorkItemId} is a different work item. Switch back " +
+               "to settle it"
+               + (entry.CouldBelongTo(organization)
+                   ? " - or, if this is that same organization under a new address, say so from the Time " +
+                     "tab and Slate will settle it here."
+                   : ". Azure DevOps gives the two addresses different organization ids, so saying they " +
+                     "are one organization is not open here.");
+    }
+
+    /// <summary>
+    /// Of an entry this connection has already refused: true when the hours were booked at the
+    /// very address Slate is reaching Azure DevOps on, so what the two disagree about is the
+    /// organization's identity rather than where it lives.
+    ///
+    /// Everything that explains such a refusal has to know: the usual wordings - "which Slate
+    /// is not connected to now", "switch back" - would name the address Slate is plainly
+    /// connected to and send the user somewhere they already are.
+    ///
+    /// A refusal that gets here always has two known ids that differ, because an entry with no
+    /// id of its own - or a connection with none - is judged on the address alone, and this
+    /// address is the same one. So this is also the case "same organization" can never mend.
+    /// </summary>
+    private static bool SameAddressAs(TimeEntry entry, OrganizationRef organization) =>
+        organization.Url.Length > 0
+        && TimeEntry.NormaliseOrganization(BookedAgainst(entry)) == organization.Url;
+
+    /// <summary>
+    /// The bookings of a block this connection may answer for, with <paramref name="elsewhere"/>
+    /// set to why the others were left out when any were.
+    ///
+    /// One booking at a time, the way <see cref="SettleBlockAsync"/> has always judged them: a
+    /// block can hold one booking made before an organization was switched and one made after,
+    /// and refusing the whole block on the strength of the foreign one left the booking that is
+    /// plainly this organization's with no way to be answered at all.
+    /// </summary>
+    private List<UnconfirmedBooking> MineOf(
+        IReadOnlyList<UnconfirmedBooking> bookings, out string? elsewhere)
+    {
+        var mine = new List<UnconfirmedBooking>(bookings.Count);
+        string? why = null;
+
+        foreach (var booking in bookings)
+        {
+            if (WrongConnection(booking.Entry) is { } refused) why ??= refused;
+            else mine.Add(booking);
+        }
+
+        elsewhere = why;
+        return mine;
+    }
+
+    /// <summary>
+    /// One block's unconfirmed bookings, split into the ones this connection may act on and
+    /// the address the rest were booked against.
+    ///
+    /// What every opening onto those bookings shows is decided from this, so that none of them
+    /// can offer an action the answer paths will then refuse - and none of them can hide one
+    /// that would work. A block can hold a booking made before an organization was switched
+    /// and one made after: the check and the two answers are for <see cref="Mine"/>, and
+    /// "same organization" is the way out for the others - where it is a way out at all.
+    /// </summary>
+    /// <param name="Elsewhere">
+    /// The address the bookings that were left out were booked against, or null when none were.
+    /// </param>
+    /// <param name="ElsewhereWhy">
+    /// Why that address is not this connection's, as <see cref="WhyNotOurs"/> puts it - which
+    /// is not always that Slate is somewhere else. Carried beside the address so the two are
+    /// worked out from the one booking and cannot describe different ones.
+    /// </param>
+    /// <param name="CanAdopt">
+    /// Whether "same organization" could move any of the left-out bookings over: true while at
+    /// least one of them is a claim Azure DevOps has not already refused - see
+    /// <see cref="TimeEntry.CouldBelongTo"/>. False leaves the button off rather than offering
+    /// a press that could only come back refused.
+    /// </param>
+    public sealed record UnsettledBlock(
+        Guid AllocationId,
+        IReadOnlyList<UnconfirmedBooking> Bookings,
+        IReadOnlyList<UnconfirmedBooking> Mine,
+        string? Elsewhere,
+        string ElsewhereWhy = "",
+        bool CanAdopt = false)
+    {
+        /// <summary>The oldest booking of the block, which names the work item for all of them.</summary>
+        public TimeEntry First => Bookings[0].Entry;
+
+        /// <summary>The newest, which is the one "sent ten minutes ago" is about.</summary>
+        public TimeEntry Latest => Bookings[^1].Entry;
+
+        public int Minutes => Bookings.Sum(b => b.Entry.Minutes);
+
+        /// <summary>Nothing on this block can be checked or answered for from here.</summary>
+        public bool AllElsewhere => Mine.Count == 0;
+
+        /// <summary>Only once none of the ones that can be answered could still be arriving.</summary>
+        public bool CanBeLetGo => Mine.Count > 0 && Mine.All(b => b.CanBeLetGo);
+    }
+
+    /// <summary>
+    /// The unconfirmed bookings of one block as <see cref="UnsettledBlock"/> reads them, or
+    /// null when the block has none left. For the two record dialogs, which ask about the one
+    /// block they are open on.
+    /// </summary>
+    public UnsettledBlock? UnsettledFor(Guid allocationId) =>
+        planner.UnconfirmedForBlock(allocationId) is { Count: > 0 } bookings
+            ? Split(allocationId, bookings)
+            : null;
+
+    /// <summary>
+    /// The same split, for a caller that already has the bookings in hand - the Time tab,
+    /// which reads every block's at once and must judge them all from the one snapshot.
+    /// </summary>
+    public UnsettledBlock Split(Guid allocationId, IReadOnlyList<UnconfirmedBooking> bookings)
+    {
+        var mine = new List<UnconfirmedBooking>(bookings.Count);
+        string? elsewhere = null;
+        var elsewhereWhy = "";
+        var canAdopt = false;
+        var organization = CurrentOrganization;
+
+        // The same test the answers themselves are refused by, so what is offered and what is
+        // accepted cannot drift apart; only the wording differs, this one being what the
+        // address is rather than why it is a refusal.
+        foreach (var booking in bookings)
+        {
+            if (WrongConnection(booking.Entry) is null)
+            {
+                mine.Add(booking);
+                continue;
+            }
+
+            // The address and its clause are the first refused booking's, so the two always
+            // describe one booking. Whether the button appears is asked of all of them,
+            // because AdoptOrganizationForBlockAsync moves every one it is allowed to and a
+            // press is worth offering while any of them would move.
+            if (elsewhere is null)
+            {
+                elsewhere = BookedAgainst(booking.Entry);
+                elsewhereWhy = WhyNotOurs(booking.Entry, organization);
+            }
+
+            canAdopt |= booking.Entry.CouldBelongTo(organization);
+        }
+
+        return new UnsettledBlock(allocationId, bookings, mine, elsewhere, elsewhereWhy, canAdopt);
+    }
+
+    /// <summary>Where a set of hours says it was booked, however little it was stamped with.</summary>
+    public static string BookedAgainst(TimeEntry entry) =>
+        entry.Organization is { Length: > 0 } stamp ? stamp : entry.WorkItemUrl;
+
+    /// <summary>
+    /// Why the address a refused set of hours was booked against is not this connection's, as
+    /// the clause that follows that address wherever one is shown.
+    ///
+    /// Usually because Slate is reaching Azure DevOps somewhere else. Not always: the refusal
+    /// can be about which organization answers at one address rather than about the address -
+    /// see <see cref="SameAddressAs"/> - and saying "not connected to" there would be saying
+    /// it of the address Slate is connected to.
+    ///
+    /// Told which organization rather than reading it, the way <see cref="BookedAgainst"/> is
+    /// handed its entry: a page that judged a row against the connection it was built with
+    /// must explain that row against the same one, or the sentence and the button it sits
+    /// beside can end up describing different connections.
+    /// </summary>
+    public static string WhyNotOurs(TimeEntry entry, OrganizationRef organization) =>
+        SameAddressAs(entry, organization)
+            ? "which Azure DevOps now reports as a different organization at the same address"
+            : "which Slate is not connected to now";
+
+    /// <summary>
+    /// What can be done about hours this connection has refused, as the clause that closes
+    /// every explanation of one. Worked out here rather than written into each opening,
+    /// because an opening whose remedy has drifted from what the write paths accept either
+    /// offers a press that can only be refused or hides one that would work.
+    ///
+    /// Three remedies, for the three shapes a refusal takes. Where the claim is one nothing
+    /// can disprove - see <see cref="TimeEntry.CouldBelongTo"/> - saying it is the same
+    /// organization settles it. Where Azure DevOps' own ids have already refused it, that
+    /// leaves only going back to the organization the hours went to, and nothing at all when
+    /// the hours were booked at this very address and there is nowhere to go back to.
+    /// </summary>
+    /// <param name="onTimeTab">
+    /// True where "same organization" is on the page the clause is being shown on, which
+    /// changes only whether the user is sent to the Time tab to find it.
+    /// </param>
+    public static string WayOut(TimeEntry entry, OrganizationRef organization, bool onTimeTab) =>
+        entry.CouldBelongTo(organization)
+            ? onTimeTab
+                ? "Say it is the same organization first."
+                : "Say it is the same organization on the Time tab first."
+            : SameAddressAs(entry, organization)
+                ? "Nothing here can undo them."
+                : "Connect to that organization again to undo them.";
+
+    /// <summary>
+    /// Why a refused entry's Undo is off, as the button's own tooltip says it. One builder for
+    /// all three openings onto that button - the Time tab's rows, the plan's block menu and
+    /// the inspector - so the reason, the remedy and the button carrying them cannot drift.
+    /// </summary>
+    public static string WhyUndoIsOff(TimeEntry entry, OrganizationRef organization, bool onTimeTab) =>
+        $"Booked against {BookedAgainst(entry)}, {WhyNotOurs(entry, organization)}, so Undo would change " +
+        $"a different work item. {WayOut(entry, organization, onTimeTab)}";
+
+    /// <summary>
+    /// What "same organization" promises, in the one wording all five openings onto it use -
+    /// the Time tab's block cards, stuck undos and entry rows, and the two record dialogs.
+    /// Five copies of a sentence this particular drifted apart once already.
+    ///
+    /// It promises no more than the adopt paths deliver: the three things that move an
+    /// organization without changing which organization it is, and the check that refuses the
+    /// claim outright when Azure DevOps gives the two different ids.
+    /// </summary>
+    private const string SameOrganizationWhen =
+        "Only if that address and this one are the same organization - renamed, moved to dev.azure.com, " +
+        "or reached by a new server name. Slate refuses it if Azure DevOps gives the two different " +
+        "organization ids. Nothing is written to Azure DevOps";
+
+    /// <summary>The tooltip on a booking's button, which becomes checkable rather than undoable.</summary>
+    public const string AdoptBookingTitle =
+        SameOrganizationWhen + "; the booking simply becomes one this connection can check and answer for.";
+
+    /// <summary>The tooltip on a filed entry's button, whose undo is what the stamp refuses.</summary>
+    public const string AdoptEntryTitle = SameOrganizationWhen + ".";
+
+    /// <summary>
+    /// Lets go of a block's unconfirmed bookings without asking Azure DevOps again: the user
+    /// has looked at the work item and the hours are not on it. The way out of a booking that
+    /// can never be settled - a work item restored from the recycle bin, a revision the
+    /// service will not give up, an identity it names in a way this app cannot match.
+    ///
+    /// Only once no send of it could still be arriving, so this can never be overtaken by the
+    /// change landing a moment later; and the block is claimed first, so it cannot run beside
+    /// a write of its own.
+    ///
+    /// Never for a booking made against another organization. This answer rests entirely on
+    /// the user having looked at the work item - and that is the one case where they cannot
+    /// have, because Slate is not connected to the organization the hours went to, and #7 over
+    /// here is a different work item altogether.
+    ///
+    /// Judged one booking at a time, the way the check and the settle judge them. A block can
+    /// hold bookings from either side of an organization switch, and refusing all of them on
+    /// the strength of the foreign one leaves the local one with no answer at all.
+    /// </summary>
+    public bool LetGoUnconfirmed(Guid allocationId)
+    {
+        if (TryClaimBlock(allocationId) is { } refused)
+        {
+            toasts.Error("Could not let that booking go", refused);
+            return false;
+        }
+
+        try
+        {
+            var all = planner.UnconfirmedForBlock(allocationId);
+            if (all.Count == 0) return false;
+
+            var bookings = MineOf(all, out var elsewhere);
+            if (bookings.Count == 0)
+            {
+                toasts.Error("That booking is not this organization's to let go", elsewhere!);
+                return false;
+            }
+
+            if (bookings.Any(b => !b.CanBeLetGo))
+            {
+                toasts.Error("Too soon to let that booking go",
+                    "It was sent only moments ago and could still be arriving. Give it five minutes, check the " +
+                    "work item, then try again.");
+                return false;
+            }
+
+            var minutes = 0;
+            foreach (var booking in bookings)
+                if (planner.SettleUnconfirmed(booking, landed: false)) minutes += booking.Entry.Minutes;
+
+            if (minutes == 0) return false;
+
+            toasts.Info($"{Ui.Hours(minutes)} on #{bookings[0].Entry.WorkItemId} let go",
+                "Slate has stopped waiting on it. Nothing was written to Azure DevOps either way."
+                + (elsewhere is null
+                    ? " The block can be recorded again."
+                    : " Another booking on that block was made against a different organization and is still" +
+                      " waiting, so the block cannot be recorded again until that one is settled too."));
+
+            Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            ReleaseBlock(allocationId);
+        }
+    }
+
+    /// <summary>
+    /// The other half of <see cref="LetGoUnconfirmed"/>: the user has looked at the work item
+    /// and the hours are on it, so the booking is filed as the entry it would have made.
+    ///
+    /// Without this, a booking Azure DevOps can never settle could only be let go - which
+    /// leaves the block offering the same hours again, with them already on the work item.
+    /// Nothing is written to Azure DevOps; this only writes down what is already there.
+    ///
+    /// Refused for another organization's booking for the same reason letting one go is: the
+    /// work item this claims to have looked at is not one this connection can even show - and
+    /// one booking at a time, so a block holding one from either side of a switch still has an
+    /// answer for the one that is here.
+    /// </summary>
+    public bool FileUnconfirmed(Guid allocationId)
+    {
+        if (TryClaimBlock(allocationId) is { } refused)
+        {
+            toasts.Error("Could not record that booking", refused);
+            return false;
+        }
+
+        try
+        {
+            var all = planner.UnconfirmedForBlock(allocationId);
+            if (all.Count == 0) return false;
+
+            var bookings = MineOf(all, out var elsewhere);
+            if (bookings.Count == 0)
+            {
+                toasts.Error("That booking is not this organization's to settle", elsewhere!);
+                return false;
+            }
+
+            // Same gate as letting one go: while a send could still be arriving, a check can
+            // still settle it for certain, and that is better than anybody's reading of the
+            // work item at this moment.
+            if (bookings.Any(b => !b.CanBeLetGo))
+            {
+                toasts.Error("Too soon to settle that booking by hand",
+                    "It was sent only moments ago and could still be arriving. Give it five minutes and check " +
+                    "again - Azure DevOps may yet answer for it.");
+                return false;
+            }
+
+            var workItemId = bookings[0].Entry.WorkItemId;
+            var minutes = 0;
+            foreach (var booking in bookings)
+                if (planner.SettleUnconfirmed(booking, landed: true)) minutes += booking.Entry.Minutes;
+
+            if (minutes == 0) return false;
+
+            toasts.Success($"{Ui.Hours(minutes)} on #{workItemId} recorded here",
+                "Taken as booked because you said the work item has it. Nothing was written to Azure DevOps; " +
+                "undo the entry from the time view if it turns out it does not.");
+
+            Changed?.Invoke();
+            _ = RefreshWorkItemAsync(workItemId);
+            return true;
+        }
+        finally
+        {
+            ReleaseBlock(allocationId);
+        }
+    }
+
+    /// <summary>
+    /// The organization a "same organization" claim is judged by, with the id read first when
+    /// it is not known yet.
+    ///
+    /// <see cref="CurrentOrganization"/>'s id is empty until connectionData has been read for
+    /// the address in settings, which is exactly the state just after an organization is
+    /// switched - the switch that makes these hours need claiming in the first place. Judged
+    /// in that window the claim is taken on the address alone, this address is stamped on, and
+    /// the Undo it re-enables writes against this organization's #7 for hours that went to
+    /// another one. The moment the id arrives the very same claim is refused, which is the
+    /// proof it should never have been taken: one cheap GET settles it, and it is made here
+    /// before anything is written down.
+    ///
+    /// A connection whose connectionData genuinely cannot be read comes back with the id still
+    /// empty, and the claim is taken on trust exactly as it was before - that escape hatch for
+    /// a renamed or moved organization is what claiming one exists for.
+    /// </summary>
+    private async Task<OrganizationRef> IdentifiedOrganizationAsync()
+    {
+        if (CurrentOrganization.Id.Length > 0) return CurrentOrganization;
+
+        // Reads connectionData for the address in settings and holds what it says; the name it
+        // returns is not what is wanted here, the identity it fills in on the way is.
+        try
+        {
+            await ado.GetAuthenticatedUserAsync();
+        }
+        catch (Exception ex)
+        {
+            CrashLog.WriteLine($"Could not read which organization this is before a claim: {ex.Message}");
+        }
+
+        return CurrentOrganization;
+    }
+
+    /// <summary>
+    /// Why a "same organization" claim cannot be taken at its word: Azure DevOps has already
+    /// answered the question itself, and its answer is no.
+    ///
+    /// Said at the press rather than acted on and taken back later. Accepting it would stamp
+    /// this organization onto hours that went to another one, and the Undo that comes back
+    /// with it would take time off a work item that never had it.
+    /// </summary>
+    private static string NotTheSameOrganization(TimeEntry entry) =>
+        $"Azure DevOps gives this organization a different id from the one #{entry.WorkItemId} " +
+        $"\"{entry.WorkItemTitle}\" was booked under, and an id is the one part of an organization that a " +
+        "rename, a move to dev.azure.com or a new server name leaves alone. They really are two " +
+        "organizations, so those hours cannot be moved over - undoing them here would take time off a " +
+        "work item that never had it.";
+
+    /// <summary>
+    /// Takes a block's unsettled bookings as this organization's after all, when the user says
+    /// so. The way out of the one refusal there is otherwise no way out of: an organization
+    /// that was renamed or moved has no old address left to switch back to, so without this
+    /// those hours could never be checked, answered for or undone again.
+    ///
+    /// The claim is put to Azure DevOps before it is written down. The id is read first when
+    /// it is not known - see <see cref="IdentifiedOrganizationAsync"/> - and a booking whose
+    /// own id the service contradicts is refused here, with the reason, rather than accepted
+    /// and quietly taken back the moment the id arrives.
+    ///
+    /// It only re-stamps them, and only the ones that are actually refused: a block can hold a
+    /// booking made before the switch and one made after, and the second was never in question.
+    /// Nothing is written to Azure DevOps and nothing is settled - the check and the two
+    /// answers simply become available again, and they still decide.
+    /// </summary>
+    public async Task<bool> AdoptOrganizationForBlockAsync(Guid allocationId)
+    {
+        if (TryClaimBlock(allocationId) is { } refused)
+        {
+            toasts.Error("Could not move that booking over", refused);
+            return false;
+        }
+
+        try
+        {
+            var bookings = planner.UnconfirmedForBlock(allocationId);
+            if (bookings.Count == 0) return false;
+
+            var organization = await IdentifiedOrganizationAsync();
+
+            var inQuestion = bookings.Where(b => !b.Entry.BelongsTo(organization)).ToList();
+            if (inQuestion.Count == 0) return false;
+
+            // Refused only when nothing on the block can be moved. One the service has ruled
+            // on beside one it has not is still worth the press for the second, the same way
+            // only the refused bookings are re-stamped at all.
+            var stuck = inQuestion.Where(b => !b.Entry.CouldBelongTo(organization)).ToList();
+            if (stuck.Count == inQuestion.Count)
+            {
+                toasts.Error("That booking is not this organization's", NotTheSameOrganization(stuck[0].Entry));
+                return false;
+            }
+
+            var workItemId = bookings[0].Entry.WorkItemId;
+            if (planner.AdoptOrganization(allocationId, organization) == 0) return false;
+
+            toasts.Info($"That booking on #{workItemId} is this organization's now",
+                "Nothing was written to Azure DevOps. Check it, or answer for it, as usual."
+                + (stuck.Count > 0
+                    ? " Another booking on that block carries an id Azure DevOps gives a different" +
+                      " organization, and that one stays where it is."
+                    : ""));
+
+            Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            ReleaseBlock(allocationId);
+        }
+    }
+
+    /// <summary>
+    /// The same for a filed entry, whose undo is what the organization stamp is refusing.
+    /// Claimed the way an undo of it is, so it cannot run beside one - and the claim is put to
+    /// Azure DevOps first for the same reason the block's is: what a press re-enables here is
+    /// a write against a work item.
+    /// </summary>
+    public async Task<bool> AdoptOrganizationForEntryAsync(Guid entryId)
+    {
+        if (TryBeginTimeWrite() is { } refused)
+        {
+            toasts.Error("Could not move that entry over", refused);
+            return false;
+        }
+
+        lock (_undoingEntries)
+        {
+            if (!_undoingEntries.Add(entryId))
+            {
+                EndWrite();
+                return false;
+            }
+        }
+
+        try
+        {
+            if (planner.FindTimeEntry(entryId) is not { } entry) return false;
+
+            var organization = await IdentifiedOrganizationAsync();
+            if (!entry.CouldBelongTo(organization))
+            {
+                toasts.Error("Those hours are not this organization's", NotTheSameOrganization(entry));
+                return false;
+            }
+
+            if (!planner.AdoptOrganizationForEntry(entryId, organization)) return false;
+
+            toasts.Info($"Those hours on #{entry.WorkItemId} are this organization's now",
+                "Nothing was written to Azure DevOps. Undo works on them again.");
+
+            Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            lock (_undoingEntries) _undoingEntries.Remove(entryId);
+            EndWrite();
+        }
+    }
+
+    /// <summary>
+    /// Answers for an undo Azure DevOps never confirmed, when the user has the work item in
+    /// front of them: it went through, so the entry goes, or it did not, so the entry stands
+    /// and the pin is let go.
+    ///
+    /// Without this an undo stuck at "cannot tell" left its entry permanently un-undoable -
+    /// every Undo of it stopped at the same unanswerable question. No time is written to Azure
+    /// DevOps either way; as far as the hours go this only writes down what the work item
+    /// already says.
+    ///
+    /// Gated like the booking answers: only once no send of it could still be arriving, and
+    /// never for another organization's hours, which are the ones the user cannot have looked
+    /// at from here.
+    ///
+    /// "It went through" drops the entry, so it takes <paramref name="removeNote"/> the way an
+    /// undo does, and in the same order: the hours are off the work item by the user's own
+    /// account of it before anything here runs, the entry goes, and only then the comment. It
+    /// may well be the last chance to remove it - unless the note was posted for a whole day at
+    /// once, this entry is the only record of which comment it was. "It never went through"
+    /// changes nothing but the pin and asks nothing.
+    /// </summary>
+    public async Task<bool> AnswerUnconfirmedUndoAsync(Guid entryId, bool wentThrough, bool removeNote = false)
+    {
+        if (TryBeginTimeWrite() is { } refused)
+        {
+            toasts.Error("Could not settle that undo", refused);
+            return false;
+        }
+
+        lock (_undoingEntries)
+        {
+            if (!_undoingEntries.Add(entryId))
+            {
+                EndWrite();
+                toasts.Error("Could not settle that undo", "That entry is already being undone.");
+                return false;
+            }
+        }
+
+        try
+        {
+            // Both of these are ordinary: nothing is claimed while the prompt is merely open,
+            // so the quiet settle - or another undo of the same work item landing and sweeping
+            // the pin - can answer for this one between the question being asked and the button
+            // being pressed. Said out loud rather than closed in silence, because the button
+            // that was pressed reads "Drop it and remove the note".
+            if (planner.FindTimeEntry(entryId) is not { } entry)
+            {
+                toasts.Info("That undo had already been settled",
+                    "Its entry is gone, so there was nothing left to drop. Nothing was sent to Azure DevOps and "
+                    + "no note was taken off the discussion from here: remove the comment in Azure DevOps if "
+                    + "those hours left one that should not stand.");
+                return false;
+            }
+
+            if (entry.UnconfirmedUndo is not { } plan)
+            {
+                toasts.Info($"That undo on #{entry.WorkItemId} had already been answered for",
+                    "Something else settled it first, and those hours are still recorded here - Undo works on "
+                    + "them again. Nothing was sent to Azure DevOps, and no note was taken off the discussion "
+                    + "from here.");
+                return false;
+            }
+
+            if (WrongConnection(entry) is { } elsewhere)
+            {
+                toasts.Error("That undo is not this organization's to settle", elsewhere);
+                return false;
+            }
+
+            if (plan.CouldStillLand)
+            {
+                toasts.Error("Too soon to settle that undo by hand",
+                    "It was sent only moments ago and could still be arriving. Give it five minutes and undo " +
+                    "again - Azure DevOps may yet answer for it.");
+                return false;
+            }
+
+            // The same two races again, caught inside the save that acts on the pin: by now
+            // either the entry has gone or the pin has been swept, and which of the two is only
+            // knowable in there, so this says what is true of both.
+            if (!planner.SettleUnconfirmedUndo(entryId, plan, wentThrough))
+            {
+                toasts.Info($"That undo on #{entry.WorkItemId} was settled while you were answering",
+                    "Something else answered for it first, so nothing here was changed: those hours are either "
+                    + "gone from the Time tab already or still recorded there. Nothing was sent to Azure DevOps, "
+                    + "and no note was taken off the discussion from here.");
+                return false;
+            }
+
+            if (wentThrough)
+            {
+                // Last, and only now the entry is gone: the same order every undo here keeps,
+                // and a comment that will not delete is reported on its own rather than taking
+                // the settled entry back.
+                var note = removeNote ? await RemoveTimeNoteAsync(entry) : NoteRemoval.NotAsked;
+
+                toasts.Success($"The undo of {entry.Hours:0.##}h on #{entry.WorkItemId} is settled",
+                    "Taken as gone through because you said the work item no longer has those hours. "
+                    + (removeNote ? "No time was written to Azure DevOps." : "Nothing was written to Azure DevOps.")
+                    + NoteSentence(note));
+                _ = RefreshWorkItemAsync(entry.WorkItemId);
+            }
+            else
+            {
+                toasts.Info($"The undo of {entry.Hours:0.##}h on #{entry.WorkItemId} never went through",
+                    "The entry stands, and Undo works on it again.");
+            }
+
+            Changed?.Invoke();
+            return true;
+        }
+        finally
+        {
+            lock (_undoingEntries) _undoingEntries.Remove(entryId);
+            EndWrite();
+        }
+    }
+
+    private bool _settledUnconfirmed;
+
+    /// <summary>
+    /// Does what <see cref="CheckUnconfirmedAsync"/> does for every unconfirmed booking, once a
+    /// session, after the first list of work items that loads - so they are settled even when
+    /// nobody presses Check, including ones from blocks deleted since, which no dialog can reach
+    /// any more. Quiet unless one turns out to have landed, which is news worth a toast; one
+    /// that still cannot be told is simply left for later.
+    /// </summary>
+    private async Task SettleUnconfirmedQuietlyAsync()
+    {
+        var organization = CurrentOrganization;
+        var landedMinutes = 0;
+
+        foreach (var group in planner.UnconfirmedBookings
+                     .Where(b => b.Entry.BelongsTo(organization))
+                     .GroupBy(b => b.Entry.AllocationId).ToList())
+        {
+            // A block being booked or checked right now is left to whatever is doing it.
+            if (TryClaimBlock(group.Key) is not null) continue;
+
+            try
+            {
+                landedMinutes += (await SettleBlockAsync([.. group])).LandedMinutes;
+            }
+            catch (Exception)
+            {
+                // Deliberately broad: this is housekeeping, and the next session tries again.
+            }
+            finally
+            {
+                ReleaseBlock(group.Key);
+            }
+        }
+
+        if (landedMinutes > 0)
+            toasts.Success($"{Ui.Hours(landedMinutes)} Azure DevOps had not confirmed did go on",
+                "It is recorded here now as well.");
+
+        // Undos the same way: one that did go through takes its entry with it, as it would
+        // have at the time. Entries from another organization are left alone - their work
+        // item numbers mean something else here.
+        var undoneMinutes = 0;
+        foreach (var entry in planner.TimeEntries
+                     .Where(e => e.UnconfirmedUndo is not null && e.BelongsTo(organization)).ToList())
+        {
+            if (TryBeginTimeWrite() is not null) break;
+
+            lock (_undoingEntries)
+            {
+                if (!_undoingEntries.Add(entry.Id))
+                {
+                    EndWrite();
+                    continue;
+                }
+            }
+
+            try
+            {
+                // Read again inside the loop, not from the list: settling an earlier undo lets
+                // go of any pinned to the same revision, and one of those may be this.
+                if (entry.UnconfirmedUndo is not { } plan) continue;
+
+                var (landed, _) = await ado.CheckTimeWriteAsync(plan);
+                if (landed is null) continue;
+
+                // The pin is tested again, inside the same lock that acts on it. Reading it
+                // before the await is not enough: a manual undo of another entry of this work
+                // item can land while this check is out and sweep this pin away - which says
+                // this undo did not land, whatever the check thought it saw. Two entries
+                // pinned to one revision and describing the same change are ordinary, not
+                // exotic, and dropping both would leave an hour on the work item with nothing
+                // here pointing at it. Landed, the removal and the sweep go in one save.
+                if (!planner.SettleUnconfirmedUndo(entry.Id, plan, landed.Value)) continue;
+
+                if (landed.Value)
+                {
+                    undoneMinutes += entry.Minutes;
+                    _ = RefreshWorkItemAsync(entry.WorkItemId);
+                }
+            }
+            catch (Exception)
+            {
+                // Housekeeping again: the next Undo of it, or the next session, looks again.
+            }
+            finally
+            {
+                lock (_undoingEntries) _undoingEntries.Remove(entry.Id);
+                EndWrite();
+            }
+        }
+
+        if (undoneMinutes > 0)
+            toasts.Success($"An undo of {Ui.Hours(undoneMinutes)} Azure DevOps had not confirmed did go through",
+                "Its entry is gone from here now as well.");
+
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// What came of settling one block's unconfirmed bookings. <see cref="Elsewhere"/> is the
+    /// reason the first booking from another organization could not be looked at, when there
+    /// was one; those are counted in <see cref="Unsure"/> as well, because nothing about them
+    /// has been settled either.
+    ///
+    /// <see cref="UnpostedNote"/> and <see cref="SharedNote"/> are what can be said about a
+    /// settled booking's note, and they are told apart because they are opposite news: hours
+    /// filed carrying a comment id are covered by a note that is on the discussion already,
+    /// while hours filed with the text and no id may have nothing there at all. Which of the
+    /// two the second one is cannot be known from here - a booking made before the row that
+    /// posted the day's note also ends up with the text and no id - so the toast says what this
+    /// check did rather than what is on the work item.
+    /// </summary>
+    private sealed record BlockSettlement(
+        int LandedMinutes, int Unsure, string? Elsewhere, bool UnpostedNote, bool SharedNote);
+
+    /// <summary>
+    /// Settles what can be settled of one block's unconfirmed bookings. The caller claims the
+    /// block first, so nothing else books or checks it meanwhile.
+    /// </summary>
+    private async Task<BlockSettlement> SettleBlockAsync(IReadOnlyList<UnconfirmedBooking> bookings)
+    {
+        var landedMinutes = 0;
+        var unsure = 0;
+        string? elsewhere = null;
+        var unpostedNote = false;
+        var sharedNote = false;
+
+        foreach (var booking in bookings)
+        {
+            // Settling an earlier one lets go of any pinned to the same revision: only one of
+            // them can ever have landed.
+            if (!planner.IsUnsettled(booking)) continue;
+
+            // Somebody else's #7. Left standing rather than guessed at, and counted as
+            // unsettled so nothing offers the block as free to book.
+            if (WrongConnection(booking.Entry) is { } why)
+            {
+                elsewhere ??= why;
+                unsure++;
+                continue;
+            }
+
+            // Always written with a plan; one without could only come from a hand-edited file,
+            // and there is nothing to look for.
+            var landed = booking.Plan is { } plan ? (await ado.CheckTimeWriteAsync(plan)).Landed : false;
+
+            if (landed is null)
+            {
+                unsure++;
+                continue;
+            }
+
+            if (planner.SettleUnconfirmed(booking, landed.Value) && landed.Value)
+            {
+                landedMinutes += booking.Entry.Minutes;
+
+                // A booking carrying a comment id was covered by a note another block of the
+                // same day had already posted, so its note is on the discussion however this
+                // one ended. One with the text and no id is a note this check has deliberately
+                // not posted - arriving this late, whether it is still wanted is the user's
+                // call - and may be one no row of that day ever got as far as posting.
+                if (booking.Entry.Comment.Length > 0)
+                {
+                    if (booking.Entry.CommentId > 0) sharedNote = true;
+                    else unpostedNote = true;
+                }
+
+                _ = RefreshWorkItemAsync(booking.Entry.WorkItemId);
+            }
+        }
+
+        Changed?.Invoke();
+        return new BlockSettlement(landedMinutes, unsure, elsewhere, unpostedNote, sharedNote);
+    }
+
+    /// <summary>
+    /// Adds the note that came with a time booking to the work item's discussion. Returns the
+    /// comment it became, or null when nothing went on: an empty note is the normal case, not
+    /// a failure, and so is a discussion that turned the note down - that has its own toast.
+    ///
+    /// The comment is written onto the entry those hours made, so an undo of them can offer to
+    /// take the note back off, and it is handed back so the rest of a batch that shares the one
+    /// note can be written down carrying it too. Written down quietly, the way everything else
+    /// around a time write is: the comment is on the work item by then, and a plan file that
+    /// will not take the id must not turn a posted note into a reported failure. All that is
+    /// lost is the offer to remove it.
     ///
     /// If the work item on show is the one being booked against, the new comment is folded
     /// into the loaded discussion so the open modal does not have to be reopened to see it.
     /// </summary>
-    private async Task<bool> PostTimeNoteAsync(Allocation allocation, string note, TextFormat format)
+    private async Task<TimeNote?> PostTimeNoteAsync(
+        Allocation allocation, string note, TextFormat format, Guid entryId)
     {
-        if (string.IsNullOrWhiteSpace(note)) return false;
+        if (string.IsNullOrWhiteSpace(note)) return null;
+
+        // Resolved here rather than left to the client's own fallback, because the project a
+        // comment was posted under is what addresses it afterwards, and the selected one can
+        // have moved on by the time the entry is undone.
+        var project = string.IsNullOrWhiteSpace(allocation.Project)
+            ? Settings.Ado.Project
+            : allocation.Project;
 
         try
         {
             var comment = await ado.AddCommentAsync(
-                allocation.WorkItemId, allocation.Project, Html.ToCommentHtml(note, format, Members));
+                allocation.WorkItemId, project, Html.ToCommentHtml(note, format, Members));
+
+            // No id means nothing that can be addressed again, so nothing is written down; the
+            // note is on the discussion all the same, which is what the answer here is about.
+            if (comment.Id > 0)
+                PinQuietly(() => planner.SetTimeNote(entryId, comment.Id, project), allocation.WorkItemId);
 
             if (DetailWorkItemId == allocation.WorkItemId) Comments = [.. Comments, comment];
-            return true;
+            return new TimeNote(comment.Id, project);
         }
         catch (Exception ex)
         {
             toasts.Warning($"The time went on #{allocation.WorkItemId}, but the note did not", ex.Message);
-            return false;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// What became of the note when an undo was asked to take it off the discussion. Only
+    /// <see cref="Removed"/> may be spoken of as a comment taken off; the rest each have their
+    /// own words, and <see cref="Reported"/> has already said them in a toast of its own.
+    /// </summary>
+    private enum NoteRemoval
+    {
+        /// <summary>Nothing was asked of the discussion, so there is nothing to say about it.</summary>
+        NotAsked,
+
+        /// <summary>Azure DevOps took the comment off.</summary>
+        Removed,
+
+        /// <summary>There was no such comment at that address to take off.</summary>
+        NotThere,
+
+        /// <summary>It did not come off, or could not be told; the toast that says which has gone out.</summary>
+        Reported,
+    }
+
+    /// <summary>
+    /// What a successful undo's toast adds about the note - nothing at all unless there is
+    /// something true to add. A comment that would not delete, and one whose delete was never
+    /// answered for, have each already raised a warning of their own and must not be summed up
+    /// here as though the undo had dealt with them.
+    /// </summary>
+    private static string NoteSentence(NoteRemoval removal) => removal switch
+    {
+        NoteRemoval.Removed => " Its note has been taken off the discussion.",
+        NoteRemoval.NotThere => " There was no such comment to remove - it may already have gone, or the " +
+                                "work item may have moved project.",
+        _ => "",
+    };
+
+    /// <summary>
+    /// Takes the note a booking posted back off the work item's discussion, once those hours
+    /// are off it.
+    ///
+    /// Shaped like <see cref="PostTimeNoteAsync"/> and for the same reason: the hours are the
+    /// point of an undo and they are already reversed by the time this runs, so a discussion
+    /// that will not give the comment up says so and leaves the undo standing. It is never
+    /// allowed to put the hours back.
+    ///
+    /// A delete that was never answered for is kept apart from one that was refused, the way
+    /// every other write here is: a timeout or a service failing mid-request may well have
+    /// carried the delete out, and saying flatly that the note is still there would be the same
+    /// misleading certainty this whole thing exists to be rid of.
+    ///
+    /// If the work item on show is the one being undone, the comment is taken out of the
+    /// loaded discussion too, so the open modal does not go on showing a note for hours that
+    /// are no longer there. Only when it really was removed: a 404 can equally mean the
+    /// comment is standing somewhere this did not look.
+    /// </summary>
+    private async Task<NoteRemoval> RemoveTimeNoteAsync(TimeEntry entry)
+    {
+        if (entry.CommentId <= 0) return NoteRemoval.NotAsked;
+
+        try
+        {
+            var removal = await ado.DeleteCommentAsync(entry.WorkItemId, entry.CommentProject, entry.CommentId);
+            if (removal != CommentRemoval.Removed) return NoteRemoval.NotThere;
+
+            // The comment is off the discussion, so any entries that shared it are carrying an
+            // id that addresses nothing. Forgotten here rather than left for their own undo to
+            // find out: while it stands, each of those dialogs goes on saying the note also
+            // covers hours that are staying and turns the tick off to protect a comment that
+            // has already gone. Quietly, like every other plan step around a time write - the
+            // comment is gone whatever the plan file does about it.
+            //
+            // Only for a removal. A 404 is not one: the comment may be standing under a
+            // project this did not look in, and those entries' own deletes answer for it the
+            // same honest way this one just did.
+            PinQuietly(() => planner.ForgetTimeNote(entry), entry.WorkItemId);
+
+            if (DetailWorkItemId == entry.WorkItemId)
+                Comments = [.. Comments.Where(c => c.Id != entry.CommentId)];
+
+            return NoteRemoval.Removed;
+        }
+        catch (AzureDevOpsException ex) when (ex.Unanswered)
+        {
+            toasts.Warning($"The time came off #{entry.WorkItemId}; whether its note went with it is not known",
+                ex.Message + " The delete may well have landed all the same. Look at the work item's discussion, " +
+                "and remove the comment there if it is still standing and should not.");
+            return NoteRemoval.Reported;
+        }
+        catch (Exception ex)
+        {
+            toasts.Warning($"The time came off #{entry.WorkItemId}, but its note is still on the discussion",
+                ex.Message + " Remove the comment in Azure DevOps if it should not stand.");
+            return NoteRemoval.Reported;
+        }
+    }
+
+    /// <summary>Entries being taken back off at this moment, so a second Undo cannot take them off twice.</summary>
+    private readonly HashSet<Guid> _undoingEntries = [];
+
+    /// <summary>
+    /// Which of the two answers that drop an entry the dialog is asking for. Both end with the
+    /// entry gone and the hours off the work item, which is why both are asked the same way -
+    /// they differ only in what takes the hours off.
+    /// </summary>
+    public enum UndoAsk
+    {
+        /// <summary>Take the hours back off the work item now.</summary>
+        TakeOff,
+
+        /// <summary>
+        /// An undo Azure DevOps never confirmed, which the user has looked at the work item and
+        /// says did go through. No time is written - by that account it is already off - but
+        /// the entry goes, and with it what may be the last record of which comment its note
+        /// was: only a note posted for a whole day at once is written down anywhere else.
+        /// </summary>
+        SettleGone,
+    }
+
+    /// <summary>
+    /// An undo waiting to be confirmed, and what can be done about the note those hours put on
+    /// the work item's discussion.
+    ///
+    /// <see cref="Refused"/> is why the undo itself cannot go ahead at all, from the one test
+    /// the write path refuses by, so the dialog can say so instead of offering a button that
+    /// could only be turned down.
+    ///
+    /// <see cref="CanRemoveNote"/> holds when Slate knows which comment it posted and which
+    /// project it went under - both address it - and the undo is not refused. Anything else and
+    /// the offer is not made rather than made and then refused - <see cref="NoteKept"/> then
+    /// says why, for the case where there is plainly a note and somebody would otherwise expect
+    /// the offer.
+    ///
+    /// <see cref="NoteShared"/> is set when that one comment is also the note of hours that are
+    /// staying, which is what a day booked in one pass makes of a work item with two blocks. The
+    /// offer stands - it is still the user's to make - but it is the one case where the tick
+    /// starts off, because taking the note would leave those other hours on the work item with
+    /// nothing saying what they went on.
+    /// </summary>
+    public sealed record UndoPrompt(
+        TimeEntry Entry, UndoAsk Ask, bool CanRemoveNote, string? NoteShared, string? NoteKept, string? Refused);
+
+    /// <summary>The undo being confirmed, or null while nothing is being asked about.</summary>
+    public UndoPrompt? UndoingPrompt { get; private set; }
+
+    /// <summary>The entry whose undo is going to Azure DevOps at this moment, for the spinners.</summary>
+    public Guid? UndoingEntry { get; private set; }
+
+    /// <summary>
+    /// Asks before taking a booking back off, because the answer decides something the undo
+    /// cannot take back afterwards: whether the note those hours left on the discussion goes
+    /// with them. Every route to an undo comes through here - the Time tab, the block's menu
+    /// and the inspector - so the question is asked the same way wherever it starts.
+    ///
+    /// Hours from another organization are shown with the refusal the write path would give,
+    /// rather than an Undo that could only be turned down: the block's menu has no way of its
+    /// own to say so, and the refusal carries the way out with it.
+    /// </summary>
+    public void BeginUndoTimeEntry(TimeEntry entry) => BeginUndoPrompt(entry, UndoAsk.TakeOff);
+
+    /// <summary>
+    /// The same question for the other answer that drops an entry: an undo Azure DevOps never
+    /// confirmed, which the user has looked at the work item and says went through. The hours
+    /// are off by their own account at that moment, so the note is in exactly the position it
+    /// is in after any other undo - and the entry about to be dropped may be the last record of
+    /// which comment it is.
+    /// </summary>
+    public void BeginSettleUndoWentThrough(TimeEntry entry) => BeginUndoPrompt(entry, UndoAsk.SettleGone);
+
+    private void BeginUndoPrompt(TimeEntry entry, UndoAsk ask)
+    {
+        if (UndoingPrompt is not null || UndoingEntry is not null) return;
+
+        // The same gate every other dialog here opens behind: nothing new is started once a
+        // handover has read the plan for the copy taking over, and one dialog at a time.
+        if (IsHandingOver) return;
+        if (RecordingFor is not null || RecordDayFor is not null || DetailWorkItemId is not null
+            || SchedulingFor is not null || PriorityPrompt is not null || Creating is not null
+            || SpawnFor is not null) return;
+
+        // Read from the plan, so the question is asked about the entry as it stands rather
+        // than a copy a page has been holding since it last rendered.
+        var current = planner.FindTimeEntry(entry.Id) ?? entry;
+        var refused = WrongConnection(current);
+
+        // The project as well as the id: a comment is addressed by both, and the delete refuses
+        // an empty project outright rather than guessing at one. Offering a tick that could only
+        // fail is exactly what this prompt exists to avoid.
+        var canRemoveNote = current is { CommentId: > 0, CommentProject.Length: > 0 } && refused is null;
+
+        // Only worth asking about when the offer is actually there.
+        var noteShared = canRemoveNote ? WhyNoteShared(planner.OthersSharingNote(current)) : null;
+
+        // Nothing to explain when the offer is there, and nothing worth explaining when the
+        // undo itself is refused - that refusal is about the whole entry, note and all.
+        var noteKept = canRemoveNote || refused is not null ? null : WhyNoteKept(current);
+
+        UndoingPrompt = new UndoPrompt(current, ask, canRemoveNote, noteShared, noteKept, refused);
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// What that one comment also stands for, when other entries are still carrying its id -
+    /// the rest of a day booked in one pass, where the work item's note was posted once for
+    /// several blocks. Null when this entry is the last one it covers, which is the ordinary
+    /// case and needs no saying.
+    /// </summary>
+    private static string? WhyNoteShared(IReadOnlyList<TimeEntry> others)
+    {
+        if (others.Count == 0) return null;
+
+        var hours = Ui.Hours(others.Sum(e => e.Minutes));
+        return others.Count == 1
+            ? $"This note also covers {hours} booked from another block, which is staying on the work item. "
+              + "Remove it and those hours are left with nothing saying what they went on."
+            : $"This note also covers {hours} booked from {others.Count} other blocks, which are staying on "
+              + "the work item. Remove it and those hours are left with nothing saying what they went on.";
+    }
+
+    /// <summary>
+    /// Why the note cannot come off with the hours, when there is one and the offer is
+    /// therefore missing from the dialog. Null when there was no note at all: nothing was
+    /// posted, so there is nothing to explain.
+    ///
+    /// Worded without claiming the comment is still there, because nothing here knows: an
+    /// entry with a note and no id may never have had one to point at in the first place.
+    ///
+    /// Every way an entry can end up with the text and no id is named, because from here they
+    /// look identical: a plan written before the id was kept at all; a plan written when only
+    /// the row that posted the note was given it; a booking of a day recorded in one pass that
+    /// Azure DevOps never confirmed, whose write went out before the note went on with another
+    /// block; a note the discussion turned down; and hours whose comment has already gone with
+    /// an earlier undo of another block it covered, which is the one of them where what became
+    /// of the comment is known.
+    ///
+    /// An id with no project is its own case and is not lumped in with those: the comment is
+    /// known, and what is missing is the project that addresses it.
+    /// </summary>
+    private static string? WhyNoteKept(TimeEntry entry) =>
+        entry.Comment.Length == 0
+            ? null
+            : entry.CommentId > 0
+                ? "Slate wrote down which comment this note was posted as but not the project it went "
+                  + "under, and a comment can only be addressed through its project, so it cannot take "
+                  + "it off. Remove the comment in Azure DevOps if it should not stand."
+                : "Slate did not write down which comment this note was posted as, so it cannot take it off: "
+                  + "the entry was recorded by an older version of Slate, the note went on with another "
+                  + "block of the same day, the comment was removed with an earlier undo of the same note, "
+                  + "or it never reached the discussion. If a comment for it is still there, remove it in "
+                  + "Azure DevOps.";
+
+    public void CancelUndoTimeEntry()
+    {
+        if (UndoingPrompt is null || UndoingEntry is not null) return;
+
+        UndoingPrompt = null;
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Carries out whichever answer was asked about, with or without its note.
+    ///
+    /// The tick is only honoured where the prompt said it could be: what is offered and what
+    /// is done are the one decision, so a stale tick from a dialog left open across a change
+    /// of organization cannot turn into a delete against somebody else's work item.
+    /// </summary>
+    public async Task<bool> ConfirmUndoTimeEntryAsync(bool removeNote)
+    {
+        if (UndoingPrompt is not { } prompt || UndoingEntry is not null) return false;
+
+        UndoingEntry = prompt.Entry.Id;
+        Changed?.Invoke();
+
+        try
+        {
+            var takeNote = removeNote && prompt.CanRemoveNote;
+
+            return prompt.Ask == UndoAsk.SettleGone
+                ? await AnswerUnconfirmedUndoAsync(prompt.Entry.Id, wentThrough: true, takeNote)
+                : await UndoTimeEntryAsync(prompt.Entry, takeNote);
+        }
+        finally
+        {
+            UndoingEntry = null;
+
+            // Closed however it went: what happened is in the toast, and the entry is still
+            // there to try again on when it failed. Only this very prompt, by identity.
+            if (ReferenceEquals(UndoingPrompt, prompt)) UndoingPrompt = null;
+            Changed?.Invoke();
         }
     }
 
     /// <summary>
     /// Takes a booking back off the work item in Azure DevOps and drops the entry. Only
     /// removes the entry locally once the write has actually succeeded.
+    ///
+    /// An undo Azure DevOps never confirmed is written onto the entry - before it is sent, so
+    /// a copy that dies mid-write leaves it behind too - and the next Undo looks for it before
+    /// doing anything: taking the hours off again when the first one had gone through would
+    /// hand back work that was never there.
+    ///
+    /// <paramref name="removeNote"/> also takes the note these hours posted off the work
+    /// item's discussion, and only ever after the hours themselves are off: the hours are what
+    /// this is for, and a comment that will not be deleted is reported on its own rather than
+    /// unwinding a good undo. An undo Azure DevOps could not confirm removes nothing - those
+    /// hours may still be on the work item, which is exactly when the note should still stand.
     /// </summary>
-    public async Task<bool> UndoTimeEntryAsync(TimeEntry entry)
+    public async Task<bool> UndoTimeEntryAsync(TimeEntry entry, bool removeNote = false)
     {
+        // Somebody else's #7, refused before anything is counted in: an undo that was never
+        // going to happen must not hold a handover open, nor claim the entry on its way to
+        // being turned away. Every opening onto an undo - the time view's button, the plan's
+        // context menu, the inspector's "Undo last" - is disabled on this same test, so none
+        // of them offers hours it could only be refused for; this is what holds that to
+        // account rather than each page promising it. Read from the plan rather than
+        // trusting the caller's copy, and asked again below under the claim, where the entry
+        // cannot change underneath the write.
+        if (planner.FindTimeEntry(entry.Id) is { } shown && WrongConnection(shown) is { } wrongOrganization)
+        {
+            toasts.Error("Those hours are not this organization's to undo", wrongOrganization);
+            return false;
+        }
+
+        // Counted for the same reason as recording: cut off between the write and dropping
+        // the entry, the entry would survive to be undone a second time. The plan being
+        // unwritable is that same gap held open for the whole session.
+        if (TryBeginTimeWrite() is { } refused)
+        {
+            toasts.Error("Could not undo that time", refused);
+            return false;
+        }
+
+        lock (_undoingEntries)
+        {
+            if (!_undoingEntries.Add(entry.Id))
+            {
+                EndWrite();
+                toasts.Error("Could not undo that time", "That entry is already being undone.");
+                return false;
+            }
+        }
+
         try
         {
+            // Taken from the plan rather than the caller: a page can still be holding an entry
+            // that another Undo has already taken off and dropped.
+            if (planner.FindTimeEntry(entry.Id) is not { } current)
+            {
+                toasts.Error("Could not undo that time", "That entry has already been undone.");
+                return false;
+            }
+
+            // Only the organization these hours went to can take them off again: #7 elsewhere
+            // is a different work item, and undoing against it would change somebody's work.
+            if (WrongConnection(current) is { } elsewhere)
+            {
+                toasts.Error("Those hours are not this organization's to undo", elsewhere);
+                return false;
+            }
+
+            if (current.UnconfirmedUndo is { } earlier)
+            {
+                var (landed, _) = await ado.CheckTimeWriteAsync(earlier);
+                if (landed is null)
+                {
+                    toasts.Error($"Still cannot tell whether the undo on #{entry.WorkItemId} went through",
+                        "Look at the work item itself, or try again in a few minutes.");
+                    return false;
+                }
+
+                // Removed and swept in one save, against the very pin it was judged by: that
+                // undo became the revision after the one it was pinned to, so nothing else
+                // pinned there can have landed, and anything still waiting to be checked there
+                // must not claim it. The pin is tested inside that same save because another
+                // undo of this work item can have landed and swept it while this check was
+                // out - and that says this one did not land, whatever the check saw.
+                if (landed.Value && planner.SettleUnconfirmedUndo(entry.Id, earlier, landed: true))
+                {
+                    // The hours came off when that undo landed after all, so the note goes now
+                    // as it would have then - after the entry, like every other undo here.
+                    var noteGone = removeNote ? await RemoveTimeNoteAsync(current) : NoteRemoval.NotAsked;
+
+                    toasts.Success($"Undid {entry.Hours:0.##}h on #{entry.WorkItemId}",
+                        "The earlier undo had gone through after all, so nothing more was taken off."
+                        + NoteSentence(noteGone));
+                    Changed?.Invoke();
+                    _ = RefreshWorkItemAsync(entry.WorkItemId);
+                    return true;
+                }
+
+                planner.SettleUnconfirmedUndo(entry.Id, earlier, landed: false);
+            }
+
             // Entries written before the applied amounts were recorded fall back to the
             // hours asked for, which is what those entries were undone by at the time.
             var completed = entry.AppliedCompleted != 0 ? entry.AppliedCompleted : entry.Hours;
@@ -1590,21 +3610,59 @@ public sealed class AppState(
                 ? entry.AppliedRemaining
                 : entry.ReducedRemaining ? -entry.Hours : 0;
 
-            var result = await ado.UndoTimeAsync(entry.WorkItemId, completed, remaining);
+            TimeRecordResult result;
+            try
+            {
+                // Written onto the entry before each send, the same way a booking is, so a
+                // copy that dies with the PATCH on its way does not leave the entry looking
+                // untouched and free to be undone all over again.
+                result = await ado.UndoTimeAsync(entry.WorkItemId, completed, remaining,
+                    plan => PinQuietly(() => planner.SetUnconfirmedUndo(entry.Id, plan), entry.WorkItemId));
+            }
+            catch (AzureDevOpsException ex) when (ex is not TimeWriteUnconfirmedException)
+            {
+                // Turned away, or never sent: nothing of it is on the work item, so the pin
+                // would only make the next Undo go looking for a change that never existed.
+                // An unconfirmed one is left pinned - that record is the whole point of it.
+                PinQuietly(() => planner.SetUnconfirmedUndo(entry.Id, null), entry.WorkItemId);
+                throw;
+            }
 
-            planner.RemoveTimeEntry(entry.Id);
+            planner.RemoveTimeEntry(entry.Id, result.Plan);
+
+            // The hours are off the work item and the entry is gone; only now is the note
+            // worth taking back. A discussion that will not give it up says so on its own and
+            // changes nothing else - the undo has already happened and must stay happened.
+            var noteRemoved = removeNote ? await RemoveTimeNoteAsync(current) : NoteRemoval.NotAsked;
 
             toasts.Success($"Undid {entry.Hours:0.##}h on #{entry.WorkItemId}",
-                $"Completed Work is back to {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h.");
+                $"Completed Work is back to {result.CompletedWork:0.##}h, Remaining {result.RemainingWork:0.##}h."
+                + NoteSentence(noteRemoved));
 
             Changed?.Invoke();
             _ = RefreshWorkItemAsync(entry.WorkItemId);
             return true;
         }
+        catch (TimeWriteUnconfirmedException ex)
+        {
+            // Already pinned before the send in the ordinary case; this covers the one where
+            // the plan file refused it then, and must never itself escape as a crash.
+            PinQuietly(() => planner.SetUnconfirmedUndo(entry.Id, ex.Plan), entry.WorkItemId);
+            toasts.Error($"The undo on #{entry.WorkItemId} may already have gone through",
+                "Azure DevOps did not confirm it, and a look at the work item afterwards could not settle " +
+                "whether it went through. Undo again looks for it first, so the hours are never taken off twice.");
+            Changed?.Invoke();
+            return false;
+        }
         catch (Exception ex)
         {
             toasts.Error("Could not undo that time", ex.Message);
             return false;
+        }
+        finally
+        {
+            lock (_undoingEntries) _undoingEntries.Remove(entry.Id);
+            EndWrite();
         }
     }
 
@@ -1674,11 +3732,19 @@ public sealed class AppState(
     {
         if (SpawnFor is not { } allocation || SpawnParent is not { } parent || IsSpawning) return false;
 
-        IsSpawning = true;
-        Changed?.Invoke();
+        // Counted: a task created but never pointed at would be offered, and created, again.
+        if (!TryBeginWrite())
+        {
+            toasts.Error("Could not create that task", RestartingForUpdate);
+            return false;
+        }
 
         try
         {
+            // Inside the try: see ConfirmPriorityChangeAsync.
+            IsSpawning = true;
+            Changed?.Invoke();
+
             var created = await ado.CreateChildAsync(parent, title, description, type, remainingHours);
 
             // Make it visible in the sidebar straight away; the query behind the list may
@@ -1702,6 +3768,7 @@ public sealed class AppState(
         finally
         {
             IsSpawning = false;
+            EndWrite();
             Changed?.Invoke();
         }
     }
@@ -1712,40 +3779,209 @@ public sealed class AppState(
     private Timer? _workItemPoll;
 
     /// <summary>
-    /// Re-reads the calendar on a timer so changes made in Outlook show up without the user
-    /// having to ask. Safe to call repeatedly; it reconfigures itself from settings.
+    /// Every timer is made, replaced and stopped under this, and the handover flag is looked at
+    /// inside it. Settings are saved and the plan changes on whichever thread did it, so without
+    /// one lock a timer made at the very moment a handover stopped the rest would carry on
+    /// running through it, and a second made beside one already running would leave both
+    /// polling for good after a rollback.
     /// </summary>
+    private readonly Lock _timers = new();
+
     private bool _watchingPlan;
 
+    /// <summary>
+    /// Re-reads the calendar on a timer so changes made in Outlook show up without the user
+    /// having to ask. Safe to call repeatedly, from any thread; it reconfigures itself from
+    /// settings, and always ends with exactly one of each timer the settings ask for.
+    /// </summary>
     public void ConfigurePolling()
     {
-        // Every edit to the plan arms the debounce. Subscribed here because this is where the
-        // rest of the timers are set up, and guarded so repeated calls do not stack handlers.
-        if (!_watchingPlan)
+        lock (_timers)
         {
-            planner.Changed += NudgeAutoSync;
-            _watchingPlan = true;
-        }
+            // Stopped for a handover, and only started again if it is abandoned.
+            if (IsHandingOver) return;
 
+            // Every edit to the plan arms the debounce. Subscribed here because this is where
+            // the rest of the timers are set up, and guarded so repeated calls do not stack
+            // handlers.
+            if (!_watchingPlan)
+            {
+                planner.Changed += NudgeAutoSync;
+                _watchingPlan = true;
+            }
+
+            _poll?.Dispose();
+            _poll = null;
+
+            var minutes = Settings.Planning.RefreshMinutes;
+            if (minutes > 0 && Settings.IsCalendarConfigured)
+            {
+                var period = TimeSpan.FromMinutes(Math.Clamp(minutes, 1, 120));
+                _poll = new Timer(_ => _ = LoadEventsAsync(), null, period, period);
+            }
+
+            _workItemPoll?.Dispose();
+            _workItemPoll = null;
+
+            var seconds = Settings.Planning.WorkItemRefreshSeconds;
+            if (seconds > 0 && Settings.IsAdoConfigured)
+            {
+                var period = TimeSpan.FromSeconds(Math.Clamp(seconds, 15, 3600));
+                _workItemPoll = new Timer(_ => _ = RefreshWorkItemsQuietlyAsync(), null, period, period);
+            }
+        }
+    }
+
+    /// <summary>Stops every timer. Only called under <see cref="_timers"/>.</summary>
+    private void StopTimers()
+    {
         _poll?.Dispose();
         _poll = null;
-
-        var minutes = Settings.Planning.RefreshMinutes;
-        if (minutes > 0 && Settings.IsCalendarConfigured)
-        {
-            var period = TimeSpan.FromMinutes(Math.Clamp(minutes, 1, 120));
-            _poll = new Timer(_ => _ = LoadEventsAsync(), null, period, period);
-        }
-
         _workItemPoll?.Dispose();
         _workItemPoll = null;
+        _autoSync?.Dispose();
+        _autoSync = null;
+    }
 
-        var seconds = Settings.Planning.WorkItemRefreshSeconds;
-        if (seconds > 0 && Settings.IsAdoConfigured)
+    // ---------------------------------------------------------------- handing over to an update
+
+    /// <summary>Why something was refused while an update is taking over.</summary>
+    public const string RestartingForUpdate = WriteGate.ClosedReason;
+
+    /// <summary>
+    /// True from the moment an update starts putting a new copy in this one's place until
+    /// this copy exits, or the update is abandoned. Nothing new goes to Azure DevOps, Outlook,
+    /// the plan or the settings meanwhile: the new copy reads the plan and the settings as it
+    /// starts, so a write made here after that is lost to it - and a booking or an event made
+    /// remotely but not yet written down here is one the new copy would make a second time.
+    /// </summary>
+    public bool IsHandingOver => writes.IsClosed;
+
+    /// <summary>
+    /// Counts in a write to Azure DevOps, Outlook, the plan or the settings, unless a handover
+    /// has begun; every true must be paired with an <see cref="EndWrite"/>. See
+    /// <see cref="WriteGate.TryEnter"/> for why a write starting at the same instant as a
+    /// handover is always either refused or waited for.
+    /// </summary>
+    private bool TryBeginWrite() => writes.TryEnter();
+
+    private void EndWrite() => writes.Exit();
+
+    /// <summary>
+    /// Makes a change to the plan straight from the page - a drop, a resize, a delete, a
+    /// triage priority - as one counted write. None of them waits on anything, but they run on
+    /// the window's thread while a handover starts on another, so a check of
+    /// <see cref="IsHandingOver"/> beforehand could still pass a moment before the handover
+    /// looked for writes in flight, and the edit then land on a plan the new copy had already
+    /// read. False, with nothing changed, when an update is taking over.
+    /// </summary>
+    public bool TryEdit(Action edit)
+    {
+        if (!TryBeginWrite()) return false;
+
+        try
         {
-            var period = TimeSpan.FromSeconds(Math.Clamp(seconds, 15, 3600));
-            _workItemPoll = new Timer(_ => _ = RefreshWorkItemsQuietlyAsync(), null, period, period);
+            edit();
+            return true;
         }
+        finally
+        {
+            EndWrite();
+        }
+    }
+
+    /// <summary>
+    /// The same for something a page awaits, such as signing in, which writes the sign-in
+    /// cache. False when refused; an exception from <paramref name="write"/> is the caller's.
+    /// </summary>
+    public async Task<bool> TryWriteAsync(Func<Task> write)
+    {
+        if (!TryBeginWrite()) return false;
+
+        try
+        {
+            await write();
+            return true;
+        }
+        finally
+        {
+            EndWrite();
+        }
+    }
+
+    /// <summary>
+    /// Brings this copy to a standstill before an update moves any files: the timers stop,
+    /// nothing new may start, and what is already under way is waited for rather than cut
+    /// off by the shutdown at the end of the handover. False when something is still going
+    /// when <paramref name="timeout"/> is up, which abandons the update - an unfinished write
+    /// is exactly what this is here to protect.
+    /// </summary>
+    public async Task<bool> PrepareForHandoverAsync(TimeSpan timeout)
+    {
+        // Closed before the timers are stopped, and they are stopped under the lock they are
+        // made under: a ConfigurePolling or NudgeAutoSync racing this either finished first,
+        // so what it made is stopped here, or finds the gate closed and makes nothing.
+        writes.Close();
+        lock (_timers)
+        {
+            _preparedForHandover = true;
+            StopTimers();
+        }
+
+        Changed?.Invoke();
+
+        return await writes.WaitForWritesAsync(timeout);
+    }
+
+    /// <summary>
+    /// Set from the moment this copy is brought to a standstill for an update until it is let
+    /// out of it again, and what <see cref="ResumeAfterFailedHandover"/> goes by.
+    ///
+    /// The gate being closed would serve as the test too - the resume comes from two places
+    /// now, wherever the updater put the update back and the install's own way out, and the
+    /// first to arrive reopens the gate and restores the timers under the one lock, so the
+    /// second finds it open and rightly does nothing. The flag is kept because it names what
+    /// is actually being undone: a standstill, of which the gate is only one part. Going by
+    /// the gate would tie this method to the gate staying the only thing the standstill closes,
+    /// and a later change to either side would quietly make the resume skip the timers or
+    /// restore them twice.
+    /// </summary>
+    private bool _preparedForHandover;
+
+    /// <summary>
+    /// Picks up where <see cref="PrepareForHandoverAsync"/> left off when the update did not
+    /// go ahead, so this copy carries on exactly as before: writes are allowed again, the
+    /// timers come back, and any edit that was waiting to reach Outlook is sent. Safe to call
+    /// more than once, or when no handover was ever started.
+    /// </summary>
+    public void ResumeAfterFailedHandover()
+    {
+        // Never after the update went through. Nothing reaches here that way today - the one
+        // caller that could checks first - but this copy would be replaying its held plan,
+        // settings and cache writes over the files the new copy has already read and is now
+        // writing, which is the one thing the whole handover exists to prevent.
+        if (SelfUpdater.HasHandedOver) return;
+
+        lock (_timers)
+        {
+            if (!_preparedForHandover) return;
+            _preparedForHandover = false;
+
+            // Before the gate reopens: an update that did not go ahead leaves the data folder
+            // this copy's again, and a gate open over a frozen folder would take every save
+            // and write none of them. The updater thaws it itself as it puts things back; this
+            // is the second pair of hands, since nothing else would ever notice. Inside the
+            // guard, because a folder frozen at all means this copy was prepared for a
+            // handover - Freeze only ever runs after that - and outside it, a thaw is only
+            // ever a thaw of a folder somebody else is now using.
+            DataFolder.Thaw();
+
+            writes.Open();
+            ConfigurePolling();
+            NudgeAutoSync();
+        }
+
+        Changed?.Invoke();
     }
 
     // ---------------------------------------------------------------- selection

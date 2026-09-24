@@ -1,0 +1,736 @@
+@using System.Globalization
+@using Slate.Services
+@implements IDisposable
+
+@inject AppState State
+@inject SettingsStore Settings
+@inject PlannerService Plan
+@inject ToastService Toasts
+
+@* Records a whole day's blocks in one pass instead of one "Record time…" dialog per block.
+   Every row still goes through AppState.RecordTimeSilentAsync - the exact write, time entry
+   and note handling the single-block dialog uses - so the only thing this adds is the list,
+   the per-row hours and the batching around it. *@
+@if (State.RecordDayFor is { } requested)
+{
+    @* The day the rows are for, which is the one asked for except while a save for another
+       day - closed and then reopened elsewhere - is still running. Its rows stay on screen
+       until it ends, so the heading has to name their day, not the one just asked for. *@
+    var day = _openedFor ?? requested;
+
+    <div class="modal-scrim" @onclick="Cancel">
+        <div class="modal record-day-modal" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span style="color: var(--danger); margin-top: 3px"><ClockIcon Size="18" /></span>
+                <div class="grow">
+                    <h2>Record @Ui.RelativeDay(day).ToLowerInvariant()</h2>
+                    <div class="sub">
+                        <span>@day.ToString("dddd d MMMM")</span>
+                        <span>·</span>
+                        <span>@_rows.Count block@(_rows.Count == 1 ? "" : "s")</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close" @onclick="Cancel">✕</button>
+            </div>
+
+            <div class="modal-body">
+                @if (_rows.Count == 0)
+                {
+                    <div class="empty-state" style="padding: 24px 12px">
+                        <span class="glyph"><ClockIcon Size="28" /></span>
+                        <p>Nothing is on the calendar for this day.</p>
+                    </div>
+                }
+                else
+                {
+                    <div class="table-wrap">
+                        <table class="data record-day-table">
+                            @* Fixed layout, with the columns sized here rather than left to
+                               content: an unconstrained title or a wide status message would
+                               otherwise be free to push the table - and this modal - wider
+                               than the dialog is meant to be. *@
+                            @* The status column is wide enough for a row that needs an answer to
+                               put its check and its two answers on one line, rather than a tower
+                               of buttons that trebles the height of that row. *@
+                            <colgroup>
+                                <col style="width: 30px" />
+                                <col />
+                                <col style="width: 110px" />
+                                <col style="width: 76px" />
+                                <col style="width: 92px" />
+                                <col style="width: 232px" />
+                            </colgroup>
+                            <thead>
+                                <tr>
+                                    <th class="no-sort"></th>
+                                    <th class="no-sort">Work item</th>
+                                    <th class="no-sort">When</th>
+                                    <th class="no-sort cell-num">Recorded</th>
+                                    <th class="no-sort cell-num">Hours</th>
+                                    <th class="no-sort">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var row in _rows)
+                                {
+                                    var disabled = !row.TracksTime || row.Status is RowStatus.Recorded or RowStatus.Unconfirmed
+                                                   || _saving || _checking;
+
+                                    @* What the block is actually waiting on, so the row offers
+                                       the actions that would be allowed for it and no others.
+                                       Asked only of a row that is waiting: every other one has
+                                       nothing to split. Null means nothing is left on the block
+                                       - settled from elsewhere while this list sat here - and
+                                       Check is what tells the row so. *@
+                                    var pending = row.Status == RowStatus.Unconfirmed
+                                        ? State.UnsettledFor(row.AllocationId)
+                                        : null;
+                                    <tr @key="row.AllocationId" class="@(row.Status is RowStatus.Failed or RowStatus.Unconfirmed ? "row-failed" : "")">
+                                        <td>
+                                            <input type="checkbox" checked="@row.Selected" disabled="@disabled"
+                                                   title="@(row.TracksTime ? "" : "This work item type does not track time")"
+                                                   @onchange="e => OnRowSelected(row, e)" />
+                                        </td>
+                                        <td>
+                                            <button class="link-cell" title="Open this work item"
+                                                    @onclick="() => State.ShowWorkItemAsync(row.WorkItemId)">
+                                                <span class="dot" style="background: @Ui.ColorFor(row.WorkItemType)"></span>
+                                                <span class="mono muted">#@row.WorkItemId</span>
+                                                <span class="truncate">@row.WorkItemTitle</span>
+                                            </button>
+                                        </td>
+                                        <td class="cell-num" style="text-align: left">
+                                            @Ui.TimeRange(row.Start, row.End)
+                                            <div class="muted" style="font-size: 11px">@Ui.Duration(row.DurationMinutes)</div>
+                                        </td>
+                                        <td class="cell-num">
+                                            @(row.RecordedMinutes > 0 ? Ui.Duration(row.RecordedMinutes) : "—")
+                                        </td>
+                                        <td class="cell-num">
+                                            <input class="input" type="number" step="0.25" min="0" max="24"
+                                                   style="width: 100%; text-align: right"
+                                                   value="@row.Hours.ToString("0.##", CultureInfo.InvariantCulture)"
+                                                   disabled="@disabled"
+                                                   @onchange="e => OnRowHoursChanged(row, e)" />
+                                        </td>
+                                        <td>
+                                            @switch (row.Status)
+                                            {
+                                                case RowStatus.Recording:
+                                                    <span class="spinner"></span>
+                                                    break;
+                                                case RowStatus.Recorded:
+                                                    <span class="muted">Recorded</span>
+                                                    break;
+                                                case RowStatus.Failed:
+                                                    <span style="color: var(--danger); font-size: 11.5px" title="@row.Error">Failed - retry?</span>
+                                                    break;
+                                                case RowStatus.Unconfirmed:
+                                                    @* Not ticked and not tickable: sending it again is how the same
+                                                       hours would go on twice. Check looks without writing, and the
+                                                       two answers are the way out of one that never settles.
+
+                                                       Offered against the bookings this connection may act on, the
+                                                       way the Time tab does it: hours booked before an organization
+                                                       was switched cannot be checked or answered from here at all,
+                                                       and "same organization" is the way forward for those - where
+                                                       Azure DevOps' own ids have not already refused the claim. *@
+                                                    <div style="color: var(--danger); font-size: 11.5px" title="@row.Error">May be booked</div>
+                                                    @if (pending is { Elsewhere: { } where })
+                                                    {
+                                                        <div class="muted" style="font-size: 11px">
+                                                            @(pending.AllElsewhere ? "Booked" : "Partly booked")
+                                                            against <span class="mono">@where</span>
+                                                        </div>
+                                                    }
+                                                    <div class="row" style="gap: 4px; flex-wrap: wrap">
+                                                        @if (pending is null or { AllElsewhere: false })
+                                                        {
+                                                            <button class="btn btn-sm" title="@row.Error" disabled="@(_saving || _checking)"
+                                                                    @onclick="() => CheckAsync(row)">Check</button>
+                                                        }
+                                                        @if (pending is { CanAdopt: true })
+                                                        {
+                                                            <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                                                    title="@AppState.AdoptBookingTitle"
+                                                                    @onclick="() => AdoptAsync(row)">Same organization</button>
+                                                        }
+                                                        @if (pending is { CanBeLetGo: true })
+                                                        {
+                                                            <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                                                    title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
+                                                                    @onclick="() => FileIt(row)">On it</button>
+                                                            <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                                                    title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting, and the block can be recorded again."
+                                                                    @onclick="() => LetGo(row)">Never went on</button>
+                                                        }
+                                                    </div>
+                                                    break;
+                                                default:
+                                                    @if (!row.TracksTime)
+                                                    {
+                                                        <span class="muted" style="font-size: 11.5px">Doesn't track time</span>
+                                                    }
+                                                    break;
+                                            }
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <label class="switch">
+                        <input type="checkbox" checked="@_reduceRemaining" @onchange="OnReduceChanged" />
+                        <span class="track"></span>
+                        <span class="label">Take the same off Remaining Work</span>
+                    </label>
+
+                    <div class="field">
+                        <label for="day-note">Note <span class="muted">(optional, shared by every block below)</span></label>
+                        <div class="row">
+                            <span class="hint">Posted to each work item's discussion.</span>
+                            <span style="flex: 1"></span>
+                            <FormatPicker Value="NoteFormat" ValueChanged="OnNoteFormatChanged" />
+                        </div>
+                        <textarea id="day-note" class="textarea" rows="2"
+                                  placeholder="What did today go on?"
+                                  value="@_note" @onchange="OnNoteChanged"></textarea>
+                        <span class="hint">Left empty, nothing is posted. @NoteHint</span>
+                    </div>
+                }
+            </div>
+
+            <div class="modal-foot">
+                <span class="muted" style="font-size: 11.5px">
+                    @(SelectedCount > 0 ? $"{Ui.Hours(SelectedMinutes)} across {SelectedCount} block(s)." : "Nothing selected.")
+                </span>
+                <span style="flex: 1"></span>
+                <button class="btn" @onclick="Cancel">@(_rows.Any(r => r.Status == RowStatus.Recorded) ? "Done" : "Cancel")</button>
+                <button class="btn btn-primary" disabled="@(_saving || _checking || SelectedCount == 0)" @onclick="SaveAsync">
+                    @if (_saving)
+                    {
+                        <span class="spinner on-accent"></span>
+                        <span>Recording…</span>
+                    }
+                    else
+                    {
+                        <span>Record @Ui.Hours(SelectedMinutes)</span>
+                    }
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    /// <summary>Where a row stands. Unconfirmed: sent, and Azure DevOps never said whether it landed.</summary>
+    private enum RowStatus { Pending, Recording, Recorded, Failed, Unconfirmed }
+
+    /// <summary>One row of the day being recorded. Mutated in place as rows are booked, so a
+    /// partial failure only ever needs a retry of what is left rather than a rebuild.</summary>
+    private sealed class RowVm
+    {
+        public required Guid AllocationId { get; init; }
+        public required int WorkItemId { get; init; }
+        public required string WorkItemTitle { get; init; } = "";
+        public required string WorkItemType { get; init; } = "";
+        public required DateTime Start { get; init; }
+        public required DateTime End { get; init; }
+        public required int DurationMinutes { get; init; }
+        public required int RecordedMinutes { get; init; }
+
+        /// <summary>What this machine had booked on the block when the row was built - what
+        /// <see cref="Hours"/> was worked out from, and so what a save checks is still true.
+        /// Settable so that time undone from the block while the list is open can bring it
+        /// down: the check is for hours booked on top of these, not for hours taken off.</summary>
+        public required int RecordedHereMinutes { get; set; }
+
+        /// <summary>Settable because a row built before the work item list had loaded cannot
+        /// know yet, and is opened up once the list says the item does take time.</summary>
+        public required bool TracksTime { get; set; }
+
+        public bool Selected { get; set; }
+        public double Hours { get; set; }
+        public RowStatus Status { get; set; } = RowStatus.Pending;
+        public string? Error { get; set; }
+    }
+
+    private List<RowVm> _rows = [];
+    private DateTime? _openedFor;
+    private bool _reduceRemaining = true;
+    private string _note = "";
+    private bool _saving;
+    private bool _checking;
+
+    /// <summary>
+    /// The work items a note has already gone to in this opening, with the note that went and
+    /// the comment it became. Kept across retries, so neither a second block of the same item
+    /// nor a retried row posts the same comment to a discussion twice - while an edited note
+    /// is still new.
+    ///
+    /// Being in here at all is what says a note has been sent; the comment beside it is null
+    /// when the discussion turned it down, which is a note not to send it again rather than
+    /// one to send it now. The comment goes to every later row of the same item so each entry
+    /// is written down carrying it, and the note only leaves the discussion with the last of
+    /// the hours it covers.
+    /// </summary>
+    private readonly Dictionary<(int WorkItemId, string Note), TimeNote?> _notePosted = new();
+
+    private int SelectedCount => _rows.Count(r => r.Selected);
+    private int SelectedMinutes => (int)Math.Round(_rows.Where(r => r.Selected).Sum(r => r.Hours) * 60);
+
+    /// <summary>Shared with the single-block dialog's note box, so it reads the same way.</summary>
+    private TextFormat NoteFormat
+    {
+        get => Settings.Current.Ui.CommentFormat;
+
+        // Refused while an update takes over, the picker is already back where it was by the
+        // next render; this is so that reads as an answer rather than a misclick.
+        set
+        {
+            if (!Settings.Update(s => s.Ui.CommentFormat = value))
+                Toasts.Error("Could not change the format", AppState.RestartingForUpdate);
+        }
+    }
+
+    private string NoteHint => NoteFormat switch
+    {
+        TextFormat.Markdown => "Markdown: **bold**, `code`, - lists, [links](url) and tables.",
+        TextFormat.Html => "Passed through as markup. Scripts and event handlers are stripped.",
+        _ => "Exactly what you type; line breaks are kept.",
+    };
+
+    protected override void OnInitialized() => State.Changed += OnChanged;
+
+    protected override void OnParametersSet() => Prime();
+
+    /// <summary>
+    /// Builds the row list once per opening, not on every re-render - a full rebuild on every
+    /// <see cref="AppState.Changed"/> would throw away hours someone just edited, or a row's
+    /// in-flight recording status.
+    ///
+    /// "Once per opening" is decided here rather than by whichever button closed it: Escape
+    /// closes it from the page's shortcuts, which never reach this component, and a list kept
+    /// from before a close would offer time booked since - by "Record time…", say - as still
+    /// unrecorded, and book it again.
+    /// </summary>
+    private void Prime()
+    {
+        // Never under a save that is still running: a rebuild would put the row it is booking
+        // back as unrecorded and let a second save book it again. The save primes once it
+        // ends, and so does a check.
+        if (_saving || _checking) return;
+
+        if (State.RecordDayFor is not { } day)
+        {
+            _openedFor = null;
+            return;
+        }
+
+        if (_openedFor == day)
+        {
+            EnableRowsThatNowTrackTime();
+            FollowTimeUndoneElsewhere();
+            return;
+        }
+
+        _openedFor = day;
+        _rows = [.. Plan.ForDay(day).OrderBy(a => a.Start).Select(BuildRow)];
+        _reduceRemaining = Settings.Current.Planning.ReduceRemainingOnRecord;
+        _note = "";
+        _notePosted.Clear();
+    }
+
+    /// <summary>
+    /// Keeps a row's mark in step with time undone from its block while the list is open -
+    /// from the calendar or the time view, neither of which this list hears about otherwise.
+    /// A save refuses a row whose block has gained time since it was built; hours taken off it
+    /// are not that, and without this the row would be refused for the wrong reason.
+    /// </summary>
+    private void FollowTimeUndoneElsewhere()
+    {
+        foreach (var row in _rows)
+            row.RecordedHereMinutes = Math.Min(row.RecordedHereMinutes, Plan.RecordedMinutesForBlock(row.AllocationId));
+    }
+
+    /// <summary>
+    /// Opened before the work item list has loaded - the first launch after an upgrade, with
+    /// no cached list yet - every row reads as a type that cannot take time. Once the list
+    /// arrives, the ones that can are ticked with their remainder, as if the dialog had been
+    /// opened then. Those rows were disabled until now, so nothing typed into them is lost.
+    /// </summary>
+    private void EnableRowsThatNowTrackTime()
+    {
+        foreach (var row in _rows.Where(r => !r.TracksTime && r.Status == RowStatus.Pending))
+        {
+            if (State.WorkItems.FirstOrDefault(i => i.Id == row.WorkItemId) is not { TracksTime: true }) continue;
+
+            var remainder = Math.Max(0, row.DurationMinutes - row.RecordedMinutes);
+            row.TracksTime = true;
+            row.Selected = remainder > 0;
+            row.Hours = Math.Round(remainder / 60.0, 2);
+        }
+    }
+
+    private RowVm BuildRow(Allocation a)
+    {
+        var tracksTime = State.WorkItems.FirstOrDefault(i => i.Id == a.WorkItemId)?.TracksTime ?? false;
+
+        // Mirrors the banner in the single-block dialog: time recorded elsewhere only
+        // still matters until this machine has booked something of its own.
+        var recordedHere = Plan.RecordedMinutesForBlock(a.Id);
+        var recorded = recordedHere > 0 ? recordedHere : recordedHere + a.RecordedElsewhereMinutes;
+        var remainder = Math.Max(0, a.DurationMinutes - recorded);
+
+        // A booking from this block Azure DevOps never confirmed may be on the work item
+        // already, so the block is not offered as unrecorded until a check settles it.
+        var unconfirmed = Plan.HasUnconfirmed(a.Id);
+
+        return new RowVm
+        {
+            AllocationId = a.Id,
+            WorkItemId = a.WorkItemId,
+            WorkItemTitle = a.WorkItemTitle,
+            WorkItemType = a.WorkItemType,
+            Start = a.Start,
+            End = a.End,
+            DurationMinutes = a.DurationMinutes,
+            RecordedMinutes = recorded,
+            RecordedHereMinutes = recordedHere,
+            TracksTime = tracksTime,
+            Selected = tracksTime && remainder > 0 && !unconfirmed,
+            Hours = Math.Round(remainder / 60.0, 2),
+            Status = unconfirmed ? RowStatus.Unconfirmed : RowStatus.Pending,
+            Error = unconfirmed ? UnconfirmedBefore : null,
+        };
+    }
+
+    private void OnChanged() => InvokeAsync(() =>
+    {
+        Prime();
+        StateHasChanged();
+    });
+
+    public void Dispose() => State.Changed -= OnChanged;
+
+    private void OnRowSelected(RowVm row, ChangeEventArgs e) =>
+        row.Selected = e.Value is true or "true" or "on";
+
+    private void OnRowHoursChanged(RowVm row, ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            row.Hours = Math.Clamp(Math.Round(parsed, 2), 0, 24);
+    }
+
+    private void OnReduceChanged(ChangeEventArgs e) =>
+        _reduceRemaining = e.Value is true or "true" or "on";
+
+    private void OnNoteChanged(ChangeEventArgs e) => _note = e.Value?.ToString() ?? "";
+
+    private void OnNoteFormatChanged(TextFormat format) => NoteFormat = format;
+
+    /// <summary>Closing is the same whichever way it happens - <see cref="Prime"/> forgets the
+    /// rows once the dialog is shut, or once a save still running behind it has ended.</summary>
+    private void Cancel() => State.CancelRecordDay();
+
+    /// <summary>
+    /// Books every selected, not-yet-recorded row in turn through the same write the
+    /// single-block dialog uses. A row that fails is left ticked and marked so pressing
+    /// Record again retries just that one - the rows that already went through are not
+    /// touched a second time.
+    /// </summary>
+    private async Task SaveAsync()
+    {
+        var toRecord = _rows.Where(r => r.Selected && r.Status is not (RowStatus.Recorded or RowStatus.Unconfirmed)
+                                        && r.Hours > 0).ToList();
+        if (_saving || _checking || toRecord.Count == 0) return;
+
+        _saving = true;
+
+        // The day these rows are for. The dialog can be closed while they go through, and
+        // even reopened for another day, so the end of the run checks it is still the one
+        // on screen before closing anything.
+        var day = _openedFor;
+
+        // Read once: the note box stays editable during the run, and a note changed halfway
+        // would go to the rest of the items as a second, different comment.
+        var note = _note;
+        var noteFormat = NoteFormat;
+
+        try
+        {
+            if (Settings.Current.Planning.ReduceRemainingOnRecord != _reduceRemaining)
+                Settings.Update(s => s.Planning.ReduceRemainingOnRecord = _reduceRemaining);
+
+            var okCount = 0;
+            var okMinutes = 0;
+            var failCount = 0;
+            var unsureCount = 0;
+
+            foreach (var row in toRecord)
+            {
+                row.Status = RowStatus.Recording;
+                row.Error = null;
+                StateHasChanged();
+
+                var allocation = Plan.Find(row.AllocationId);
+                if (allocation is null)
+                {
+                    row.Status = RowStatus.Failed;
+                    row.Error = "This block has since been removed from the plan.";
+                    failCount++;
+                    StateHasChanged();
+                    continue;
+                }
+
+                // A booking from this block that nothing has settled may be on the work item
+                // already - made by "Record time…" while this list sat here, or by an earlier
+                // pass whose row read as a plain failure because the claim was lost. Sending
+                // it is what would book the hours twice, so the row becomes the one thing it
+                // now is: a block waiting on an answer. (AppState refuses the write as well;
+                // this is what makes the row say so rather than read as a failure to retry.)
+                if (Plan.HasUnconfirmed(row.AllocationId))
+                {
+                    row.Status = RowStatus.Unconfirmed;
+                    row.Selected = false;
+                    row.Error = UnconfirmedBefore;
+                    unsureCount++;
+                    StateHasChanged();
+                    continue;
+                }
+
+                // The hours were worked out from what was booked on the block when the list
+                // was built. Anything booked on it since - "Record time…" used while this run
+                // carried on behind a closed dialog, say - means they are no longer what is
+                // left, so the row is refused rather than booked on top of it. Hours undone
+                // from it are not that: the row's mark follows those down instead.
+                if (Plan.RecordedMinutesForBlock(row.AllocationId) > row.RecordedHereMinutes)
+                {
+                    row.Status = RowStatus.Failed;
+                    row.Selected = false;
+                    row.Error = "More time was recorded on this block after this list was opened. Close and reopen to see what is left.";
+                    failCount++;
+                    StateHasChanged();
+                    continue;
+                }
+
+                // One comment per work item, however many of its blocks are booked - and the
+                // rest of them are written down carrying that same comment, so it is only
+                // taken off the discussion with the last of the hours it speaks for.
+                var sent = _notePosted.TryGetValue((row.WorkItemId, note), out var shared);
+                var postNote = !string.IsNullOrWhiteSpace(note) && !sent;
+
+                var (outcome, error, posted) = await State.RecordTimeSilentAsync(
+                    allocation, row.Hours, _reduceRemaining, note, noteFormat, postNote, shared);
+
+                if (outcome == TimeWriteOutcome.Recorded)
+                {
+                    // Counted as sent even if the discussion turned it down: that has already
+                    // been reported, and trying again on the item's next block could double it
+                    // up if the first one did land after all.
+                    if (postNote) _notePosted[(row.WorkItemId, note)] = posted;
+
+                    row.Status = RowStatus.Recorded;
+                    row.Selected = false;
+                    okCount++;
+                    okMinutes += (int)Math.Round(row.Hours * 60);
+                }
+                else if (outcome == TimeWriteOutcome.Unconfirmed)
+                {
+                    // Unticked, and locked until a check settles it: the one-click retry a
+                    // failure gets is exactly how these hours would go on twice.
+                    row.Status = RowStatus.Unconfirmed;
+                    row.Selected = false;
+                    row.Error = error;
+                    unsureCount++;
+                }
+                else
+                {
+                    row.Status = RowStatus.Failed;
+                    row.Error = error;
+                    failCount++;
+                }
+
+                StateHasChanged();
+            }
+
+            Summarise(day, okCount, okMinutes, failCount, unsureCount);
+
+            // Only closes once nothing is left to retry or check, so those stay on screen
+            // rather than making you find those blocks again from the calendar.
+            if (failCount == 0 && unsureCount == 0 && State.RecordDayFor == day) Cancel();
+        }
+        finally
+        {
+            _saving = false;
+
+            // Catches up with anything held back while the run was going: a close forgets
+            // the rows, and a reopen for another day builds that day's.
+            Prime();
+        }
+    }
+
+    private const string UnconfirmedBefore =
+        "A booking from this block was never confirmed by Azure DevOps and may already be on the work item. " +
+        "Check settles it without booking anything.";
+
+    /// <summary>
+    /// The one toast a run ends with. Worded for where its rows are by then: still on screen,
+    /// or gone - the dialog shut, or opened for another day, while the run carried on - when
+    /// "below" would point at nothing, and reopening the day is what brings them back.
+    /// </summary>
+    private void Summarise(DateTime? day, int okCount, int okMinutes, int failCount, int unsureCount)
+    {
+        if (failCount == 0 && unsureCount == 0)
+        {
+            Toasts.Success($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)");
+            return;
+        }
+
+        var onScreen = day is not null && State.RecordDayFor == day;
+        var reopen = day is { } d ? $"open Record {Ui.RelativeDay(d).ToLowerInvariant()} again" : "open that day again";
+
+        var lines = new List<string>();
+
+        if (failCount > 0)
+            lines.Add(okCount == 0 && unsureCount == 0
+                ? onScreen ? "Fix whatever they need below and try again." : $"To retry them, {reopen}."
+                : onScreen ? $"{failCount} did not go through - fix them below and try again."
+                : $"{failCount} did not go through - {reopen} to retry them.");
+
+        if (unsureCount > 0)
+            lines.Add($"{unsureCount} may already be booked: Azure DevOps never confirmed {(unsureCount == 1 ? "it" : "them")}. "
+                      + (onScreen ? "Check them below before recording again." : $"{Capitalise(reopen)} to check them before recording again."));
+
+        var detail = string.Join(" ", lines);
+
+        // Errors stay until dismissed, which an unconfirmed booking needs: it is something to act on.
+        if (unsureCount > 0)
+            Toasts.Error(okCount > 0
+                ? $"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s), {unsureCount} not confirmed"
+                : $"{unsureCount} block(s) not confirmed", detail);
+        else if (okCount == 0)
+            Toasts.Error($"Could not record {failCount} block(s)", detail);
+        else
+            Toasts.Warning($"Recorded {Ui.Hours(okMinutes)} across {okCount} block(s)", detail);
+
+        static string Capitalise(string text) => char.ToUpperInvariant(text[0]) + text[1..];
+    }
+
+    /// <summary>
+    /// Looks again for a row's unconfirmed booking without booking anything. Landed, the row
+    /// is recorded; never arrived, it is offered again ticked, as a failed row would be.
+    /// </summary>
+    private async Task CheckAsync(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+
+        _checking = true;
+        row.Status = RowStatus.Recording;
+        try
+        {
+            switch (await State.CheckUnconfirmedAsync(row.AllocationId))
+            {
+                case TimeWriteOutcome.Recorded:
+                    row.Status = RowStatus.Recorded;
+                    row.Selected = false;
+                    row.Error = null;
+                    break;
+
+                case TimeWriteOutcome.Failed:
+                    ReopenForRecording(row);
+                    break;
+
+                // Nothing was left to check: the quiet settle had already been through it, so
+                // the plan itself says where this row stands. Ticking it on the strength of
+                // "nothing landed" would offer hours the settle may well have just filed.
+                case null:
+                    if (Plan.RecordedMinutesForBlock(row.AllocationId) > row.RecordedHereMinutes)
+                    {
+                        row.Status = RowStatus.Recorded;
+                        row.Selected = false;
+                        row.Error = null;
+                    }
+                    else
+                    {
+                        ReopenForRecording(row);
+                    }
+                    break;
+
+                default:
+                    row.Status = RowStatus.Unconfirmed;
+                    break;
+            }
+        }
+        finally
+        {
+            _checking = false;
+            Prime();
+        }
+    }
+
+    /// <summary>
+    /// Stops waiting on a row's booking that never went on, and offers the block again. Only
+    /// the plan is touched - nothing is sent to Azure DevOps either way.
+    ///
+    /// Offered again only once nothing at all is left on the block. Letting go settles the
+    /// bookings this connection may answer for, and one made against another organization is
+    /// left standing - the write refuses the block while it is, so a row put back as ready
+    /// would be ticked, prefilled, and then refused the moment Record was pressed.
+    /// </summary>
+    private void LetGo(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+        if (State.LetGoUnconfirmed(row.AllocationId) && !Plan.HasUnconfirmed(row.AllocationId))
+            ReopenForRecording(row);
+    }
+
+    /// <summary>
+    /// Files a row's booking as recorded because the user has the work item in front of them
+    /// and the hours are on it. The other half of <see cref="LetGo"/>: without it, a booking
+    /// that did land but can never be settled could only be let go, which would offer the
+    /// block again with the hours already on the work item.
+    ///
+    /// Reads as recorded only once nothing is left on the block, for the mirror of the reason
+    /// above: a row that says Recorded stops offering the answers, and the booking still
+    /// waiting there would have nowhere left in this list to be settled from.
+    /// </summary>
+    private void FileIt(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+        if (!State.FileUnconfirmed(row.AllocationId)) return;
+        if (Plan.HasUnconfirmed(row.AllocationId)) return;
+
+        row.Status = RowStatus.Recorded;
+        row.Selected = false;
+        row.Error = null;
+    }
+
+    /// <summary>
+    /// Takes a row's refused bookings as this organization's, when the user says they are.
+    /// The way out of the one refusal there is otherwise no way out of from this list: an
+    /// organization that was renamed or moved has no old address left to switch back to, so
+    /// without this the row's Check and both its answers stay out of reach for ever.
+    ///
+    /// Only re-stamps them, and only the ones actually refused. The row stays as it is -
+    /// nothing has been settled - and the actions that were hidden appear.
+    ///
+    /// Awaited because the claim is put to Azure DevOps first where its id is not already
+    /// known, and refused there if the service has already answered it.
+    /// </summary>
+    private async Task AdoptAsync(RowVm row)
+    {
+        if (_saving || _checking || row.Status != RowStatus.Unconfirmed) return;
+        await State.AdoptOrganizationForBlockAsync(row.AllocationId);
+    }
+
+    /// <summary>Puts a row back where an unbooked one starts: offered, ticked and editable.</summary>
+    private void ReopenForRecording(RowVm row)
+    {
+        row.Status = RowStatus.Pending;
+        row.Selected = row.TracksTime && row.Hours > 0;
+        row.Error = null;
+    }
+}

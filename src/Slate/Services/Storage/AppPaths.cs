@@ -57,5 +57,9 @@ public static class AppPaths
     public static string PlanFile => Path.Combine(DataDirectory, "plan.json");
     public static string TokenCacheFile => Path.Combine(DataDirectory, "msal.cache");
 
+    /// <summary>The last work item list that loaded successfully, shown at the next launch
+    /// before Azure DevOps has even been asked.</summary>
+    public static string WorkItemsCacheFile => Path.Combine(DataDirectory, "workitems-cache.json");
+
     public static void EnsureCreated() => Directory.CreateDirectory(DataDirectory);
 }

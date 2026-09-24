@@ -135,7 +135,8 @@ The **Plan** tab is a week grid with your work items down the left.
 | See a work item | Click it anywhere — sidebar, calendar block, or table — for the full record in a scrollable modal |
 | More actions | Right-click a calendar block: record time, edit, duplicate, send, delete |
 | Record time | Right-click a block → **Record time…**, or the button in the inspector — with an optional note that posts to the discussion |
-| Undo recorded time | Right-click the same block → **Undo recorded time**, or Undo in the Time tab |
+| Record a whole day | Click the hours in a day's header, **Record today** in the toolbar, or <kbd>Ctrl</kbd>+<kbd>R</kbd> — one dialog, every block, editable hours per row |
+| Undo recorded time | Right-click the same block → **Undo recorded time**, or Undo in the Time tab — with the option to remove the note it posted too |
 | Set a priority | Right-click a work item or block → **Your triage** stays here, **Azure DevOps** writes back |
 | Change the status | Open the work item and pick a state, or set one while recording time |
 | Raise new work | **New work item** on the Work items tab, or **＋** above the Plan sidebar |
@@ -157,8 +158,9 @@ field and its links — in a scrollable modal, so you rarely need the browser.
 and the triage row](docs/screenshots/06-workitem.png)
 
 **Shortcuts:** <kbd>←</kbd>/<kbd>→</kbd> change week · <kbd>T</kbd> today · <kbd>R</kbd> reload work
-items · <kbd>Ctrl</kbd>+<kbd>S</kbd> send to Outlook · <kbd>Del</kbd> delete the selected block ·
-<kbd>Esc</kbd> deselect · <kbd>/</kbd> focus the filter.
+items · <kbd>Ctrl</kbd>+<kbd>S</kbd> send to Outlook · <kbd>Ctrl</kbd>+<kbd>R</kbd> record today's
+blocks · <kbd>Del</kbd> delete the selected block · <kbd>Esc</kbd> deselect · <kbd>/</kbd> focus
+the filter.
 
 ---
 
@@ -220,8 +222,8 @@ The dialog also takes an optional **note**, which is posted to the work item's *
 Azure DevOps — Plain or Markdown, the same picker the comment box uses, remembering whichever you
 used last. Leave it empty and nothing is posted. The hours are the point of the operation and are
 already written by the time the note goes out, so a discussion that refuses the note says so and
-leaves the booking standing rather than unwinding a good write over a failed extra. Undoing the
-entry later takes the hours back off the work item but does not retract the comment.
+leaves the booking standing rather than unwinding a good write over a failed extra. Slate keeps
+the id of the comment it posted, so undoing those hours can offer to take the note off with them.
 
 ### The Time tab
 
@@ -241,6 +243,48 @@ below it grouped by day](docs/screenshots/03-time.png)
 
 Undo is also on the calendar block's right-click menu, which reverses the most recent booking
 made from that block.
+
+Either way it asks first, with **Also remove the note from the work item's discussion** ticked:
+a note saying what the time went on is misleading once the hours are gone. The hours come off
+first and the comment only afterwards, so a delete Azure DevOps refuses is reported on its own
+and never puts the booking back. The tick is only offered when Slate knows which comment it
+posted and which project it went under, and the entry belongs to the organization you are
+connected to; otherwise the dialog says why there is nothing it can remove. An undo Azure DevOps
+could not confirm removes nothing — the hours may still be on the work item, and the note with
+them.
+
+Recording a whole day posts a work item's note once however many of its blocks are booked, and
+every one of those entries carries that comment — so the note comes off with the **last** of the
+hours it covers. Undo one of them while the others stand and the dialog names what the note also
+speaks for and leaves the tick off; you can still tick it, knowing what it leaves behind, and
+the entries left over stop claiming a comment that has gone. Days recorded by an earlier version
+of Slate did not write the comment down on every block of them, so there the dialog says the note
+cannot be removed rather than offering to.
+
+The same question is asked wherever an entry is dropped. An undo Azure DevOps never confirmed
+leaves two answers on the Time tab: **The undo did go through** drops the entry, so it asks and
+offers the same tick — that entry may be the last record of which comment the note was — while
+**It never went through** changes nothing but the pin and asks nothing. The one entry that goes
+without asking is one Slate settles by itself in the background: when it finds an unconfirmed
+undo really did land, the entry goes and the note stays. Nobody is there to be asked, and nothing
+is claimed about the comment.
+
+### Recording a whole day
+
+Booking every block one at a time is fine for one or two, but a full day means opening the same
+dialog over and over. **Record today** does it in one pass: click the hours in a day's column
+header, the button in the calendar toolbar, or press <kbd>Ctrl</kbd>+<kbd>R</kbd> — all three
+open every block for that day (not just today; the header button works on any day in view).
+
+Each row starts ticked with the block's unrecorded remainder — its length minus whatever is
+already booked against it, including time recorded elsewhere — and unticked if there is nothing
+left to book. Every row's hours are editable, there is one shared optional note posted to each
+work item recorded, and a running total across the ticked rows.
+
+Rows are booked one at a time through the exact same write as the single-block dialog, so
+`ReduceRemainingOnRecord`, the untrackable-type handling and the time entries it leaves behind
+all behave identically. A row that fails stays ticked with its error, the rows that already went
+through are left alone, and pressing **Record** again only retries what is left.
 
 ## Types that cannot record time
 
@@ -465,13 +509,55 @@ own.
 ## Keeping up to date
 
 On launch the app asks GitHub once whether there is a newer release. If there is, a yellow bar
-appears above the header — the new version number, the one you are on, and a link straight to that
-release's page for the download. Dismiss it and it stays gone until the next launch.
+appears above the header — the new version number, the one you are on, **Install and restart**,
+and a link straight to that release's page. Dismiss it and it stays gone until the next launch.
 
 The check is deliberately quiet and best-effort: it runs after the first paint so it can never hold
 the window up, and no network, a rate limit or a draft release all mean nothing is shown rather
-than an error. Nothing is downloaded or installed for you — upgrading is still a matter of swapping
-the `.exe`.
+than an error.
+
+**Install and restart** downloads the same flavour you are running (standalone or slim) into the
+folder the `.exe` lives in, with progress in the bar and a Cancel button; the app stays usable
+meanwhile. The download is only used if its SHA-256 matches the checksum GitHub published for the
+file, and only if it came from this repository's releases over HTTPS. Anything already under way —
+time being recorded, a sync to Outlook, a change to a work item, an edit to the plan or the
+settings, a sign-in — is then allowed to finish, and from there until the restart the app holds
+still: nothing more can be changed, and the window will not close. The running `.exe` is renamed
+to `<name>.old`, the new one takes its name — so shortcuts and pins keep working — and the new
+version starts. From that moment the old copy writes nothing more to the data folder, so the two
+never write over each other; it closes once the new window is up, and the `.old` file is removed.
+Settings and the plan live in the data folder, so nothing is lost across the restart.
+
+If anything gets in the way — something is still under way after 30 seconds, the folder cannot be
+written to, the file is locked, the checksum does not match, or the new version closes or has not
+shown its window within 90 seconds — the new version is stopped, the old `.exe` is put back where
+it was, the app carries on exactly as before, and the release page opens so you can download it by
+hand. What Slate then tells you is what actually happened rather than a rollback that did not: it
+puts the old `.exe` back, or — something is holding a file open and will not let go — leaves the
+new version there and names the `.old` beside it to rename over it, or, rarest of all, can put
+nothing there at all and names the `.old` to rename to `Slate.exe`. Where the old `.exe` could
+only be put back by copying it, the `.old` it was copied from stays until you restart Slate, and
+the message says so.
+
+If you sign out or shut down while the new version is still starting, Slate stops it and puts the
+old `.exe` back there and then, with every step cut to what fits in a moment: Windows offers to
+end an app that has not answered in about five seconds, and being ended halfway through moving
+the files is worse than any failed update. If the files were already moving when the sign-out
+arrived, Slate answers Windows rather than hold the sign-out up, and leaves the thread already
+doing that work to finish as the app closes — it is cutting the same steps short. Either way the
+usual outcome is the one you want: the old `.exe` is renamed back under its own name and is what
+opens next time, and no `.old` is left beside it, because renaming it back is what uses that file
+up.
+
+It is not a promise, though, and the folder tells you which way it went. If Windows would not let
+the files move at all, the new, unproven version is still where Slate runs from, with the version
+you were on beside it as `Slate.exe.old` to rename over it. If Slate was ended between the two
+renames — rarest of all — nothing is there, and the version you were on is in that folder as
+`Slate.exe.old` to rename to `Slate.exe`. And if the old version went back by being copied rather
+than renamed, it is back under its own name, with the `.old` it was copied from beside it until
+you next start Slate, as above. `crash.log` in the data folder names the outcome whenever Slate
+was still running to write it down. A build made with plain `dotnet build` does not know which
+flavour it is, so it only ever offers the link.
 
 ## Carrying your setup around
 

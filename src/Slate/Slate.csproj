@@ -13,7 +13,7 @@
     <ApplicationIcon>appicon.ico</ApplicationIcon>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <Version>1.5.6</Version>
+    <Version>1.6.0</Version>
     <Product>Slate</Product>
     <Company>Blackcat Data Solutions Limited</Company>
     <Authors>Jake Morgan</Authors>
@@ -39,6 +39,22 @@
     <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
       <_Parameter1>BuildDate</_Parameter1>
       <_Parameter2>$(BuildDate)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <!--
+    Which release asset this build is, so the app can fetch the same flavour when it updates
+    itself. build/publish.ps1 passes SlateFlavour (slim or standalone); a plain dotnet build
+    has none, and without it the app only ever points at the release page.
+  -->
+  <ItemGroup Condition="'$(SlateFlavour)' != ''">
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>SlateFlavour</_Parameter1>
+      <_Parameter2>$(SlateFlavour)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>SlateRuntime</_Parameter1>
+      <_Parameter2>$(RuntimeIdentifier)</_Parameter2>
     </AssemblyAttribute>
   </ItemGroup>
 

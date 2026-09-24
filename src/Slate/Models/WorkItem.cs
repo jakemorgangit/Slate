@@ -106,16 +106,35 @@ public sealed record WorkItemFieldValue(string Name, string DisplayName, string 
 
 public sealed record WorkItemRelation(string Kind, string Title, string Url, int? WorkItemId);
 
-/// <summary>Outcome of writing time back to Azure DevOps.</summary>
 /// <summary>
 /// What a work item's time fields now read, and what was actually applied to get there -
-/// which is not always what was asked for, because both fields clamp at zero.
+/// which is not always what was asked for, because both fields clamp at zero. The plan is
+/// the write that landed, when one was sent.
 /// </summary>
 public sealed record TimeRecordResult(
     double CompletedWork,
     double RemainingWork,
     double AppliedCompleted = 0,
-    double AppliedRemaining = 0);
+    double AppliedRemaining = 0,
+    TimeWritePlan? Plan = null);
+
+/// <summary>
+/// What became of a comment somebody asked to have taken off a discussion. Anything that went
+/// wrong is an exception, as everywhere else here; these are the two ways it can go right, and
+/// they are kept apart because only one of them may be spoken of as a comment removed.
+/// </summary>
+public enum CommentRemoval
+{
+    /// <summary>Azure DevOps took it off the discussion.</summary>
+    Removed,
+
+    /// <summary>
+    /// There was nothing at that address to take off. Usually a comment already gone, but the
+    /// same answer covers a project or a work item the address cannot find, so it may equally
+    /// be standing somewhere this did not look.
+    /// </summary>
+    NotThere,
+}
 
 /// <summary>One entry in a work item's discussion.</summary>
 public sealed record WorkItemComment(

@@ -43,6 +43,179 @@
         </div>
     </div>
 
+    @* Bookings Azure DevOps never confirmed. Shown here whatever week is on screen, and
+       whether or not their block still exists: one from a block deleted since cannot be
+       reached from the plan at all, and without somewhere like this it would sit in the
+       file for ever with no way to settle it. *@
+    @if (_unsettled.Count > 0)
+    {
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Not confirmed by Azure DevOps</h2>
+                    <div class="sub">
+                        Sent, with no answer either way. They count towards nothing above until one of them is settled.
+                    </div>
+                </div>
+            </div>
+            <div class="card-body">
+                @foreach (var block in _unsettled)
+                {
+                    <div class="banner error" @key="block.AllocationId">
+                        <span>!</span>
+                        <div class="grow">
+                            <div>
+                                <strong>@Ui.Hours(block.Minutes)</strong> for
+                                <span class="mono">#@block.First.WorkItemId</span>
+                                <span>@Ui.Clip(block.First.WorkItemTitle, NoteLimit)</span>,
+                                sent @Ui.Ago(block.First.RecordedAt).
+                                @if (Plan.Find(block.AllocationId) is null)
+                                {
+                                    <span class="badge badge-muted" title="The calendar block it came from has gone">Block deleted</span>
+                                }
+                            </div>
+                            @* Booked against an organization Slate is not on now. Nothing here
+                               can be settled against it - #7 over here is a different work
+                               item - and a renamed or moved organization has no old address
+                               left to switch back to, so the way out is the user saying it is
+                               the same one, where Azure DevOps' own ids leave that open. Said
+                               of the bookings it is true of: a block can hold one from either
+                               side of a switch. *@
+                            @if (block.Elsewhere is { } where)
+                            {
+                                <div>
+                                    @(block.AllElsewhere ? "It was booked" : "Part of it was booked")
+                                    against <span class="mono">@where</span>, @block.ElsewhereWhy,
+                                    so nothing here can settle
+                                    @(block.AllElsewhere ? "it" : "that part").
+                                </div>
+                            }
+                            @if (!block.AllElsewhere)
+                            {
+                                <div>It may already be on the work item - look there before recording those hours again.</div>
+                            }
+                            <div class="row" style="margin-top: 8px; gap: 6px">
+                                @if (!block.AllElsewhere)
+                                {
+                                    <button class="btn btn-sm" disabled="@(_busy is not null)"
+                                            @onclick="() => CheckAsync(block)">
+                                        @if (_busy == block.AllocationId)
+                                        {
+                                            <span class="spinner"></span>
+                                            <span>Checking…</span>
+                                        }
+                                        else
+                                        {
+                                            <span>Check</span>
+                                        }
+                                    </button>
+                                }
+                                @if (block.First.WorkItemUrl is { Length: > 0 } url)
+                                {
+                                    <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
+                                            @onclick="() => SystemShell.OpenUrl(url)">Open #@block.First.WorkItemId ↗</button>
+                                }
+                                @* Offered only while the claim is one Azure DevOps has not
+                                   already refused: where it has, the press could do nothing
+                                   but come back refused. *@
+                                @if (block.CanAdopt)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_busy is not null)"
+                                            title="@AppState.AdoptBookingTitle"
+                                            @onclick="() => AdoptAsync(block)">Same organization - settle it here</button>
+                                }
+                                @if (block.CanBeLetGo)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_busy is not null)"
+                                            title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
+                                            @onclick="() => FileIt(block)">It did go on</button>
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_busy is not null)"
+                                            title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting."
+                                            @onclick="() => LetGo(block)">Never went on</button>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
+    @* Undos Azure DevOps never confirmed, for entries booked in some other week. An entry
+       showing this week is answered from its own row further down; one from three weeks ago
+       has no row here at all, and until its undo is answered that entry can never be undone.
+       That makes it outstanding in exactly the same sense as the bookings above, so like them
+       it is shown whatever week is on screen rather than only on its own. *@
+    @if (_stuckUndos.Count > 0)
+    {
+        <div class="card">
+            <div class="card-head">
+                <div class="grow">
+                    <h2>Undos not confirmed, from other weeks</h2>
+                    <div class="sub">
+                        Sent, with no answer either way. Until one is answered, its entry cannot be undone.
+                    </div>
+                </div>
+            </div>
+            <div class="card-body">
+                @foreach (var (entry, undo) in _stuckUndos)
+                {
+                    <div class="banner error" @key="entry.Id">
+                        <span>!</span>
+                        <div class="grow">
+                            <div>
+                                <strong>@Ui.DecimalHours(entry.Minutes)h</strong> for
+                                <span class="mono">#@entry.WorkItemId</span>
+                                <span>@Ui.Clip(entry.WorkItemTitle, NoteLimit)</span>,
+                                booked @entry.Date.ToString("d MMM yyyy").
+                            </div>
+                            <div>
+                                Azure DevOps never confirmed the undo sent @Ui.Ago(undo.SentAt),
+                                so those hours may or may not still be on the work item.
+                            </div>
+                            @if (!entry.BelongsTo(_organization))
+                            {
+                                <div>
+                                    It was booked against <span class="mono">@AppState.BookedAgainst(entry)</span>,
+                                    @AppState.WhyNotOurs(entry, _organization), so nothing here can settle it.
+                                </div>
+                            }
+                            <div class="row" style="margin-top: 8px; gap: 6px">
+                                @if (entry.WorkItemUrl is { Length: > 0 } undoneUrl)
+                                {
+                                    <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
+                                            @onclick="() => SystemShell.OpenUrl(undoneUrl)">Open #@entry.WorkItemId ↗</button>
+                                }
+                                @if (!entry.BelongsTo(_organization))
+                                {
+                                    @* The two answers stay off for these whatever happens
+                                       next - they rest on a work item this connection cannot
+                                       show - and "same organization" is offered only while it
+                                       is a claim Azure DevOps has not already refused. *@
+                                    @if (entry.CouldBelongTo(_organization))
+                                    {
+                                        <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
+                                                title="@AppState.AdoptEntryTitle"
+                                                @onclick="() => AdoptEntryAsync(entry)">Same organization</button>
+                                    }
+                                }
+                                else if (!undo.CouldStillLand)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
+                                            title="Only once you have looked at the work item and those hours are no longer on it. Asks first, the way Undo does, and offers to take the note off the discussion with them; no time is written to Azure DevOps."
+                                            @onclick="() => AnswerUndo(entry, wentThrough: true)">The undo did go through</button>
+                                    <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
+                                            title="Only once you have looked at the work item and those hours are still on it. Nothing is written to Azure DevOps; the entry stands and Undo works on it again."
+                                            @onclick="() => AnswerUndo(entry, wentThrough: false)">It never went through</button>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
     @if (_entries.Count == 0)
     {
         <div class="empty-state">
@@ -140,6 +313,15 @@
                         @foreach (var entry in _entries.Where(e => e.Date.Date == day.Date))
                         {
                             var live = Plan.Find(entry.AllocationId) is not null;
+
+                            // Worked out once for the row, so the explanation, the two answers
+                            // and the Undo button can never disagree about whose hours these
+                            // are: it is the test the write paths themselves refuse by.
+                            var elsewhere = !entry.BelongsTo(_organization);
+                            var canAdopt = elsewhere && entry.CouldBelongTo(_organization);
+                            var undoTitle = elsewhere
+                                ? AppState.WhyUndoIsOff(entry, _organization, onTimeTab: true)
+                                : "Take this time back off the work item";
                             <div class="ghost-entry" @key="entry.Id" style="--wi-color: @Ui.ColorFor(entry.WorkItemType)">
                                 <div class="ghost-time">
                                     <div class="range">@Ui.TimeRange(entry.Start, entry.End)</div>
@@ -164,7 +346,73 @@
                                         {
                                             <span class="badge badge-muted" title="The calendar block it came from has gone">Block deleted</span>
                                         }
+                                        @if (entry.UnconfirmedUndo is not null)
+                                        {
+                                            <span class="badge badge-danger"
+                                                  title="An undo of these hours went to Azure DevOps and was never confirmed. Undo looks for it first, so nothing is ever taken off twice.">Undo not confirmed</span>
+                                        }
                                     </div>
+
+                                    @* An undo that nothing can settle leaves the entry
+                                       un-undoable: every Undo of it stops at the same
+                                       unanswerable question. The work item itself can answer
+                                       it, so the two answers are offered here - once no send
+                                       of that undo could still be arriving, which is the same
+                                       window a booking's answers wait for. An entry booked in
+                                       another week has no row here at all; those are gathered
+                                       into their own section at the top of the page.
+
+                                       Gated on the organization as well, the way that section
+                                       is: both answers rest on the user having looked at the
+                                       work item, and hours booked against an organization
+                                       Slate is not on are the one case where they cannot
+                                       have. "Same organization", just below, is the way out
+                                       for those. *@
+                                    @if (entry.UnconfirmedUndo is { } undo)
+                                    {
+                                        <div style="margin-top: 4px; font-size: 11.5px; color: var(--danger)">
+                                            Azure DevOps never confirmed the undo sent @Ui.Ago(undo.SentAt),
+                                            so those hours may or may not still be on the work item.
+                                        </div>
+                                        @if (!undo.CouldStillLand && !elsewhere)
+                                        {
+                                            <div class="row" style="margin-top: 6px; gap: 6px">
+                                                <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
+                                                        title="Only once you have looked at the work item and those hours are no longer on it. Asks first, the way Undo does, and offers to take the note off the discussion with them; no time is written to Azure DevOps."
+                                                        @onclick="() => AnswerUndo(entry, wentThrough: true)">The undo did go through</button>
+                                                <button class="btn btn-sm btn-ghost" disabled="@(State.UndoingEntry is not null)"
+                                                        title="Only once you have looked at the work item and those hours are still on it. Nothing is written to Azure DevOps; the entry stands and Undo works on it again."
+                                                        @onclick="() => AnswerUndo(entry, wentThrough: false)">It never went through</button>
+                                            </div>
+                                        }
+                                    }
+
+                                    @* Hours booked against an organization Slate is not on
+                                       cannot be undone from here: #7 over there is a different
+                                       work item. What can be done about it depends on the
+                                       refusal - an organization that was renamed or moved is
+                                       a claim only the user can answer, while one Azure DevOps
+                                       has already answered by giving the two different ids is
+                                       not - so the button appears only where a press could
+                                       work, and the clause says what is left where it cannot. *@
+                                    @if (elsewhere)
+                                    {
+                                        <div style="margin-top: 4px; font-size: 11.5px; color: var(--text-3)">
+                                            Booked against <span class="mono">@AppState.BookedAgainst(entry)</span>,
+                                            @AppState.WhyNotOurs(entry, _organization), so Undo would change a different work item.
+                                            @if (canAdopt)
+                                            {
+                                                <button class="btn btn-sm btn-ghost" style="margin-left: 6px"
+                                                        disabled="@(State.UndoingEntry is not null)"
+                                                        title="@AppState.AdoptEntryTitle"
+                                                        @onclick="() => AdoptEntryAsync(entry)">Same organization</button>
+                                            }
+                                            else
+                                            {
+                                                @AppState.WayOut(entry, _organization, onTimeTab: true)
+                                            }
+                                        </div>
+                                    }
                                     @if (!string.IsNullOrWhiteSpace(entry.Comment))
                                     {
                                         @* Held to a readable length; the whole of it is on hover. *@
@@ -183,10 +431,18 @@
                                         <span>@Ui.DecimalHours(entry.Minutes)h</span>
                                     </div>
 
-                                    <button class="btn btn-sm btn-danger" title="Take this time back off the work item"
-                                            disabled="@(_undoing == entry.Id)"
-                                            @onclick="() => UndoAsync(entry)">
-                                        @if (_undoing == entry.Id)
+                                    @* Off for hours booked against an organization Slate is not
+                                       on: #7 over here is a different work item, so the undo
+                                       would be refused the moment it was asked for. Said in
+                                       the button rather than found out by pressing it, and the
+                                       title carries whatever way out there is - telling Slate
+                                       the two are one organization where that could still be
+                                       true, and where its ids say otherwise, going back to the
+                                       organization the hours went to, or nothing at all. *@
+                                    <button class="btn btn-sm btn-danger" title="@undoTitle"
+                                            disabled="@(elsewhere || State.UndoingEntry is not null)"
+                                            @onclick="() => Undo(entry)">
+                                        @if (State.UndoingEntry == entry.Id)
                                         {
                                             <span class="spinner"></span>
                                         }
@@ -204,12 +460,24 @@
 
 <WorkItemModal />
 <PriorityDialog />
+<UndoTimeDialog />
 
 @code {
     private List<TimeEntry> _entries = [];
     private List<DateTime> _days = [];
     private List<Row> _rows = [];
-    private Guid? _undoing;
+    private List<AppState.UnsettledBlock> _unsettled = [];
+    /// <summary>
+    /// Entries whose undo Azure DevOps never confirmed, from weeks other than the one on
+    /// screen. The pin is taken here rather than read again while rendering: the quiet settle
+    /// runs on its own thread and can answer one of these in between, and a row that read the
+    /// pin a second time would find it gone.
+    /// </summary>
+    private List<(TimeEntry Entry, TimeWritePlan Undo)> _stuckUndos = [];
+    private Guid? _busy;
+
+    /// <summary>The organization Slate is connected to, as of the last rebuild of this page.</summary>
+    private OrganizationRef _organization = OrganizationRef.None;
 
     /// <summary>How much of a note the row shows before the rest is left to the tooltip.</summary>
     private const int NoteLimit = 110;
@@ -273,20 +541,123 @@
                 g.GroupBy(e => e.Date.Date).ToDictionary(d => d.Key, d => d.Sum(e => e.Minutes))))
             .OrderByDescending(r => r.TotalMinutes)
             .ThenBy(r => r.WorkItemId)];
+
+        // Worked out once for the whole page: normalising an organization address for every
+        // row of every render is work nobody asked for.
+        _organization = State.CurrentOrganization;
+
+        // Not filtered to the week on screen: these are outstanding, not history, and the one
+        // whose block was deleted has nowhere else at all to be settled from.
+        _unsettled = [.. Plan.UnconfirmedBookings
+            .GroupBy(b => b.Entry.AllocationId)
+            .Select(g => State.Split(g.Key, [.. g.OrderBy(b => b.Entry.RecordedAt)]))
+            .OrderBy(u => u.First.RecordedAt)];
+
+        // An entry whose undo is stuck is outstanding in the same sense, and it cannot be
+        // undone until that undo is answered. The ones this week is showing are answered from
+        // their own rows; the rest have no row here, so they are collected above.
+        var weekEnd = State.WeekStart.AddDays(7);
+        _stuckUndos = [];
+
+        foreach (var entry in Plan.TimeEntries.OrderBy(e => e.Date).ThenBy(e => e.Start))
+        {
+            if (entry.Date.Date >= State.WeekStart.Date && entry.Date.Date < weekEnd.Date) continue;
+            if (entry.UnconfirmedUndo is { } undo) _stuckUndos.Add((entry, undo));
+        }
     }
 
-    private async Task UndoAsync(TimeEntry entry)
+    /// <summary>
+    /// Looks at the work item for one block's unconfirmed bookings, without writing anything.
+    /// The list rebuilds itself from the plan afterwards, so whatever it settled simply drops
+    /// off - filed above as an entry, or let go.
+    /// </summary>
+    private async Task CheckAsync(AppState.UnsettledBlock block)
     {
-        if (_undoing is not null) return;
+        if (_busy is not null) return;
 
-        _undoing = entry.Id;
+        _busy = block.AllocationId;
         try
         {
-            await State.UndoTimeEntryAsync(entry);
+            await State.CheckUnconfirmedAsync(block.AllocationId);
         }
         finally
         {
-            _undoing = null;
+            _busy = null;
+            Recompute();
         }
     }
+
+    /// <summary>Stops waiting on bookings the user has checked and found are not on the item.</summary>
+    private void LetGo(AppState.UnsettledBlock block)
+    {
+        if (_busy is not null) return;
+
+        State.LetGoUnconfirmed(block.AllocationId);
+        Recompute();
+    }
+
+    /// <summary>
+    /// Files bookings the user has checked and found are on the item. Offered here as well as
+    /// in the two dialogs because a booking whose block has been deleted has nowhere else to
+    /// be answered at all, and "never went on" is the wrong answer for it.
+    /// </summary>
+    private void FileIt(AppState.UnsettledBlock block)
+    {
+        if (_busy is not null) return;
+
+        State.FileUnconfirmed(block.AllocationId);
+        Recompute();
+    }
+
+    /// <summary>
+    /// Takes a block's bookings as this organization's, when the user says they are. Awaited
+    /// because the claim is put to Azure DevOps first where its id is not already known, and
+    /// refused there rather than here if the service has already answered it.
+    /// </summary>
+    private async Task AdoptAsync(AppState.UnsettledBlock block)
+    {
+        if (_busy is not null) return;
+
+        await State.AdoptOrganizationForBlockAsync(block.AllocationId);
+        Recompute();
+    }
+
+    /// <summary>The same for one filed entry, so its Undo stops being refused.</summary>
+    private async Task AdoptEntryAsync(TimeEntry entry)
+    {
+        if (State.UndoingEntry is not null) return;
+
+        await State.AdoptOrganizationForEntryAsync(entry.Id);
+        Recompute();
+    }
+
+    /// <summary>
+    /// Answers for an undo Azure DevOps never confirmed, from what the work item itself says.
+    /// The entry goes if it went through, and stands if it did not; no time is sent either way.
+    ///
+    /// "It went through" drops the entry, and with it what may be the last record of which
+    /// comment its note was, so it goes through the same dialog an Undo does and is offered the
+    /// same tick. "It never went through" leaves everything where it is and is answered on the
+    /// spot.
+    /// </summary>
+    private async Task AnswerUndo(TimeEntry entry, bool wentThrough)
+    {
+        if (State.UndoingEntry is not null) return;
+
+        if (wentThrough)
+        {
+            State.BeginSettleUndoWentThrough(entry);
+            return;
+        }
+
+        await State.AnswerUnconfirmedUndoAsync(entry.Id, wentThrough: false);
+        Recompute();
+    }
+
+    /// <summary>
+    /// Asks about the undo rather than doing it: the note that went to the discussion with
+    /// these hours comes off with them or stays, and that is a question only the user can
+    /// answer. The dialog carries out whichever it is.
+    /// </summary>
+    private void Undo(TimeEntry entry) => State.BeginUndoTimeEntry(entry);
 }
