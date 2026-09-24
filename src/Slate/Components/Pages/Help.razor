@@ -461,14 +461,20 @@
                         you can download the update by hand. If you sign out or shut down while the new
                         version is still starting, Slate stops it and puts the old one back there and then,
                         with every step cut to a moment — Windows offers to end an app that has not
-                        answered in about five seconds. That is normally enough, and the old version is the
-                        one that opens next time, but it is not a promise: if Windows will not let the files
-                        move in that moment, or they were already moving when the sign-out arrived — Slate
-                        answers Windows rather than hold it up, and leaves the work under way to finish as
-                        the app closes — the new version is left where Slate runs from, or, if Slate was
-                        ended between the two renames, nothing is there at all. The one you were on is
-                        beside it as <code>.old</code> to rename back either way. <code>crash.log</code>
-                        says which. A copy built with <code>dotnet build</code> only ever offers the link.</dd>
+                        answered in about five seconds. If the files were already moving when the sign-out
+                        arrived, Slate answers Windows rather than hold it up, and leaves the thread already
+                        doing that work to finish as the app closes — it is cutting the same steps short.
+                        Either way the usual outcome is the one you want: the old one is renamed back under
+                        its own name and is what opens next time, and no <code>.old</code> is left beside
+                        it, because renaming it back is what uses that file up. It is not a promise, though.
+                        If Windows would not let the files move at all, the new version is still where Slate
+                        runs from, with the one you were on beside it as <code>.old</code> to rename over
+                        it; if Slate was ended between the two renames, nothing is there at all, and the one
+                        you were on is in that folder as <code>.old</code> to rename back. And if the old
+                        one went back by being copied rather than renamed, it is back under its own name,
+                        with the <code>.old</code> it was copied from beside it until you next start Slate,
+                        as above. <code>crash.log</code> says which. A copy built with
+                        <code>dotnet build</code> only ever offers the link.</dd>
 
                     <dt>Something else</dt>
                     <dd>Anything unexpected is written to <code>crash.log</code> in the data folder below.</dd>

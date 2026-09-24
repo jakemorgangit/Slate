@@ -21,9 +21,15 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
     /// changed" a caller otherwise adds would flatly contradict any of the three.
     /// SelfUpdater.NothingLeftBehind is where those three are defined, and every throw built by
     /// its Failed and Interrupted takes this from it. Two throws in Swap word their own messages
-    /// rather than being built there - the copy-back failure, and the opening step of the next
-    /// install in that session, which stops on the .old that failure left - and both are about
-    /// the third of the three, so each of them marks itself the same way by hand.
+    /// rather than being built there, and mark themselves by hand instead. The copy-back failure
+    /// is the third of the three exactly. The other - Swap's opening step, which stops on a .old
+    /// it cannot delete - is that state when the .old is the one that failure left, and often
+    /// nothing of the kind: an update whose cleanup was cut short leaves a .old that later
+    /// launches leave alone, and anything holding that one open - a scanner reading it, say -
+    /// is enough to stop the delete. This attempt has moved nothing at all then. Marked the same
+    /// way regardless, because the file it names really is there and really does have to go
+    /// before an update can be tried again - which "nothing was changed" would talk the user
+    /// out of.
     /// </summary>
     public bool NothingChanged { get; init; } = true;
 }
@@ -726,7 +732,7 @@ public sealed class SelfUpdater
 
     /// <summary>
     /// True from the moment the install can no longer be cancelled until this copy has either
-    /// put everything back or handed over to the new copy - and after a handover, for the
+    /// put back what it could or handed over to the new copy - and after a handover, for the
     /// rest of its life.
     ///
     /// The window refuses to close meanwhile: this copy is what notices a new version that
@@ -1004,7 +1010,12 @@ public sealed class SelfUpdater
     /// <summary>
     /// Starts the new copy and waits for it to say its window is up. If it cannot start, exits
     /// first - a slim build whose runtime is missing does exactly that - or never gets as far
-    /// as its window, it is stopped and the old copy is put back and keeps running.
+    /// as its window, it is stopped and the old copy put back, and this copy carries on as it
+    /// was. That is the ordinary outcome rather than a promise: a rollback from here can also
+    /// end with the new, unproven version still standing where Slate runs from, or with nothing
+    /// standing there at all, which is why what is thrown is built by <see cref="Failed"/> or
+    /// <see cref="Interrupted"/> - they say what was actually left rather than a rollback that
+    /// happened.
     ///
     /// Every look at how the new copy is doing, and whatever is done about it, happens under
     /// <see cref="HandoverLock"/>, so it can never cross with <see cref="SettleBeforeExit"/>
@@ -1359,8 +1370,10 @@ public sealed class SelfUpdater
     /// where it is the only thing left that might fill it and there is no Slate there to lose.
     /// The second try at the rename - the one that matters, once the new copy has let go of its
     /// own image - is still made, below. A sign-out that arrives after this began sets
-    /// <see cref="_pressedToExit"/>, which every step here reads as it goes, the wait for the
-    /// new copy included, so it is cut short from wherever it had got to.
+    /// <see cref="_pressedToExit"/>, which the steps here read as they go, the wait for the new
+    /// copy included, so they are cut short from wherever they had got to. All but the empty
+    /// path above: <see cref="FillEmptyPath"/> runs its whole budget and then copies regardless,
+    /// and must go on doing so, since that is the one thing here that outranks the flag.
     /// </param>
     private static void RollBack(Handover handover, bool exiting = false, bool pressed = false)
     {
@@ -1468,8 +1481,10 @@ public sealed class SelfUpdater
     /// writing there.
     ///
     /// Waited out in short slices rather than in one call, so that a sign-out arriving in the
-    /// middle of a rollback that had the long wait is not sat out to the end. Like every other
-    /// wait in a rollback, it reads <see cref="_pressedToExit"/> as it goes; it used to be
+    /// middle of a rollback that had the long wait is not sat out to the end. Like every wait
+    /// in a rollback but one - <see cref="FillEmptyPath"/> spends its whole budget and makes
+    /// its last-resort copy whatever the flag says, because filling an empty path outranks
+    /// even answering Windows - it reads <see cref="_pressedToExit"/> as it goes; it used to be
     /// handed its budget before it started, and the ten seconds of that would be ten seconds of
     /// <see cref="HandoverLock"/> held against the window's thread, which is what put Slate on
     /// Windows' "these apps are stopping you" screen.
@@ -1586,9 +1601,12 @@ public sealed class SelfUpdater
     /// back under its own name, and no .old left beside it. A rollback that could only get it
     /// back by copying leaves one, says so, and tells the user to restart before updating again
     /// - which the reassurance would flatly contradict, exactly as it would for a new version
-    /// left standing. Swap's own copy-back failure, and the opening step the next install then
-    /// stops at, say the same thing and mark themselves the same way by hand; it is all the one
-    /// state, so they read the same. Only called under <see cref="HandoverLock"/>, like
+    /// left standing. Swap's own copy-back failure is that state, says so, and marks itself the
+    /// same way by hand. So does the opening step the next install stops at - though only when
+    /// the .old it could not delete is the one that failure left: it stops on any .old that will
+    /// not go, including a stale one something else is holding, and nothing about this copy has
+    /// moved then. It is marked all the same, since what it names is a file that has to go
+    /// before an update can be tried again. Only called under <see cref="HandoverLock"/>, like
     /// <see cref="Describe"/>, which asks the same question of the same file.
     /// </summary>
     private static bool NothingLeftBehind(Handover handover) =>

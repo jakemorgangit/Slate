@@ -517,14 +517,22 @@ the message says so.
 If you sign out or shut down while the new version is still starting, Slate stops it and puts the
 old `.exe` back there and then, with every step cut to what fits in a moment: Windows offers to
 end an app that has not answered in about five seconds, and being ended halfway through moving
-the files is worse than any failed update. That is normally enough, and the old version is the
-one that opens next time — but it is not a promise. If Windows will not let the files move in
-that moment, or they were already being moved when the sign-out arrived — in which case Slate
-answers Windows rather than hold the sign-out up, and leaves the work already under way to finish
-as the app closes — then what is where Slate runs from is the new, unproven version, or, if it was
-ended between two renames, nothing at all. The version you were on is beside it as `Slate.exe.old`
-either way, to rename back. `crash.log` in the data folder says which of those happened. A build
-made with plain `dotnet build` does not know which flavour it is, so it only ever offers the link.
+the files is worse than any failed update. If the files were already moving when the sign-out
+arrived, Slate answers Windows rather than hold the sign-out up, and leaves the thread already
+doing that work to finish as the app closes — it is cutting the same steps short. Either way the
+usual outcome is the one you want: the old `.exe` is renamed back under its own name and is what
+opens next time, and no `.old` is left beside it, because renaming it back is what uses that file
+up.
+
+It is not a promise, though, and the folder tells you which way it went. If Windows would not let
+the files move at all, the new, unproven version is still where Slate runs from, with the version
+you were on beside it as `Slate.exe.old` to rename over it. If Slate was ended between the two
+renames — rarest of all — nothing is there, and the version you were on is in that folder as
+`Slate.exe.old` to rename to `Slate.exe`. And if the old version went back by being copied rather
+than renamed, it is back under its own name, with the `.old` it was copied from beside it until
+you next start Slate, as above. `crash.log` in the data folder says which of those happened. A
+build made with plain `dotnet build` does not know which flavour it is, so it only ever offers the
+link.
 
 ## Carrying your setup around
 
