@@ -530,9 +530,9 @@ you were on beside it as `Slate.exe.old` to rename over it. If Slate was ended b
 renames — rarest of all — nothing is there, and the version you were on is in that folder as
 `Slate.exe.old` to rename to `Slate.exe`. And if the old version went back by being copied rather
 than renamed, it is back under its own name, with the `.old` it was copied from beside it until
-you next start Slate, as above. `crash.log` in the data folder says which of those happened. A
-build made with plain `dotnet build` does not know which flavour it is, so it only ever offers the
-link.
+you next start Slate, as above. `crash.log` in the data folder names the outcome whenever Slate
+was still running to write it down. A build made with plain `dotnet build` does not know which
+flavour it is, so it only ever offers the link.
 
 ## Carrying your setup around
 

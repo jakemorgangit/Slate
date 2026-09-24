@@ -23,7 +23,7 @@ public sealed class SelfUpdateException(string message, Exception? inner = null)
     /// its Failed and Interrupted takes this from it. Two throws in Swap word their own messages
     /// rather than being built there, and mark themselves by hand instead. The copy-back failure
     /// is the third of the three exactly. The other - Swap's opening step, which stops on a .old
-    /// it cannot delete - is that state when the .old is the one that failure left, and often
+    /// it cannot delete - is that state when the .old is the one that failure left, and sometimes
     /// nothing of the kind: an update whose cleanup was cut short leaves a .old that later
     /// launches leave alone, and anything holding that one open - a scanner reading it, say -
     /// is enough to stop the delete. This attempt has moved nothing at all then. Marked the same
@@ -580,8 +580,9 @@ public sealed class SelfUpdater
     /// <summary>
     /// True while Windows is waiting on this copy's answer to a sign-out or shutdown before it
     /// goes on. Read by work already under way on another thread - a rollback the sign-out
-    /// arrived in the middle of - so it can cut short every wait it was about to make; see
-    /// <see cref="RollBack"/>.
+    /// arrived in the middle of - so it can cut short the waits it was about to make. All but
+    /// <see cref="FillEmptyPath"/>'s: that one runs its whole budget and then copies regardless,
+    /// because filling an empty path outranks answering Windows. See <see cref="RollBack"/>.
     /// </summary>
     private static volatile bool _pressedToExit;
 
