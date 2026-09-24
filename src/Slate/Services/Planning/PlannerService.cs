@@ -652,12 +652,16 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// offer to take the note off with them. The project goes down beside the id because that
     /// is how the comment is addressed, and the project selected here can move on afterwards.
     ///
-    /// Every entry the comment covers gets it, not only the one that posted it. A day booked
-    /// in one pass posts a work item's note once and books several blocks behind it, and an id
-    /// on the posting entry alone would let that entry's undo delete a comment still speaking
-    /// for hours that are staying - and leave the rest with a note nothing here could ever take
-    /// off. Shared, the comment goes with the last of the hours it covers; see
-    /// <see cref="OthersSharingNote"/>, which is what tells an undo it is not the last.
+    /// This is the entry that posted it, written down once the discussion has answered with an
+    /// id. Every entry the comment covers carries it, not only that one: a day booked in one
+    /// pass posts a work item's note once and books several blocks behind it, and an id on the
+    /// posting entry alone would let that entry's undo delete a comment still speaking for
+    /// hours that are staying - and leave the rest with a note nothing here could ever take
+    /// off. The rest are stamped before their own write instead of afterwards, so a booking
+    /// Azure DevOps never confirms carries it too; see
+    /// <see cref="AppState.RecordTimeSilentAsync"/>. Shared, the comment goes with the last of
+    /// the hours it covers; see <see cref="OthersSharingNote"/>, which is what tells an undo it
+    /// is not the last.
     /// </summary>
     public void SetTimeNote(Guid entryId, int commentId, string project)
     {
@@ -682,14 +686,68 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// that may take the comment off without leaving hours behind it unexplained.
     ///
     /// Matched on the work item as well as the id: comment ids are numbered within a work item,
-    /// so the same small number belongs to a different comment on every other one.
+    /// so the same small number belongs to a different comment on every other one - and within
+    /// the entry's own organization, because a work item number means nothing outside it and
+    /// the ids are small and sequential, so an entry left over from a previous organization
+    /// would otherwise be counted as a sibling of hours it has nothing to do with.
+    ///
+    /// An entry that says nothing about where it came from is counted in, the way
+    /// <see cref="SameOrganizationAs"/> leaves it in everywhere: here the worse of the two
+    /// mistakes is missing a sibling, which is what lets a note come off the discussion while
+    /// the hours it also speaks for stand.
     /// </summary>
-    public IReadOnlyList<TimeEntry> OthersSharingNote(TimeEntry entry) =>
-        entry.CommentId <= 0
-            ? []
-            : [.. store.TimeEntries.Where(e => e.Id != entry.Id
-                                               && e.CommentId == entry.CommentId
-                                               && e.WorkItemId == entry.WorkItemId)];
+    public IReadOnlyList<TimeEntry> OthersSharingNote(TimeEntry entry)
+    {
+        if (entry.CommentId <= 0) return [];
+
+        var confined = SameOrganizationAs(entry);
+        return [.. store.TimeEntries.Where(e => e.Id != entry.Id
+                                                && e.CommentId == entry.CommentId
+                                                && e.WorkItemId == entry.WorkItemId
+                                                && confined(e))];
+    }
+
+    /// <summary>
+    /// Forgets a comment on every entry still carrying its id, once it has actually been taken
+    /// off the discussion by an undo of one of the entries it covered. The same match
+    /// <see cref="OthersSharingNote"/> makes, so exactly the entries that were named as sharing
+    /// it are the ones that stop claiming it.
+    ///
+    /// Without this those entries go on offering to remove a comment that has gone: their undo
+    /// would say the note also covers hours that are staying and turn the tick off to protect
+    /// it, which is a false reason once nothing is there. The text stays - it is what the hours
+    /// went on - so the dialog can still say why the note cannot come off.
+    ///
+    /// The project goes with the id because the two are one record: a project with no id to go
+    /// with addresses nothing.
+    /// </summary>
+    public void ForgetTimeNote(TimeEntry entry)
+    {
+        if (entry.CommentId <= 0) return;
+
+        var confined = SameOrganizationAs(entry);
+
+        // Through the store, under the lock a save holds: this follows an undo, which can be
+        // going on while a polling timer saves the plan on another thread.
+        var cleared = store.Edit(file =>
+        {
+            var any = false;
+
+            foreach (var other in file.TimeEntries)
+            {
+                if (other.Id == entry.Id || other.CommentId != entry.CommentId
+                    || other.WorkItemId != entry.WorkItemId || !confined(other)) continue;
+
+                other.CommentId = 0;
+                other.CommentProject = "";
+                any = true;
+            }
+
+            return any;
+        });
+
+        if (cleared) Persist();
+    }
 
     // ---------------------------------------------------------------- unconfirmed bookings
 
@@ -820,10 +878,38 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// that drive Completed Work to nothing from the same place identical.
     ///
     /// Only within the organization the write that landed belongs to, which
-    /// <paramref name="from"/> carries. A work item number and a revision mean nothing outside
-    /// one organization, so without that a booking made before a switch would be let go on the
-    /// strength of a revision of some other organization's #7 - and its hours could still be
-    /// sitting on the item it really went to.
+    /// <paramref name="from"/> carries - see <see cref="SameOrganizationAs"/>. A work item
+    /// number and a revision mean nothing outside one organization, so without that a booking
+    /// made before a switch would be let go on the strength of a revision of some other
+    /// organization's #7 - and its hours could still be sitting on the item it really went to.
+    ///
+    /// An overtaken pin left behind is the worse of the two mistakes here, which is why what
+    /// says nothing about where it came from is left in: a later check would find this write's
+    /// change sitting on the work item and file the same hours a second time.
+    /// </summary>
+    private static bool DropOvertaken(PlanFile file, TimeWritePlan landed, TimeEntry from)
+    {
+        var confined = SameOrganizationAs(from);
+
+        var dropped = file.UnconfirmedBookings.RemoveAll(
+            b => b.Plan is { } plan && Overtaken(plan, landed) && confined(b.Entry)) > 0;
+
+        foreach (var entry in file.TimeEntries)
+        {
+            if (entry.UnconfirmedUndo is not { } undo || !Overtaken(undo, landed)) continue;
+            if (!confined(entry)) continue;
+
+            entry.UnconfirmedUndo = null;
+            dropped = true;
+        }
+
+        return dropped;
+    }
+
+    /// <summary>
+    /// Whether another set of hours came from the same Azure DevOps organization as these -
+    /// the test every match on a work item number has to be confined by, because that number
+    /// means a different item in every other organization.
     ///
     /// An entry written before the stamp existed carries no organization at all, and an empty
     /// one matches everything - which is no confinement whatever. Those are judged on the work
@@ -831,12 +917,11 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
     /// two links to the same work item number from the same organization are the same address
     /// and one from another organization plainly is not.
     ///
-    /// Anything that says nothing about where it came from is left in, as everything was
-    /// before there was a stamp to go by. An overtaken pin left behind is the worse of the two
-    /// mistakes: a later check would find this write's change sitting on the work item and
-    /// file the same hours a second time.
+    /// Anything that still says nothing about where it came from is left in, as everything was
+    /// before there was a stamp to go by. Both callers want it that way: for an overtaken pin
+    /// and for a note two entries share, the mistake that costs something is leaving one out.
     /// </summary>
-    private static bool DropOvertaken(PlanFile file, TimeWritePlan landed, TimeEntry from)
+    private static Func<TimeEntry, bool> SameOrganizationAs(TimeEntry from)
     {
         var where = OrganizationRef.For(from.Organization, from.OrganizationId);
 
@@ -845,7 +930,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             ? TimeEntry.NormaliseOrganization(from.WorkItemUrl)
             : "";
 
-        bool Confined(TimeEntry entry)
+        return entry =>
         {
             if (here.Length == 0) return entry.BelongsTo(where);
 
@@ -858,21 +943,7 @@ public sealed class PlannerService(PlanStore store, GraphCalendarClient graph, S
             return there.Length == 0
                    || there == here
                    || here.StartsWith(there + "/", StringComparison.Ordinal);
-        }
-
-        var dropped = file.UnconfirmedBookings.RemoveAll(
-            b => b.Plan is { } plan && Overtaken(plan, landed) && Confined(b.Entry)) > 0;
-
-        foreach (var entry in file.TimeEntries)
-        {
-            if (entry.UnconfirmedUndo is not { } undo || !Overtaken(undo, landed)) continue;
-            if (!Confined(entry)) continue;
-
-            entry.UnconfirmedUndo = null;
-            dropped = true;
-        }
-
-        return dropped;
+        };
     }
 
     private static bool Overtaken(TimeWritePlan pending, TimeWritePlan landed) =>

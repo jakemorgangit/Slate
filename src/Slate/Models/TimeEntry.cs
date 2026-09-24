@@ -80,14 +80,16 @@ public sealed class TimeEntry
     /// went with them still stands reads as work that was done.
     ///
     /// One comment can be several entries' note. A day booked in one pass posts a work item's
-    /// note once however many of its blocks are booked, and every entry it covers is given the
-    /// same id - so the note comes off with the last of the hours it speaks for rather than
-    /// with whichever happened to post it. The undo that finds others still carrying the id
-    /// says what the comment also stands for before offering to delete it.
+    /// note once however many of its blocks are booked, and from this version on every entry it
+    /// covers is given the same id - so the note comes off with the last of the hours it speaks
+    /// for rather than with whichever happened to post it. The undo that finds others still
+    /// carrying the id says what the comment also stands for before offering to delete it.
     ///
-    /// Zero whenever there is no comment to remove, which is not the same as there being no
-    /// note: an entry written before this was kept has the text and no id, and so does one
-    /// whose note never reached the discussion.
+    /// Zero whenever there is nothing here to remove with, which is not the same as there being
+    /// no note: an entry written before this was kept has the text and no id, so does one
+    /// written while only the posting entry was given it, so does one whose note never reached
+    /// the discussion, and so does one whose comment has already gone with an earlier undo of
+    /// another block the same note covered.
     /// </summary>
     public int CommentId { get; set; }
 

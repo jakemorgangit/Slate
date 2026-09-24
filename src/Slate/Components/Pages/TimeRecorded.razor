@@ -607,9 +607,10 @@
     /// Answers for an undo Azure DevOps never confirmed, from what the work item itself says.
     /// The entry goes if it went through, and stands if it did not; no time is sent either way.
     ///
-    /// "It went through" drops the entry, and with it the only record of which comment its note
-    /// was, so it goes through the same dialog an Undo does and is offered the same tick. "It
-    /// never went through" leaves everything where it is and is answered on the spot.
+    /// "It went through" drops the entry, and with it what may be the last record of which
+    /// comment its note was, so it goes through the same dialog an Undo does and is offered the
+    /// same tick. "It never went through" leaves everything where it is and is answered on the
+    /// spot.
     /// </summary>
     private async Task AnswerUndo(TimeEntry entry, bool wentThrough)
     {

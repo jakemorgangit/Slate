@@ -248,19 +248,23 @@ Either way it asks first, with **Also remove the note from the work item's discu
 a note saying what the time went on is misleading once the hours are gone. The hours come off
 first and the comment only afterwards, so a delete Azure DevOps refuses is reported on its own
 and never puts the booking back. The tick is only offered when Slate knows which comment it
-posted and the entry belongs to the organization you are connected to; otherwise the dialog says
-why there is nothing it can remove. An undo Azure DevOps could not confirm removes nothing — the
-hours may still be on the work item, and the note with them.
+posted and which project it went under, and the entry belongs to the organization you are
+connected to; otherwise the dialog says why there is nothing it can remove. An undo Azure DevOps
+could not confirm removes nothing — the hours may still be on the work item, and the note with
+them.
 
 Recording a whole day posts a work item's note once however many of its blocks are booked, and
 every one of those entries carries that comment — so the note comes off with the **last** of the
 hours it covers. Undo one of them while the others stand and the dialog names what the note also
-speaks for and leaves the tick off; you can still tick it, knowing what it leaves behind.
+speaks for and leaves the tick off; you can still tick it, knowing what it leaves behind, and
+the entries left over stop claiming a comment that has gone. Days recorded by an earlier version
+of Slate did not write the comment down on every block of them, so there the dialog says the note
+cannot be removed rather than offering to.
 
 The same question is asked wherever an entry is dropped. An undo Azure DevOps never confirmed
 leaves two answers on the Time tab: **The undo did go through** drops the entry, so it asks and
-offers the same tick — that entry is the only record of which comment the note was — while **It
-never went through** changes nothing but the pin and asks nothing. The one entry that goes
+offers the same tick — that entry may be the last record of which comment the note was — while
+**It never went through** changes nothing but the pin and asks nothing. The one entry that goes
 without asking is one Slate settles by itself in the background: when it finds an unconfirmed
 undo really did land, the entry goes and the note stays. Nobody is there to be asked, and nothing
 is claimed about the comment.

@@ -1785,7 +1785,9 @@ public sealed class AppState(
     /// both, and the item should still get the comment once. The comment that was posted comes
     /// back for the caller to hand to the rest of the rows it speaks for, as
     /// <paramref name="shared"/> - one comment, the same id on every entry it covers, so it
-    /// only leaves the discussion with the last of those hours.
+    /// only leaves the discussion with the last of those hours. It goes onto the entry before
+    /// that row's own write is sent, so a row Azure DevOps never confirms is still filed
+    /// carrying it when it is settled; see <see cref="WriteTimeAsync"/>.
     /// </summary>
     public async Task<(TimeWriteOutcome Outcome, string? Error, TimeNote? Posted)> RecordTimeSilentAsync(
         Allocation allocation, double hours, bool reduceRemaining,
@@ -1798,23 +1800,14 @@ public sealed class AppState(
 
         try
         {
-            var (_, entry) = await WriteTimeAsync(allocation, hours, reduceRemaining, note);
+            // The note an earlier row of this run put on the discussion speaks for these hours
+            // too, so the write carries it onto the entry it makes before it is sent. A row
+            // that posts its own note has nothing to carry yet - its id comes back from the
+            // discussion afterwards.
+            var (_, entry) = await WriteTimeAsync(
+                allocation, hours, reduceRemaining, note, postNote ? null : shared);
 
-            TimeNote? posted = null;
-            if (postNote)
-            {
-                posted = await PostTimeNoteAsync(allocation, note, noteFormat, entry.Id);
-            }
-            else if (shared is { CommentId: > 0 } already)
-            {
-                // The note is already on the discussion from an earlier row of this run and it
-                // speaks for these hours too, so this entry is written down carrying the same
-                // comment. Quietly, like every other plan step around a time write: the hours
-                // are on the work item and a plan file that will not take the id must not turn
-                // that into a failure.
-                PinQuietly(() => planner.SetTimeNote(entry.Id, already.CommentId, already.Project),
-                    allocation.WorkItemId);
-            }
+            var posted = postNote ? await PostTimeNoteAsync(allocation, note, noteFormat, entry.Id) : null;
 
             Changed?.Invoke();
             _ = RefreshWorkItemAsync(allocation.WorkItemId);
@@ -1940,9 +1933,19 @@ public sealed class AppState(
     /// The entry comes back beside the result so the note posted afterwards can be written
     /// onto the very entry these hours made, which is what lets an undo of them offer to
     /// take the note off too.
+    ///
+    /// <paramref name="shared"/> is a note already on the discussion that these hours are
+    /// covered by as well - the rest of a day recorded in one pass. It goes onto the entry
+    /// here, before the send, rather than onto the filed entry afterwards: a write Azure
+    /// DevOps never answers for leaves this entry standing as an unconfirmed booking, and the
+    /// settle files it exactly as it is. Stamped after the answer instead, those hours would
+    /// be filed carrying no comment, the sharing would be invisible to every other entry's
+    /// undo, and the note would come off the discussion with hours still on the work item.
+    /// Nothing escapes that way either: a booking that turns out never to have landed is let
+    /// go rather than filed, so the id only ever survives on hours that are really there.
     /// </summary>
     private async Task<(TimeRecordResult Result, TimeEntry Entry)> WriteTimeAsync(
-        Allocation allocation, double hours, bool reduceRemaining, string note)
+        Allocation allocation, double hours, bool reduceRemaining, string note, TimeNote? shared = null)
     {
         // A booking from this block that nothing has settled may be on the work item already,
         // so more hours on top of it are exactly how the same time goes on twice. Refused here
@@ -1951,10 +1954,15 @@ public sealed class AppState(
         // it, by a check or by hand, is the way out.
         if (planner.HasUnconfirmed(allocation.Id)) throw new BlockUnsettledException();
 
-        var pending = new UnconfirmedBooking
+        var entry = planner.BuildTimeEntry(allocation, CurrentOrganization, hours, reduceRemaining, comment: note);
+
+        if (shared is { CommentId: > 0 } already)
         {
-            Entry = planner.BuildTimeEntry(allocation, CurrentOrganization, hours, reduceRemaining, comment: note),
-        };
+            entry.CommentId = already.CommentId;
+            entry.CommentProject = already.Project;
+        }
+
+        var pending = new UnconfirmedBooking { Entry = entry };
 
         TimeRecordResult result;
         try
@@ -2054,7 +2062,13 @@ public sealed class AppState(
             if (settled.LandedMinutes > 0)
                 toasts.Success($"{Ui.Hours(settled.LandedMinutes)} did go on #{workItemId}",
                     "It is recorded here now as well."
-                    + (settled.UnpostedNote ? " Its note is kept on the entry; it was not posted to the discussion." : ""));
+                    + (settled.SharedNote
+                        ? " Its note is already on the discussion: it went on with another block of the same day."
+                        : "")
+                    + (settled.UnpostedNote
+                        ? " Its note is kept on the entry; nothing was posted to the discussion for it just now, " +
+                          "so look at the work item if that note should be on it."
+                        : ""));
 
             if (settled.Elsewhere is { } elsewhere)
                 toasts.Error($"That booking on #{workItemId} is not from this organization", elsewhere);
@@ -2431,8 +2445,9 @@ public sealed class AppState(
     /// "It went through" drops the entry, so it takes <paramref name="removeNote"/> the way an
     /// undo does, and in the same order: the hours are off the work item by the user's own
     /// account of it before anything here runs, the entry goes, and only then the comment. It
-    /// is the last chance to remove it - the entry is the only record of which comment the note
-    /// was. "It never went through" changes nothing but the pin and asks nothing.
+    /// may well be the last chance to remove it - unless the note was posted for a whole day at
+    /// once, this entry is the only record of which comment it was. "It never went through"
+    /// changes nothing but the pin and asks nothing.
     /// </summary>
     public async Task<bool> AnswerUnconfirmedUndoAsync(Guid entryId, bool wentThrough, bool removeNote = false)
     {
@@ -2454,7 +2469,28 @@ public sealed class AppState(
 
         try
         {
-            if (planner.FindTimeEntry(entryId) is not { UnconfirmedUndo: { } plan } entry) return false;
+            // Both of these are ordinary: nothing is claimed while the prompt is merely open,
+            // so the quiet settle - or another undo of the same work item landing and sweeping
+            // the pin - can answer for this one between the question being asked and the button
+            // being pressed. Said out loud rather than closed in silence, because the button
+            // that was pressed reads "Drop it and remove the note".
+            if (planner.FindTimeEntry(entryId) is not { } entry)
+            {
+                toasts.Info("That undo had already been settled",
+                    "Its entry is gone, so there was nothing left to drop. Nothing was sent to Azure DevOps and "
+                    + "no note was taken off the discussion from here: remove the comment in Azure DevOps if "
+                    + "those hours left one that should not stand.");
+                return false;
+            }
+
+            if (entry.UnconfirmedUndo is not { } plan)
+            {
+                toasts.Info($"That undo on #{entry.WorkItemId} had already been answered for",
+                    "Something else settled it first, and those hours are still recorded here - Undo works on "
+                    + "them again. Nothing was sent to Azure DevOps, and no note was taken off the discussion "
+                    + "from here.");
+                return false;
+            }
 
             if (WrongConnection(entry) is { } elsewhere)
             {
@@ -2470,7 +2506,17 @@ public sealed class AppState(
                 return false;
             }
 
-            if (!planner.SettleUnconfirmedUndo(entryId, plan, wentThrough)) return false;
+            // The same two races again, caught inside the save that acts on the pin: by now
+            // either the entry has gone or the pin has been swept, and which of the two is only
+            // knowable in there, so this says what is true of both.
+            if (!planner.SettleUnconfirmedUndo(entryId, plan, wentThrough))
+            {
+                toasts.Info($"That undo on #{entry.WorkItemId} was settled while you were answering",
+                    "Something else answered for it first, so nothing here was changed: those hours are either "
+                    + "gone from the Time tab already or still recorded there. Nothing was sent to Azure DevOps, "
+                    + "and no note was taken off the discussion from here.");
+                return false;
+            }
 
             if (wentThrough)
             {
@@ -2605,8 +2651,17 @@ public sealed class AppState(
     /// reason the first booking from another organization could not be looked at, when there
     /// was one; those are counted in <see cref="Unsure"/> as well, because nothing about them
     /// has been settled either.
+    ///
+    /// <see cref="UnpostedNote"/> and <see cref="SharedNote"/> are what can be said about a
+    /// settled booking's note, and they are told apart because they are opposite news: hours
+    /// filed carrying a comment id are covered by a note that is on the discussion already,
+    /// while hours filed with the text and no id may have nothing there at all. Which of the
+    /// two the second one is cannot be known from here - a booking made before the row that
+    /// posted the day's note also ends up with the text and no id - so the toast says what this
+    /// check did rather than what is on the work item.
     /// </summary>
-    private sealed record BlockSettlement(int LandedMinutes, int Unsure, string? Elsewhere, bool UnpostedNote);
+    private sealed record BlockSettlement(
+        int LandedMinutes, int Unsure, string? Elsewhere, bool UnpostedNote, bool SharedNote);
 
     /// <summary>
     /// Settles what can be settled of one block's unconfirmed bookings. The caller claims the
@@ -2618,6 +2673,7 @@ public sealed class AppState(
         var unsure = 0;
         string? elsewhere = null;
         var unpostedNote = false;
+        var sharedNote = false;
 
         foreach (var booking in bookings)
         {
@@ -2647,13 +2703,24 @@ public sealed class AppState(
             if (planner.SettleUnconfirmed(booking, landed.Value) && landed.Value)
             {
                 landedMinutes += booking.Entry.Minutes;
-                unpostedNote |= booking.Entry.Comment.Length > 0;
+
+                // A booking carrying a comment id was covered by a note another block of the
+                // same day had already posted, so its note is on the discussion however this
+                // one ended. One with the text and no id is a note this check has deliberately
+                // not posted - arriving this late, whether it is still wanted is the user's
+                // call - and may be one no row of that day ever got as far as posting.
+                if (booking.Entry.Comment.Length > 0)
+                {
+                    if (booking.Entry.CommentId > 0) sharedNote = true;
+                    else unpostedNote = true;
+                }
+
                 _ = RefreshWorkItemAsync(booking.Entry.WorkItemId);
             }
         }
 
         Changed?.Invoke();
-        return new BlockSettlement(landedMinutes, unsure, elsewhere, unpostedNote);
+        return new BlockSettlement(landedMinutes, unsure, elsewhere, unpostedNote, sharedNote);
     }
 
     /// <summary>
@@ -2765,6 +2832,18 @@ public sealed class AppState(
             var removal = await ado.DeleteCommentAsync(entry.WorkItemId, entry.CommentProject, entry.CommentId);
             if (removal != CommentRemoval.Removed) return NoteRemoval.NotThere;
 
+            // The comment is off the discussion, so any entries that shared it are carrying an
+            // id that addresses nothing. Forgotten here rather than left for their own undo to
+            // find out: while it stands, each of those dialogs goes on saying the note also
+            // covers hours that are staying and turns the tick off to protect a comment that
+            // has already gone. Quietly, like every other plan step around a time write - the
+            // comment is gone whatever the plan file does about it.
+            //
+            // Only for a removal. A 404 is not one: the comment may be standing under a
+            // project this did not look in, and those entries' own deletes answer for it the
+            // same honest way this one just did.
+            PinQuietly(() => planner.ForgetTimeNote(entry), entry.WorkItemId);
+
             if (DetailWorkItemId == entry.WorkItemId)
                 Comments = [.. Comments.Where(c => c.Id != entry.CommentId)];
 
@@ -2801,7 +2880,8 @@ public sealed class AppState(
         /// <summary>
         /// An undo Azure DevOps never confirmed, which the user has looked at the work item and
         /// says did go through. No time is written - by that account it is already off - but
-        /// the entry goes, and with it the only record of which comment its note was.
+        /// the entry goes, and with it what may be the last record of which comment its note
+        /// was: only a note posted for a whole day at once is written down anywhere else.
         /// </summary>
         SettleGone,
     }
@@ -2814,10 +2894,11 @@ public sealed class AppState(
     /// the write path refuses by, so the dialog can say so instead of offering a button that
     /// could only be turned down.
     ///
-    /// <see cref="CanRemoveNote"/> holds when Slate knows which comment it posted and the undo
-    /// is not refused. Anything else and the offer is not made rather than made and then
-    /// refused - <see cref="NoteKept"/> then says why, for the case where there is plainly a
-    /// note and somebody would otherwise expect the offer.
+    /// <see cref="CanRemoveNote"/> holds when Slate knows which comment it posted and which
+    /// project it went under - both address it - and the undo is not refused. Anything else and
+    /// the offer is not made rather than made and then refused - <see cref="NoteKept"/> then
+    /// says why, for the case where there is plainly a note and somebody would otherwise expect
+    /// the offer.
     ///
     /// <see cref="NoteShared"/> is set when that one comment is also the note of hours that are
     /// staying, which is what a day booked in one pass makes of a work item with two blocks. The
@@ -2850,7 +2931,7 @@ public sealed class AppState(
     /// The same question for the other answer that drops an entry: an undo Azure DevOps never
     /// confirmed, which the user has looked at the work item and says went through. The hours
     /// are off by their own account at that moment, so the note is in exactly the position it
-    /// is in after any other undo - and the entry about to be dropped is the only record of
+    /// is in after any other undo - and the entry about to be dropped may be the last record of
     /// which comment it is.
     /// </summary>
     public void BeginSettleUndoWentThrough(TimeEntry entry) => BeginUndoPrompt(entry, UndoAsk.SettleGone);
@@ -2870,7 +2951,11 @@ public sealed class AppState(
         // than a copy a page has been holding since it last rendered.
         var current = planner.FindTimeEntry(entry.Id) ?? entry;
         var refused = WrongConnection(current);
-        var canRemoveNote = current.CommentId > 0 && refused is null;
+
+        // The project as well as the id: a comment is addressed by both, and the delete refuses
+        // an empty project outright rather than guessing at one. Offering a tick that could only
+        // fail is exactly what this prompt exists to avoid.
+        var canRemoveNote = current is { CommentId: > 0, CommentProject.Length: > 0 } && refused is null;
 
         // Only worth asking about when the offer is actually there.
         var noteShared = canRemoveNote ? WhyNoteShared(planner.OthersSharingNote(current)) : null;
@@ -2907,14 +2992,31 @@ public sealed class AppState(
     /// posted, so there is nothing to explain.
     ///
     /// Worded without claiming the comment is still there, because nothing here knows: an
-    /// entry with a note and no id never had one to point at in the first place.
+    /// entry with a note and no id may never have had one to point at in the first place.
+    ///
+    /// Every way an entry can end up with the text and no id is named, because from here they
+    /// look identical: a plan written before the id was kept at all; a plan written when only
+    /// the row that posted the note was given it; a booking of a day recorded in one pass that
+    /// Azure DevOps never confirmed, whose write went out before the note went on with another
+    /// block; a note the discussion turned down; and hours whose comment has already gone with
+    /// an earlier undo of another block it covered, which is the one of them where what became
+    /// of the comment is known.
+    ///
+    /// An id with no project is its own case and is not lumped in with those: the comment is
+    /// known, and what is missing is the project that addresses it.
     /// </summary>
     private static string? WhyNoteKept(TimeEntry entry) =>
         entry.Comment.Length == 0
             ? null
-            : "Slate did not write down which comment this note was posted as, so it cannot take it off: "
-              + "the entry was recorded by an older version of Slate, or the note never reached the "
-              + "discussion. If a comment for it is still there, remove it in Azure DevOps.";
+            : entry.CommentId > 0
+                ? "Slate wrote down which comment this note was posted as but not the project it went "
+                  + "under, and a comment can only be addressed through its project, so it cannot take "
+                  + "it off. Remove the comment in Azure DevOps if it should not stand."
+                : "Slate did not write down which comment this note was posted as, so it cannot take it off: "
+                  + "the entry was recorded by an older version of Slate, the note went on with another "
+                  + "block of the same day, the comment was removed with an earlier undo of the same note, "
+                  + "or it never reached the discussion. If a comment for it is still there, remove it in "
+                  + "Azure DevOps.";
 
     public void CancelUndoTimeEntry()
     {

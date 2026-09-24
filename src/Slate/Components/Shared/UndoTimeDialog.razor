@@ -145,7 +145,16 @@
     /// </summary>
     private AppState.UndoPrompt? _askedAbout;
 
-    protected override void OnInitialized() => State.Changed += OnChanged;
+    protected override void OnInitialized()
+    {
+        State.Changed += OnChanged;
+
+        // Straight away as well as on every change: an instance created while a prompt is
+        // already open would otherwise render the tick from its default until the next one,
+        // and the default is not what a shared note asks for. Already on the renderer's own
+        // thread here, which is where the tick is read from.
+        SyncTick();
+    }
 
     /// <summary>
     /// Everything this touches is touched on the renderer's own thread. <c>Changed</c> is raised
@@ -154,6 +163,18 @@
     /// be a write racing a read.
     /// </summary>
     private void OnChanged() => InvokeAsync(() =>
+    {
+        SyncTick();
+        StateHasChanged();
+    });
+
+    /// <summary>
+    /// Sets the tick up for whatever is being asked about now, once per prompt: ticked wherever
+    /// the note can be removed, except where that one comment is also the note of hours that
+    /// are staying. Left alone for the prompt it was already set up for, so a change of
+    /// anything else does not undo what the user has just clicked.
+    /// </summary>
+    private void SyncTick()
     {
         if (State.UndoingPrompt is { } prompt)
         {
@@ -167,9 +188,7 @@
         {
             _askedAbout = null;
         }
-
-        StateHasChanged();
-    });
+    }
 
     public void Dispose() => State.Changed -= OnChanged;
 
