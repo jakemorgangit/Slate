@@ -424,7 +424,17 @@
             </button>
             @if (Plan.LatestEntryForBlock(block.Allocation.Id) is { } lastEntry)
             {
-                <button title="Take this booking back off the work item in Azure DevOps"
+                @* Off for hours booked against an organization Slate is not on: #7 over there
+                   is a different work item, so the undo is refused the moment it is asked for.
+                   Said in the item rather than found out by pressing it, and the way out comes
+                   from the same place the Time tab's does, so the two cannot disagree about
+                   whether there is one. *@
+                var organization = State.CurrentOrganization;
+                var canUndo = lastEntry.BelongsTo(organization);
+                <button disabled="@(!canUndo)"
+                        title="@(canUndo
+                                 ? "Take this booking back off the work item in Azure DevOps"
+                                 : AppState.WhyUndoIsOff(lastEntry, organization, onTimeTab: false))"
                         @onclick="() => UndoRecordedTime(lastEntry)">
                     <span class="glyph">↺</span> Undo recorded time (@Ui.DecimalHours(lastEntry.Minutes)h)
                 </button>

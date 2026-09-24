@@ -106,16 +106,17 @@ public sealed record WorkItemFieldValue(string Name, string DisplayName, string 
 
 public sealed record WorkItemRelation(string Kind, string Title, string Url, int? WorkItemId);
 
-/// <summary>Outcome of writing time back to Azure DevOps.</summary>
 /// <summary>
 /// What a work item's time fields now read, and what was actually applied to get there -
-/// which is not always what was asked for, because both fields clamp at zero.
+/// which is not always what was asked for, because both fields clamp at zero. The plan is
+/// the write that landed, when one was sent.
 /// </summary>
 public sealed record TimeRecordResult(
     double CompletedWork,
     double RemainingWork,
     double AppliedCompleted = 0,
-    double AppliedRemaining = 0);
+    double AppliedRemaining = 0,
+    TimeWritePlan? Plan = null);
 
 /// <summary>One entry in a work item's discussion.</summary>
 public sealed record WorkItemComment(

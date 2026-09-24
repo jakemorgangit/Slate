@@ -7,7 +7,9 @@
 @inject PlannerService Plan
 @inject ToastService Toasts
 
-@if (State.RecordingFor is { } allocation)
+@* Shown only while a block is asked for, and then for the block the form belongs to - which is
+   the one asked for except while a save for another block is still running. *@
+@if (Shown is { } allocation)
 {
     <div class="modal-scrim" @onclick="Cancel">
         <div class="modal narrow" @onclick:stopPropagation="true">
@@ -25,6 +27,90 @@
             </div>
 
             <div class="modal-body">
+                @* A booking from this block that Azure DevOps never confirmed. It may already be
+                   on the work item, so Record stays off until it is settled - pressing it again
+                   is exactly how the same hours would go on twice.
+
+                   Split the way the Time tab splits it, and for the same reason: a block can
+                   hold a booking made before an organization was switched and one made after,
+                   and every action here is offered on the ones it would actually be allowed
+                   for. Nothing offered and then refused, and nothing withheld that would work. *@
+                @if (State.UnsettledFor(allocation.Id) is { } unconfirmed)
+                {
+                    <div class="banner error">
+                        <span>!</span>
+                        <div class="grow">
+                            @if (_unconfirmed)
+                            {
+                                <div>Azure DevOps did not confirm this booking, and a look at the work item
+                                    afterwards could not settle whether it went on.</div>
+                            }
+                            else
+                            {
+                                <div><strong>@Ui.Duration(unconfirmed.Minutes)</strong> booked from
+                                    this block @Ui.Ago(unconfirmed.Latest.RecordedAt) was never confirmed by Azure DevOps.</div>
+                            }
+                            @if (unconfirmed.Elsewhere is { } where)
+                            {
+                                <div>
+                                    @(unconfirmed.AllElsewhere ? "It was booked" : "Part of it was booked")
+                                    against <span class="mono">@where</span>, @unconfirmed.ElsewhereWhy, so nothing
+                                    here can settle @(unconfirmed.AllElsewhere ? "it" : "that part").
+                                </div>
+                            }
+                            <div>It may already be on #@allocation.WorkItemId, so nothing more can be recorded
+                                from this block until that is settled.</div>
+                            <div class="row" style="margin-top: 8px; gap: 6px">
+                                @if (!unconfirmed.AllElsewhere)
+                                {
+                                    <button class="btn btn-sm" disabled="@(_saving || _checking)" @onclick="CheckAsync">
+                                        @if (_checking)
+                                        {
+                                            <span class="spinner"></span>
+                                            <span>Checking…</span>
+                                        }
+                                        else
+                                        {
+                                            <span>Check again</span>
+                                        }
+                                    </button>
+                                }
+                                @if (WorkItemUrl(allocation) is { Length: > 0 } url)
+                                {
+                                    <button class="btn btn-sm btn-ghost" title="Open the work item in Azure DevOps"
+                                            @onclick="() => SystemShell.OpenUrl(url)">Open #@allocation.WorkItemId ↗</button>
+                                }
+                                @* The one way out of a booking made against an organization this
+                                   connection is not on: it cannot be checked or answered for
+                                   here, and a renamed or moved organization has no old address
+                                   to switch back to. Only re-stamps the ones that are refused,
+                                   and only while Azure DevOps' own ids leave the claim open -
+                                   where they do not, the press could only come back refused. *@
+                                @if (unconfirmed.CanAdopt)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                            title="@AppState.AdoptBookingTitle"
+                                            @onclick="AdoptAsync">Same organization - settle it here</button>
+                                }
+                                @* The way out of a booking Azure DevOps will never settle, in both
+                                   directions: whichever way the work item reads, the user can say so
+                                   and Slate writes it down. Offered only once no send of it could
+                                   still be arriving, so an answer cannot be overtaken by the change
+                                   landing a moment later. *@
+                                @if (unconfirmed.CanBeLetGo)
+                                {
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                            title="Only once you have looked at the work item and these hours are on it. Nothing is written to Azure DevOps; the booking is simply recorded here as it stands."
+                                            @onclick="FileIt">It did go on</button>
+                                    <button class="btn btn-sm btn-ghost" disabled="@(_saving || _checking)"
+                                            title="Only once you have looked at the work item and these hours are not on it. Nothing is written to Azure DevOps; Slate simply stops waiting, and the block can be recorded again."
+                                            @onclick="LetGo">Never went on</button>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                }
+
                 <div class="field">
                     <label for="hours">Hours to record</label>
                     <input id="hours" class="input" type="number" step="0.25" min="0.25" max="24"
@@ -124,11 +210,15 @@
                     </div>
                 }
 
-                @if (allocation.RecordedMinutes > 0)
+                @* What this machine has actually booked from this block. Read from the entries,
+                   which is where recording has lived since it stopped being a running total on
+                   the block - Allocation.RecordedMinutes is only kept to migrate old plans from,
+                   and is zeroed the moment one is read, so it never had anything to say here. *@
+                @if (Plan.RecordedMinutesForBlock(allocation.Id) is > 0 and var recordedHere)
                 {
                     <p class="muted" style="font-size: 12px">
-                        @Ui.Duration(allocation.RecordedMinutes) has already been recorded from this block
-                        (@Ui.Ago(allocation.LastRecordedAt)).
+                        @Ui.Duration(recordedHere) has already been recorded from this block
+                        (@Ui.Ago(Plan.LatestEntryForBlock(allocation.Id)?.RecordedAt)).
                     </p>
                 }
             </div>
@@ -137,7 +227,7 @@
                 <span class="muted" style="font-size: 11.5px">Writes to Azure DevOps straight away.</span>
                 <span style="flex: 1"></span>
                 <button class="btn" @onclick="Cancel">Cancel</button>
-                <button class="btn btn-primary" disabled="@(_saving || _hours <= 0)" @onclick="SaveAsync">
+                <button class="btn btn-primary" disabled="@(_saving || _checking || Blocked || _hours <= 0)" @onclick="SaveAsync">
                     @if (_saving)
                     {
                         <span class="spinner on-accent"></span>
@@ -161,7 +251,37 @@
     private string _note = "";
     private string? _newState;
     private bool _saving;
-    private Guid _openedFor;
+    private bool _checking;
+
+    /// <summary>The block the form was seeded for, or null while the dialog is shut.</summary>
+    private Allocation? _openedFor;
+
+    /// <summary>What this machine had booked on the block when the form was seeded - what the
+    /// hours offered were chosen against, and so what a save checks is still true.</summary>
+    private int _recordedAtOpen;
+
+    /// <summary>This opening's own save ended without Azure DevOps confirming it.</summary>
+    private bool _unconfirmed;
+
+    /// <summary>
+    /// Record stays off while the block has a booking nothing has settled, whichever opening
+    /// or dialog made it: pressing it is exactly how the same hours would go on twice, and the
+    /// hours come prefilled, so it is one click away. A later opening is no safer than the one
+    /// the booking came from - the work item has not changed in between - so it is the block's
+    /// state that decides, not this opening's. <see cref="_unconfirmed"/> only chooses which
+    /// way the banner is worded. Settling it, by a check or by hand, is the way out.
+    /// </summary>
+    private bool Blocked => Shown is { } a && Plan.HasUnconfirmed(a.Id);
+
+    /// <summary>
+    /// The block on screen: the one asked for, except while a save or a check for another
+    /// block - closed and then reopened elsewhere - is still running. Its form stays up until
+    /// that ends, so everything shown has to be about its block, not the one just asked for.
+    /// </summary>
+    private Allocation? Shown =>
+        State.RecordingFor is { } requested
+            ? _openedFor is { } seeded && seeded.Id != requested.Id ? seeded : requested
+            : null;
 
     /// <summary>
     /// The states this work item could move to. Empty until they arrive, or for good if the
@@ -208,30 +328,57 @@
     };
 
     private double BlockHours =>
-        State.RecordingFor is { } a ? Math.Round(a.DurationMinutes / 60.0, 2) : 1;
+        Shown is { } a ? Math.Round(a.DurationMinutes / 60.0, 2) : 1;
 
     private WorkItem? Current =>
-        State.RecordingFor is { } a ? State.WorkItems.FirstOrDefault(i => i.Id == a.WorkItemId) : null;
+        Shown is { } a ? State.WorkItems.FirstOrDefault(i => i.Id == a.WorkItemId) : null;
+
+    private string WorkItemUrl(Allocation allocation) =>
+        Current?.Url is { Length: > 0 } url ? url : allocation.WorkItemUrl;
 
     protected override void OnInitialized() => State.Changed += OnChanged;
 
     protected override void OnParametersSet() => Prime();
 
-    /// <summary>Seeds the form the first time a given block opens the dialog.</summary>
+    /// <summary>
+    /// Seeds the form once per opening, not on every re-render.
+    ///
+    /// Never under a save or a check that is still running: seeding again would free the
+    /// Record button while the first write is still out, and a second press would book the
+    /// block twice. Whichever is running primes once it ends, which is when a close or a
+    /// reopen made meanwhile takes effect. "Once per opening" is decided here rather than by
+    /// whichever button closed it, because Escape closes it from the page's shortcuts, which
+    /// never reach this component.
+    /// </summary>
     private void Prime()
     {
-        if (State.RecordingFor is not { } allocation) return;
-        if (_openedFor == allocation.Id) return;
+        if (_saving || _checking) return;
 
-        _openedFor = allocation.Id;
+        if (State.RecordingFor is not { } allocation)
+        {
+            _openedFor = null;
+            return;
+        }
+
+        if (_openedFor?.Id == allocation.Id)
+        {
+            // Time undone from this block while the form sits open leaves less on it than the
+            // form was seeded against. The save guards against hours booked on top of what was
+            // there, not against hours taken off it, so the mark comes down with them.
+            _recordedAtOpen = Math.Min(_recordedAtOpen, Plan.RecordedMinutesForBlock(allocation.Id));
+            return;
+        }
+
+        _openedFor = allocation;
         _hours = Math.Max(0.25, BlockHours);
         _reduceRemaining = Settings.Current.Planning.ReduceRemainingOnRecord;
+        _recordedAtOpen = Plan.RecordedMinutesForBlock(allocation.Id);
+        _unconfirmed = false;
 
         // Deliberately empty rather than seeded from the block's notes: those were written
         // for the plan, and posting them to a discussion is not something anyone asked for.
         _note = "";
         _newState = null;
-        _saving = false;
 
         // Ask for the states this type can take, so the row is ready by the time it is wanted.
         if (State.CanEditWorkItems && Current is { } item)
@@ -262,15 +409,25 @@
             _hours = Math.Clamp(Math.Round(parsed, 2), 0, 24);
     }
 
-    private void Cancel()
-    {
-        _openedFor = Guid.Empty;
-        State.CancelRecordTime();
-    }
+    /// <summary>Closing is the same whichever way it happens - <see cref="Prime"/> forgets the
+    /// form once the dialog is shut, or once a save still running behind it has ended.</summary>
+    private void Cancel() => State.CancelRecordTime();
 
     private async Task SaveAsync()
     {
-        if (State.RecordingFor is not { } allocation || _saving || _hours <= 0) return;
+        if (_saving || _checking || Blocked || _hours <= 0 || Shown is not { } allocation) return;
+
+        // The hours were chosen against what was booked on the block when this opened.
+        // Anything booked on it since - by a Record day pass carrying on behind a closed
+        // dialog, say - means they may be for time that is already on the work item. Only
+        // more, though: an entry undone meanwhile takes nothing away from these hours, and
+        // refusing over that would be a dead end until the dialog was opened again.
+        if (Plan.RecordedMinutesForBlock(allocation.Id) > _recordedAtOpen)
+        {
+            Toasts.Error("Could not record that time",
+                "More time was recorded on this block while this was open. Close it and open it again to see what is there now.");
+            return;
+        }
 
         _saving = true;
         try
@@ -279,10 +436,16 @@
             if (Settings.Current.Planning.ReduceRemainingOnRecord != _reduceRemaining)
                 Settings.Update(s => s.Planning.ReduceRemainingOnRecord = _reduceRemaining);
 
-            if (!await State.RecordTimeAsync(allocation, _hours, _reduceRemaining, _note, NoteFormat))
+            var outcome = await State.RecordTimeAsync(allocation, _hours, _reduceRemaining, _note, NoteFormat);
+            if (outcome != TimeWriteOutcome.Recorded)
+            {
+                _unconfirmed = outcome == TimeWriteOutcome.Unconfirmed;
                 return;
+            }
 
-            _openedFor = Guid.Empty;
+            // This opening is over. Reopened while the state change below is still going, the
+            // form is seeded afresh once it ends rather than coming back with these hours in.
+            _openedFor = null;
 
             // Only once the hours are actually on the work item: a state change is what the
             // team reads as "this is done", and it should not run ahead of the booking.
@@ -292,6 +455,92 @@
         finally
         {
             _saving = false;
+            Prime();
         }
+    }
+
+    /// <summary>
+    /// Looks again for this block's unconfirmed bookings, without writing anything. A check
+    /// that files an entry closes the dialog, whichever opening the booking came from: the
+    /// hours in the box were chosen against a block that had none of it, so leaving the form
+    /// up - Record enabled, the same hours still in it - is one press away from booking them
+    /// a second time. Record day's row goes the same way, to Recorded and unticked.
+    ///
+    /// Nothing is rebased here. A check that could not settle everything leaves the guard in
+    /// <see cref="SaveAsync"/> armed against whatever it did file, so the next Record is
+    /// refused rather than added on top.
+    /// </summary>
+    private async Task CheckAsync()
+    {
+        if (_saving || _checking || Shown is not { } allocation) return;
+
+        _checking = true;
+        try
+        {
+            var outcome = await State.CheckUnconfirmedAsync(allocation.Id);
+
+            if (outcome == TimeWriteOutcome.Recorded)
+            {
+                // Forgotten first, so a dialog reopened for another block while this ran is
+                // seeded for that one rather than coming back with these hours in.
+                _openedFor = null;
+                if (State.RecordingFor?.Id == allocation.Id) State.CancelRecordTime();
+                return;
+            }
+
+            // Null is "there was nothing left to check", not "nothing landed": the quiet
+            // settle had already been through it. Either way this opening's own booking is
+            // no longer outstanding, and the banner has gone with it.
+            if (outcome != TimeWriteOutcome.Unconfirmed) _unconfirmed = false;
+        }
+        finally
+        {
+            _checking = false;
+            Prime();
+        }
+    }
+
+    /// <summary>
+    /// Stops waiting on a booking that never went on. Nothing is filed and nothing is sent,
+    /// so the hours in the box are still what is left on this block and the guard in
+    /// <see cref="SaveAsync"/> still holds - Record simply becomes available again.
+    /// </summary>
+    private void LetGo()
+    {
+        if (_saving || _checking || Shown is not { } allocation) return;
+        if (State.LetGoUnconfirmed(allocation.Id)) _unconfirmed = false;
+    }
+
+    /// <summary>
+    /// Takes this block's refused bookings as this organization's, when the user says they
+    /// are. The way out of the one refusal there is otherwise no way out of from here: an
+    /// organization that was renamed or moved has no old address left to switch back to.
+    ///
+    /// Only re-stamps them, and only the ones actually refused. Nothing is sent and nothing
+    /// is settled, so the banner stays and the check and the two answers - which still decide
+    /// - simply become available for them.
+    ///
+    /// Awaited because the claim is put to Azure DevOps first where its id is not already
+    /// known, and refused there if the service has already answered it.
+    /// </summary>
+    private async Task AdoptAsync()
+    {
+        if (_saving || _checking || Shown is not { } allocation) return;
+        await State.AdoptOrganizationForBlockAsync(allocation.Id);
+    }
+
+    /// <summary>
+    /// Files a booking the user has confirmed by eye. That is this opening over, the same way
+    /// a check that found the hours is: they are on the work item and recorded here now, and
+    /// the form still offers the block's full hours, which is one press from booking them
+    /// again.
+    /// </summary>
+    private void FileIt()
+    {
+        if (_saving || _checking || Shown is not { } allocation) return;
+        if (!State.FileUnconfirmed(allocation.Id)) return;
+
+        _openedFor = null;
+        if (State.RecordingFor?.Id == allocation.Id) State.CancelRecordTime();
     }
 }
