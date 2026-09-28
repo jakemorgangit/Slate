@@ -404,6 +404,62 @@
                 </div>
 
                 <div class="field">
+                    <label>Migrating a work item</label>
+                    <span class="hint">
+                        When an area or a project becomes the old one, <strong>Migrate…</strong> &mdash; on the
+                        right-click menu of a card in the Plan sidebar, on a row of the Work items table, and in
+                        the work item window &mdash; copies a work item into its new home. Choose the project,
+                        the area from that project's own tree, and the type (the one it already is, unless the
+                        target project has no such type, in which case you pick). The second page lists
+                        <em>everything</em> that is about to happen before a single thing is written: each field
+                        going over with its value, the comments, every attachment with its size, the parent and
+                        children that will be referenced, and a line for each thing that is not being copied with
+                        the reason why.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>What a migration does, in order</label>
+                    <span class="hint">
+                        The copy is raised first. Then the discussion &mdash; each comment led by who wrote it and
+                        when, because Azure DevOps records <em>you</em> as the author of anything posted through an
+                        app. Then every attachment, downloaded and uploaded again, with progress and a Cancel
+                        button, and one that will not come over costs only itself. Then the references: the two
+                        work items are Related to each other, and the original's parent and children are Related
+                        to the copy rather than rebuilt under it, because a parent link cannot cross a project.
+                        The original is touched last and only then: a note naming the copy, and the state you
+                        chose &mdash; <strong>Removed</strong> on Agile and Scrum, <strong>Cancelled</strong> on
+                        CMMI, whatever your own process calls it, or left open if you would rather.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>What a migration does not do</label>
+                    <span class="hint">
+                        Revision history cannot be written, so it stays on the original &mdash; which is closed,
+                        not deleted, and stays readable. <strong>Hours already recorded stay booked against the
+                        original</strong>, so no report counts them twice; only the estimate comes over. Parents
+                        and children are not moved. A field the target type does not have is named on the review
+                        page instead of being sent and refused, and an assignee that project cannot resolve is
+                        dropped so the copy is still raised, with the wizard saying so. Calendar blocks pointing
+                        at the original are offered, ticked, to be pointed at the copy.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>When a migration goes wrong</label>
+                    <span class="hint">
+                        Every step is listed with what it did or why it did not, and the copy's id is always on
+                        screen so nothing is left stranded without a name. The original is never closed unless
+                        the copy exists <em>and</em> carries a reference back to it. If something fails part way,
+                        <strong>Finish the rest</strong> picks up exactly where it stopped &mdash; it will not
+                        raise a second copy or repeat a comment. The one case it cannot promise that for is a
+                        create that went out and got no answer: it says so, names the project to go and look in,
+                        and leaves the decision to you.
+                    </span>
+                </div>
+
+                <div class="field">
                     <label>Images</label>
                     <span class="hint">
                         Screenshots attached to a work item are fetched with your credential and inlined, so

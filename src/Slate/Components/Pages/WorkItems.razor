@@ -5,6 +5,7 @@
 @inject AppState State
 @inject PlannerService Plan
 @inject ToastService Toasts
+@inject WorkItemMigrator Migrator
 @inject NavigationManager Nav
 
 <PageTitle>Work items</PageTitle>
@@ -137,8 +138,10 @@
                                 var estimate = item.EstimateMinutes;
 
                                 <tr @key="item.Id" class="clickable"
-                                    title="Click for the full work item"
-                                    @onclick="() => State.ShowWorkItemAsync(item.Id)">
+                                    title="Click for the full work item, right-click for more"
+                                    @onclick="() => State.ShowWorkItemAsync(item.Id)"
+                                    @oncontextmenu="e => OpenRowMenu(item, e)"
+                                    @oncontextmenu:preventDefault="true">
                                     <td class="mono muted">
                                         <span>#@item.Id</span>
                                     </td>
@@ -249,11 +252,38 @@
     }
 </div>
 
+@* Right-click on a row. Deliberately short: the row itself opens the work item, and everything
+   else about it lives in that window - this is the handful of actions worth reaching without. *@
+<ContextMenu Visible="_menuFor is not null" X="_menuX" Y="_menuY" Heading="@_menuHeading" OnClose="CloseMenu">
+    @if (_menuFor is { } menuItem)
+    {
+        <button @onclick="() => OpenDetails(menuItem.Id)">
+            <span class="glyph">☰</span> View work item
+        </button>
+        <button @onclick="() => ScheduleFromMenu(menuItem)">
+            <span class="glyph">＋</span> Schedule…
+        </button>
+        <div class="sep"></div>
+        @if (State.CanCreateWorkItems)
+        {
+            <button title="Copy it into another project or area, reference this one, and close this one off"
+                    @onclick="() => MigrateFromMenu(menuItem.Id)">
+                <span class="glyph">⇥</span> Migrate…
+            </button>
+        }
+        <button @onclick="() => OpenExternal(menuItem.Url)">
+            <span class="glyph">↗</span> Open in Azure DevOps
+        </button>
+    }
+</ContextMenu>
+
 <WorkItemModal OnSchedule="Schedule" />
 <SpawnTaskDialog />
 <PriorityDialog />
 <ScheduleDialog />
 <NewWorkItemDialog OnCreated="Created" OnSchedule="BookNextFree" />
+@* Last, so a migration started from the work item window lands above it rather than behind. *@
+<MigrateWorkItemDialog />
 
 @code {
     private IReadOnlyList<WorkItem> _rows = [];
@@ -308,4 +338,50 @@
 
     /// <summary>The new work item form's tickbox promises a booking, not a dialog.</summary>
     private Task BookNextFree(WorkItem item) => State.ScheduleIntoNextFree(item);
+
+    // ---------------------------------------------------------------- row menu
+
+    private WorkItem? _menuFor;
+    private string? _menuHeading;
+    private double _menuX;
+    private double _menuY;
+
+    private void OpenRowMenu(WorkItem item, MouseEventArgs e)
+    {
+        _menuFor = item;
+        _menuHeading = $"#{item.Id} {Ui.Clip(item.Title, 34)}";
+        _menuX = e.ClientX;
+        _menuY = e.ClientY;
+    }
+
+    private void CloseMenu()
+    {
+        _menuFor = null;
+        _menuHeading = null;
+    }
+
+    private async Task OpenDetails(int workItemId)
+    {
+        CloseMenu();
+        await State.ShowWorkItemAsync(workItemId);
+    }
+
+    private void ScheduleFromMenu(WorkItem item)
+    {
+        CloseMenu();
+        Schedule(item);
+    }
+
+    private void OpenExternal(string url)
+    {
+        CloseMenu();
+        SystemShell.OpenUrl(url);
+    }
+
+    /// <summary>Opens the migration wizard on a work item. It reads the item itself.</summary>
+    private async Task MigrateFromMenu(int workItemId)
+    {
+        CloseMenu();
+        await Migrator.BeginAsync(workItemId);
+    }
 }

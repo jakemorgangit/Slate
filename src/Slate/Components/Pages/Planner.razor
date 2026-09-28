@@ -7,6 +7,7 @@
 @inject PlannerService Plan
 @inject SettingsStore Settings
 @inject ToastService Toasts
+@inject WorkItemMigrator Migrator
 @inject IJSRuntime Js
 @inject NavigationManager Nav
 
@@ -581,6 +582,13 @@
         }
 
         <div class="sep"></div>
+        @if (State.CanCreateWorkItems)
+        {
+            <button title="Copy it into another project or area, reference this one, and close this one off"
+                    @onclick="() => MigrateFromMenu(item.Item.Id)">
+                <span class="glyph">⇥</span> Migrate…
+            </button>
+        }
         <button @onclick="() => OpenExternal(item.Item.Url)">
             <span class="glyph">↗</span> Open in Azure DevOps
         </button>
@@ -598,6 +606,8 @@
 <PriorityDialog />
 <UndoTimeDialog />
 <NewWorkItemDialog OnSchedule="BookNextFree" />
+@* Last, so a migration started from the work item window lands above it rather than behind. *@
+<MigrateWorkItemDialog />
 
 @code {
     private DotNetObjectReference<Planner>? _self;
@@ -1163,6 +1173,13 @@
     {
         CloseMenu();
         SystemShell.OpenUrl(url);
+    }
+
+    /// <summary>Opens the migration wizard on a work item. It reads the item itself.</summary>
+    private async Task MigrateFromMenu(int workItemId)
+    {
+        CloseMenu();
+        await Migrator.BeginAsync(workItemId);
     }
 
     /// <summary>Refuses a placement that would sit on top of an existing calendar entry.</summary>
