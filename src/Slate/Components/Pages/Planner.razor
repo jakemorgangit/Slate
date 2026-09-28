@@ -7,6 +7,7 @@
 @inject PlannerService Plan
 @inject SettingsStore Settings
 @inject ToastService Toasts
+@inject WorkItemMigrator Migrator
 @inject IJSRuntime Js
 @inject NavigationManager Nav
 
@@ -52,6 +53,25 @@
                         @onclick="() => State.SetOnlyMineAsync(!State.Settings.Ado.OnlyMine)">
                     Only mine
                 </button>
+
+                @* One chip per board, for hiding a board's work for a while without taking it
+                   out of the settings. Only once there is more than one board: naming the only
+                   board you have would be a chip that never does anything useful. A saved query
+                   or custom WIQL runs in one project whatever the boards say, so no chips then. *@
+                @if (State.Settings.Ado.Scope == WorkItemScope.AssignedToMe
+                     && State.Settings.Ado.Scopes.Count > 1)
+                {
+                    @foreach (var board in State.Settings.Ado.Scopes)
+                    {
+                        var current = board;
+
+                        <button class="chip @(current.Enabled ? "on" : "")"
+                                title="@Ui.BoardChip(current)"
+                                @onclick="() => State.SetScopeEnabledAsync(current, !current.Enabled)">
+                            @current.Label
+                        </button>
+                    }
+                }
 
                 @if (State.AvailableTypes.Count > 1)
                 {
@@ -108,6 +128,14 @@
                     </div>
                 }
 
+                @* A board that could not be read, or every board hidden at once. Neither is a
+                   failed load - the rest of the list is real - so it says its piece above the
+                   list rather than taking the list's place. *@
+                @if (State.BoardNotice is { } boards)
+                {
+                    <div class="banner warn compact"><span class="grow">@boards</span></div>
+                }
+
                 if (_visibleItems.Count == 0)
                 {
                     @* Nothing loaded at all is not the same as a query that came back empty -
@@ -125,6 +153,7 @@
                     {
                         <WorkItemCard @key="item.Id"
                                       Item="item"
+                                      Board="@Ui.Board(item, _boards)"
                                       Allocated="@Plan.AllocatedMinutes(item.Id)"
                                       Recorded="@Plan.RecordedMinutes(item.Id)"
                                       Priority="@Plan.LocalPriority(item.Id)"
@@ -581,6 +610,13 @@
         }
 
         <div class="sep"></div>
+        @if (State.CanCreateWorkItems)
+        {
+            <button title="Copy it into another project or area, reference this one, and close this one off"
+                    @onclick="() => MigrateFromMenu(item.Item.Id)">
+                <span class="glyph">⇥</span> Migrate…
+            </button>
+        }
         <button @onclick="() => OpenExternal(item.Item.Url)">
             <span class="glyph">↗</span> Open in Azure DevOps
         </button>
@@ -598,6 +634,8 @@
 <PriorityDialog />
 <UndoTimeDialog />
 <NewWorkItemDialog OnSchedule="BookNextFree" />
+@* Last, so a migration started from the work item window lands above it rather than behind. *@
+<MigrateWorkItemDialog />
 
 @code {
     private DotNetObjectReference<Planner>? _self;
@@ -617,6 +655,12 @@
 
     private IReadOnlyList<WorkItem> _visibleItems = [];
     private IReadOnlyList<DateTime> _days = [];
+
+    /// <summary>
+    /// Whether a card has to say which board it came from, worked out once with the list
+    /// rather than per card: it reads the whole list to decide.
+    /// </summary>
+    private BoardNaming _boards;
 
     private PlanningSettings P => Settings.Current.Planning;
     private int SlotMinutes => Math.Clamp(P.SlotMinutes, 5, 120);
@@ -688,6 +732,7 @@
     {
         _visibleItems = State.FilteredWorkItems;
         _days = State.VisibleDays;
+        _boards = State.Boards;
     }
 
     private void OnChanged() => InvokeAsync(() =>
@@ -986,6 +1031,23 @@
         // The overlay shown during an update's handover stops clicks, not keys.
         if (State.IsHandingOver) return;
 
+        // The migration wizard's scrim stops clicks, not keys either, and it is drawn above
+        // everything else. Every shortcut stands off while it is up: r would reload the list and
+        // throw away the copy just adopted, Delete would remove the selected block, and Ctrl+R
+        // would open Record day behind the wizard. Escape is the one that still does something,
+        // and it closes the wizard - which refuses mid-run - and nothing underneath it, which is
+        // the whole point of the rule about a key reaching past a dialog.
+        if (Migrator.IsOpen)
+        {
+            if (combo == "escape")
+            {
+                Migrator.Close();
+                await InvokeAsync(StateHasChanged);
+            }
+
+            return;
+        }
+
         switch (combo)
         {
             case "arrowleft": State.GoToWeek(-1); break;
@@ -1165,13 +1227,28 @@
         SystemShell.OpenUrl(url);
     }
 
+    /// <summary>Opens the migration wizard on a work item. It reads the item itself.</summary>
+    private async Task MigrateFromMenu(int workItemId)
+    {
+        CloseMenu();
+        await Migrator.BeginAsync(workItemId);
+    }
+
+    /// <summary>
+    /// What both refusals say. One sentence, naming the switch by the words printed beside it
+    /// and the card it sits under: "allow overlaps" is not written anywhere in Settings, so a
+    /// message that says that sends the user looking for something that is not there.
+    /// </summary>
+    private const string OverlapRefused =
+        "Something is already in your Outlook calendar there. To plan over it anyway, turn off "
+        + "\"Never plan over existing events\" under Your week in Settings.";
+
     /// <summary>Refuses a placement that would sit on top of an existing calendar entry.</summary>
     private bool Reject(DateTime start, DateTime end)
     {
         if (!State.BlocksPlacement(start, end)) return false;
 
-        Toasts.Warning("That time is already taken",
-            "Something is in your Outlook calendar there. Turn off \"Never plan over existing events\" in Settings to allow it.");
+        Toasts.Warning("That time is already taken", OverlapRefused);
         return true;
     }
 
@@ -1179,8 +1256,7 @@
     [JSInvokable]
     public void OnDropRejected()
     {
-        Toasts.Warning("That time is already taken",
-            "Pick a slot that is free, or allow overlaps in Settings.");
+        Toasts.Warning("That time is already taken", OverlapRefused);
         InvokeAsync(StateHasChanged);
     }
 

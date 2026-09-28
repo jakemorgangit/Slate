@@ -41,8 +41,9 @@
                                 Azure DevOps and Outlook.</li>
                             <li>No app registration? Open <em>Use a personal access token instead</em> and
                                 paste a token with the <strong>Work Items (Read &amp; Write)</strong> scope.</li>
-                            <li>Pick a project, then choose which items to show: by area and
-                                assignment, a saved query, or your own WIQL.</li>
+                            <li>Add a <strong>board</strong> — a project, and optionally an area inside
+                                it — then add another for every board your work lives on. Choose which
+                                items to show: by area and assignment, a saved query, or your own WIQL.</li>
                         </ol>
                         <p class="hint" style="margin-top: 8px">
                             Write access is only needed so you can record time. Read alone works for planning.
@@ -119,24 +120,40 @@
                         on the Work items tab. Take the first gap that fits inside the hours work can be
                         booked into, or pick a date and time yourself.</dd>
 
+                    <dt>Work on several boards</dt>
+                    <dd>A <strong>board</strong> is a project, optionally narrowed to an area inside it.
+                        Add as many as your work spans and the sidebar lists all of them at once, as one
+                        list you drag from. Each board is asked for on its own, so one that cannot be read
+                        does not take the others off the screen, and each gets its own 500-item allowance
+                        rather than sharing one. With no board at all, the query asks across every project
+                        you can see — which is where a new install starts.</dd>
+
+                    <dt>Showing one board for a while</dt>
+                    <dd>Every board gets a chip above the work item list, on the plan's sidebar and on the
+                        Work items tab. Turning one off hides that board's work without taking the board
+                        out of Settings, and turning it back on brings it straight back. The chips appear
+                        only once there is more than one board. While the list is drawn from more than one,
+                        each card and table row says which board its work item came from.</dd>
+
                     <dt>Beyond your own list</dt>
-                    <dd>The default source is two choices: an <strong>area</strong> (everything beneath
-                        it counts; empty means the whole project) and <strong>only work items assigned
-                        to me</strong>, on by default. Left alone it is the same list as always. Turn
-                        the toggle off to see everything in that area rather than only your own.
-                        A saved query and custom WIQL are left exactly as written.</dd>
+                    <dd>The default source is two choices: the <strong>boards</strong> above, and
+                        <strong>only work items assigned to me</strong>, on by default. Left alone it is
+                        the same list as always. Turn the toggle off to see everything on those boards
+                        rather than only your own. A saved query and custom WIQL are left exactly as
+                        written — both belong to one project, so both run in the first board's, which
+                        Settings says underneath them.</dd>
 
                     <dt>Choosing an area</dt>
                     <dd>One dropdown per level of the project's own tree. Leaving a level unset means
                         everything beneath the level above it, so stopping at <em>DevOps</em> takes in
                         <em>DevOps\DBA</em> and every other team under it — narrow further only if you
-                        want the narrower list. Each work item shows the area it sits in, next to who
-                        it is assigned to.</dd>
+                        want the narrower list. Leave it at the project itself for the whole project.
+                        Each work item shows the area it sits in, next to who it is assigned to.</dd>
 
                     <dt>Only mine, quickly</dt>
                     <dd>The same toggle sits beside <em>Hide fully planned</em> on the Work items tab
                         and as a chip above the plan's sidebar, so you can widen or narrow the list
-                        without opening Settings. All three are one setting.</dd>
+                        without opening Settings. All three are one setting, as the board chips are.</dd>
 
                     <dt>Your existing calendar</dt>
                     <dd>Everything already in Outlook that week is drawn behind the plan in grey. Work is not
@@ -400,6 +417,86 @@
                         priority and an estimate, with an option to book it onto the calendar straight away.
                         The area path is picked from the project's own tree &mdash; root, then the level below,
                         then the one below that &mdash; so you cannot build a path that does not exist.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>Migrating a work item</label>
+                    <span class="hint">
+                        When an area or a project becomes the old one, <strong>Migrate…</strong> &mdash; on the
+                        right-click menu of a card in the Plan sidebar, on a row of the Work items table, and in
+                        the work item window &mdash; copies a work item into its new home. Choose the project,
+                        the area from that project's own tree, and the type (the one it already is, unless the
+                        target project has no such type, in which case you pick). The second page lists
+                        <em>everything</em> that is about to happen before a single thing is written: each field
+                        going over with its value, the comments, every attachment with its size, the parent and
+                        children that will be referenced, and a line for each thing that is not being copied with
+                        the reason why.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>What a migration does, in order</label>
+                    <span class="hint">
+                        The copy is raised first. Then the two work items are Related to each other, early, so
+                        the trail exists before anything slow does. Then the original's parent and children are
+                        Related to the copy rather than rebuilt under it, because a parent link cannot cross a
+                        project. Then the discussion &mdash; each comment led by who wrote it and when, because
+                        Azure DevOps records <em>you</em> as the author of anything posted through an app. Then
+                        every attachment, downloaded and uploaded again, with progress and a Cancel button, and
+                        one that will not come over costs only itself. The original is touched last and only
+                        then: a note naming the copy, and the state you chose &mdash;
+                        <strong>Removed</strong> on Agile and Scrum, <strong>Cancelled</strong> on CMMI, whatever
+                        your own process calls it, or left open if you would rather. The calendar blocks, which
+                        are local, come after all of it.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>What a migration does not do</label>
+                    <span class="hint">
+                        Revision history cannot be written, so it stays on the original &mdash; which is closed,
+                        not deleted, and stays readable. <strong>Hours already recorded stay booked against the
+                        original</strong>: Slate's own time entries, the Time tab and Undo all still point there.
+                        Completed Work does come over as a number, so the copy says the work was done &mdash; which
+                        means a report adding both work items together would count those hours twice. Parents
+                        and children are not moved. A field the target type does not have is named on the review
+                        page instead of being sent and refused, and an assignee that project cannot resolve is
+                        dropped so the copy is still raised, with the wizard saying so. Its other work item links
+                        &mdash; Related, Duplicate, Predecessor, Successor, Tested By &mdash; stay on it and are
+                        named rather than guessed at on the copy. A picture pasted into the text still points at
+                        the file attached to the original, so somebody who can see only the new project sees a
+                        broken picture; the files themselves are copied, and the wizard says so when there is one.
+                        Calendar blocks pointing at the original are offered, ticked, to be pointed at the copy.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>When a migration goes wrong</label>
+                    <span class="hint">
+                        Every step is listed with what it did or why it did not, and the copy's id is always on
+                        screen so nothing is left stranded without a name. The original is never closed unless
+                        the copy exists <em>and</em> something says where the work went &mdash; either the two
+                        linked to each other, or the note naming the copy &mdash; and never when its discussion
+                        could not be read at all, unless you tick to say you have compared the two yourself. If
+                        something fails or you cancel part way, <strong>Finish the rest</strong> picks up exactly
+                        where it stopped &mdash; it will not raise a second copy, and it will not repeat a comment
+                        or an attachment, including one Azure DevOps took without saying so, which is named on the
+                        step instead. The closing state and the ticked blocks are remembered as the run started,
+                        so finishing it later does what you asked for then.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>A copy that may or may not have been raised</label>
+                    <span class="hint">
+                        The one case none of that covers. Raising the copy is the first step and the only one that
+                        leaves no mark on the original, so when the request goes out and no answer comes back
+                        &mdash; a timeout, a dropped connection, a server error, or you cancelling once it was
+                        already on its way &mdash; there may be a copy in the target project and there may not,
+                        and Slate has no id to name. It says exactly that rather than &ldquo;nothing was
+                        changed&rdquo;, names the project and the title to go and look for, and will not run again
+                        until you tick to say you looked. Running it blind is what would leave two.
                     </span>
                 </div>
 

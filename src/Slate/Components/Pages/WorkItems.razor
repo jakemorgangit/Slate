@@ -5,6 +5,7 @@
 @inject AppState State
 @inject PlannerService Plan
 @inject ToastService Toasts
+@inject WorkItemMigrator Migrator
 @inject NavigationManager Nav
 
 <PageTitle>Work items</PageTitle>
@@ -29,12 +30,32 @@
         </div>
 
         @* The same setting the Settings page holds, put where the list is actually read. *@
-        <label class="switch" title="Off shows everything in the chosen area, not just your own">
+        <label class="switch" title="Off shows everything on the chosen boards, not just your own">
             <input type="checkbox" checked="@State.Settings.Ado.OnlyMine"
                    @onchange="e => State.SetOnlyMineAsync(e.Value is true)" />
             <span class="track"></span>
             <span class="label">Only mine</span>
         </label>
+
+        @* The same board chips as the Plan sidebar, and the same setting behind them. Only
+           once there is more than one board, and not for a saved query or custom WIQL - both
+           of those run in one project whatever the boards say. *@
+        @if (State.Settings.Ado.Scope == WorkItemScope.AssignedToMe
+             && State.Settings.Ado.Scopes.Count > 1)
+        {
+            <div class="row wrap">
+                @foreach (var board in State.Settings.Ado.Scopes)
+                {
+                    var current = board;
+
+                    <button class="chip @(current.Enabled ? "on" : "")"
+                            title="@Ui.BoardChip(current)"
+                            @onclick="() => State.SetScopeEnabledAsync(current, !current.Enabled)">
+                        @current.Label
+                    </button>
+                }
+            </div>
+        }
 
         <label class="switch">
             <input type="checkbox" checked="@State.HideFullyAllocated" @onchange="OnHideToggled" />
@@ -90,6 +111,13 @@
             </div>
         }
 
+        @* A board that could not be read, or every board hidden at once. Neither is a failed
+           load - the rest of the table is real - so it says its piece above it. *@
+        @if (State.BoardNotice is { } boards)
+        {
+            <div class="banner warn compact"><span class="grow">@boards</span></div>
+        }
+
         @if (_rows.Count == 0)
         {
             <div class="empty-state">
@@ -137,8 +165,10 @@
                                 var estimate = item.EstimateMinutes;
 
                                 <tr @key="item.Id" class="clickable"
-                                    title="Click for the full work item"
-                                    @onclick="() => State.ShowWorkItemAsync(item.Id)">
+                                    title="Click for the full work item, right-click for more"
+                                    @onclick="() => State.ShowWorkItemAsync(item.Id)"
+                                    @oncontextmenu="e => OpenRowMenu(item, e)"
+                                    @oncontextmenu:preventDefault="true">
                                     <td class="mono muted">
                                         <span>#@item.Id</span>
                                     </td>
@@ -150,9 +180,17 @@
                                     </td>
                                     <td class="cell-title">
                                         <div>@item.Title</div>
-                                        @if (!string.IsNullOrWhiteSpace(item.ParentTitle) || item.Tags.Length > 0 || item.HasLinks)
+                                        @{ var board = Ui.Board(item, _boards); }
+                                        @if (board.Length > 0 || !string.IsNullOrWhiteSpace(item.ParentTitle)
+                                             || item.Tags.Length > 0 || item.HasLinks)
                                         {
                                             <div class="row wrap" style="margin-top: 3px">
+                                                @* First in the row, so several boards' work can be
+                                                   scanned down the column. *@
+                                                @if (board.Length > 0)
+                                                {
+                                                    <span class="badge badge-muted" title="@Ui.BoardTooltip(item)">@board</span>
+                                                }
                                                 @if (!string.IsNullOrWhiteSpace(item.ParentTitle))
                                                 {
                                                     <span class="muted" style="font-size: 11.5px">↳ @Ui.Clip(item.ParentTitle, 60)</span>
@@ -249,14 +287,49 @@
     }
 </div>
 
+@* Right-click on a row. Deliberately short: the row itself opens the work item, and everything
+   else about it lives in that window - this is the handful of actions worth reaching without. *@
+<ContextMenu Visible="_menuFor is not null" X="_menuX" Y="_menuY" Heading="@_menuHeading" OnClose="CloseMenu">
+    @if (_menuFor is { } menuItem)
+    {
+        <button @onclick="() => OpenDetails(menuItem.Id)">
+            <span class="glyph">☰</span> View work item
+        </button>
+        <button @onclick="() => ScheduleFromMenu(menuItem)">
+            <span class="glyph">＋</span> Schedule…
+        </button>
+        <div class="sep"></div>
+        @if (State.CanCreateWorkItems)
+        {
+            <button title="Copy it into another project or area, reference this one, and close this one off"
+                    @onclick="() => MigrateFromMenu(menuItem.Id)">
+                <span class="glyph">⇥</span> Migrate…
+            </button>
+        }
+        <button @onclick="() => OpenExternal(menuItem.Url)">
+            <span class="glyph">↗</span> Open in Azure DevOps
+        </button>
+    }
+</ContextMenu>
+
 <WorkItemModal OnSchedule="Schedule" />
 <SpawnTaskDialog />
 <PriorityDialog />
 <ScheduleDialog />
 <NewWorkItemDialog OnCreated="Created" OnSchedule="BookNextFree" />
+@* Last, so a migration started from the work item window lands above it rather than behind. *@
+<MigrateWorkItemDialog />
 
 @code {
     private IReadOnlyList<WorkItem> _rows = [];
+
+    /// <summary>
+    /// Whether a row has to say which board it came from. Worked out here rather than per row,
+    /// because deciding reads the whole list. Only alongside a load - the search, sort and
+    /// "hide fully planned" filters below change which rows show, never which boards they
+    /// came from.
+    /// </summary>
+    private BoardNaming _boards;
 
     private int TotalPlannedMinutes => Plan.Allocations.Sum(a => a.DurationMinutes);
 
@@ -265,11 +338,13 @@
         State.Changed += OnChanged;
         Plan.Changed += OnChanged;
         _rows = State.FilteredWorkItems;
+        _boards = State.Boards;
     }
 
     private void OnChanged() => InvokeAsync(() =>
     {
         _rows = State.FilteredWorkItems;
+        _boards = State.Boards;
         StateHasChanged();
     });
 
@@ -308,4 +383,50 @@
 
     /// <summary>The new work item form's tickbox promises a booking, not a dialog.</summary>
     private Task BookNextFree(WorkItem item) => State.ScheduleIntoNextFree(item);
+
+    // ---------------------------------------------------------------- row menu
+
+    private WorkItem? _menuFor;
+    private string? _menuHeading;
+    private double _menuX;
+    private double _menuY;
+
+    private void OpenRowMenu(WorkItem item, MouseEventArgs e)
+    {
+        _menuFor = item;
+        _menuHeading = $"#{item.Id} {Ui.Clip(item.Title, 34)}";
+        _menuX = e.ClientX;
+        _menuY = e.ClientY;
+    }
+
+    private void CloseMenu()
+    {
+        _menuFor = null;
+        _menuHeading = null;
+    }
+
+    private async Task OpenDetails(int workItemId)
+    {
+        CloseMenu();
+        await State.ShowWorkItemAsync(workItemId);
+    }
+
+    private void ScheduleFromMenu(WorkItem item)
+    {
+        CloseMenu();
+        Schedule(item);
+    }
+
+    private void OpenExternal(string url)
+    {
+        CloseMenu();
+        SystemShell.OpenUrl(url);
+    }
+
+    /// <summary>Opens the migration wizard on a work item. It reads the item itself.</summary>
+    private async Task MigrateFromMenu(int workItemId)
+    {
+        CloseMenu();
+        await Migrator.BeginAsync(workItemId);
+    }
 }

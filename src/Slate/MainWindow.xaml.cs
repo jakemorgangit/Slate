@@ -1,7 +1,9 @@
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using Microsoft.Extensions.DependencyInjection;
 using Slate.Services;
+using Slate.Services.Planning;
 
 namespace Slate;
 
@@ -24,8 +26,22 @@ public partial class MainWindow : Window
         // Signing out or shutting down ignores a refused close, so App settles the update itself
         // before those go ahead, or leaves it to the thread already settling it rather than hold
         // Windows up (SelfUpdater.SettleBeforeExit).
-        Closing += (_, e) => e.Cancel |= SelfUpdater.IsSwapping || SelfUpdater.IsHandingOver;
+        Closing += (_, e) =>
+            e.Cancel |= SelfUpdater.IsSwapping || SelfUpdater.IsHandingOver || MigrationInFlight();
     }
+
+    /// <summary>
+    /// True while a migration is part way through, which the close is refused for the same reason
+    /// the wizard's own close button refuses it: the account of what has been done so far is held
+    /// in memory only, so closing now could leave a copy raised in another project with nothing on
+    /// the original pointing at it and no copy of Slate that knows either happened. The wizard has
+    /// a Cancel button, which stops between one item and the next and then says what was done.
+    ///
+    /// Bounded like the two above it, and like them ignored by a sign-out or a shutdown - WPF shuts
+    /// the app down over the question whatever the window answers - so this holds nothing up.
+    /// </summary>
+    private static bool MigrationInFlight() =>
+        App.Services?.GetService<WorkItemMigrator>()?.IsRunning == true;
 
     /// <summary>Windows saying whether the session end it asked about is actually going ahead.</summary>
     private const int WmEndSession = 0x0016;

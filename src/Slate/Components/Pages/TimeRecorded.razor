@@ -461,6 +461,10 @@
 <WorkItemModal />
 <PriorityDialog />
 <UndoTimeDialog />
+@* Hosted wherever the work item window is, because that window's Migrate… button opens it: on a
+   page without it the wizard would open invisibly - a dead button, no way to close it, and the
+   wizard appearing unbidden on the next page visited. Last, so it lands above the window. *@
+<MigrateWorkItemDialog />
 
 @code {
     private List<TimeEntry> _entries = [];

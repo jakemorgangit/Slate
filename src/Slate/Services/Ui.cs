@@ -2,6 +2,12 @@ using Slate.Models;
 
 namespace Slate.Services;
 
+/// <summary>
+/// How a work item says which board it came from: not at all, by its area, or by its project.
+/// See <see cref="Planning.AppState.Boards"/> for which applies when.
+/// </summary>
+public enum BoardNaming { None, Area, Project }
+
 /// <summary>Presentation helpers shared by the Razor components.</summary>
 public static class Ui
 {
@@ -228,4 +234,47 @@ public static class Ui
     /// <summary>Truncates a string for a tooltip or a tight cell.</summary>
     public static string Clip(string? value, int max) =>
         string.IsNullOrEmpty(value) ? "" : value.Length <= max ? value : value[..(max - 1)] + "…";
+
+    /// <summary>
+    /// Where a work item sits, in as few words as a card has room for: its project, or the
+    /// last part of its area when the boards on show are several areas of one project and the
+    /// project would not tell them apart. Empty when there is one board on show and saying so
+    /// on every row would be noise.
+    ///
+    /// Where it sits rather than which board fetched it: an area takes everything beneath it,
+    /// so a board's own name would be the same on every card under it and say less than the
+    /// area each one is actually in. The full picture goes in <see cref="BoardTooltip"/>.
+    /// </summary>
+    public static string Board(WorkItem item, BoardNaming naming) => naming switch
+    {
+        BoardNaming.Project => item.Project,
+        BoardNaming.Area => AreaLeaf(item),
+        _ => "",
+    };
+
+    /// <summary>The tooltip on a board chip: the board in full, and what clicking it will do.</summary>
+    public static string BoardChip(AdoScope board) =>
+        board.Describe() + Environment.NewLine + (board.Enabled
+            ? "Showing this board - click to hide its work"
+            : "Hidden - click to show its work again");
+
+    /// <summary>The project and area in full, for the title on a board badge.</summary>
+    public static string BoardTooltip(WorkItem item) =>
+        string.IsNullOrWhiteSpace(item.AreaPath)
+        || string.Equals(item.AreaPath, item.Project, StringComparison.OrdinalIgnoreCase)
+            ? $"Project: {item.Project}"
+            : $"Project: {item.Project}{Environment.NewLine}Area: {item.AreaPath}";
+
+    /// <summary>
+    /// The deepest part of a work item's area, or its project when the area is the project
+    /// itself - which is how Azure DevOps stores "no area chosen".
+    /// </summary>
+    private static string AreaLeaf(WorkItem item)
+    {
+        var area = item.AreaPath ?? "";
+        if (area.Length == 0) return item.Project;
+
+        var slash = area.LastIndexOf('\\');
+        return slash >= 0 ? area[(slash + 1)..] : area;
+    }
 }

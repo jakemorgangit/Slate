@@ -62,6 +62,7 @@ public partial class App : Application
         services.AddSingleton<AppState>();
         services.AddSingleton<PlannerService>();
         services.AddSingleton<ToastService>();
+        services.AddSingleton<WorkItemMigrator>();
 
         Services = services.BuildServiceProvider();
 

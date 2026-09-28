@@ -62,6 +62,15 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     private const string CommentsApiVersion = "7.1-preview.4";
     private const int BatchSize = 200;
 
+    /// <summary>
+    /// What a rejected credential gets instead of an answer: the sign-in page, served with a
+    /// success status. One message for every path that has to test for it - the shared send
+    /// below, and the attachment download, which reads its own body.
+    /// </summary>
+    private const string SignInPageMessage =
+        "Azure DevOps returned a sign-in page instead of an answer. "
+        + "The token is likely expired or lacks the Work Items scope this needs.";
+
     private static readonly HttpClient Http = new(new SocketsHttpHandler
     {
         AutomaticDecompression = DecompressionMethods.All,
@@ -248,9 +257,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             // ones read as data: a request whose answer is its status alone - a delete - would
             // otherwise take that very page for the one 2xx nobody looks inside, and report a
             // comment as removed while it is still on the discussion.
-            if (payload.StartsWith('<'))
-                throw new AzureDevOpsException(
-                    "Azure DevOps returned a sign-in page instead of an answer. The token is likely expired or lacks the Work Items scope this needs.");
+            if (payload.StartsWith('<')) throw new AzureDevOpsException(SignInPageMessage);
 
             return payload;
         }
@@ -346,9 +353,9 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     /// <summary>Flattened list of the shared and personal saved queries in the selected project.</summary>
     public async Task<List<AdoQuery>> GetSavedQueriesAsync(CancellationToken ct = default)
     {
-        var project = settings.Current.Ado.Project;
+        var project = settings.Current.Ado.PrimaryProject;
         if (string.IsNullOrWhiteSpace(project))
-            throw new AzureDevOpsException("Pick a project before loading saved queries.");
+            throw new AzureDevOpsException("Add a board before loading saved queries.");
 
         using var doc = await SendAsync(HttpMethod.Get,
             $"{OrgUrl}/{Uri.EscapeDataString(project)}/_apis/wit/queries?$depth=2&api-version={ApiVersion}", null, ct);
@@ -373,34 +380,92 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         }
     }
 
-    /// <summary>Runs whatever query the settings currently describe and hydrates the results.</summary>
-    public async Task<List<WorkItem>> GetWorkItemsAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Runs whatever query the settings currently describe and hydrates the results.
+    ///
+    /// One query per board rather than a single organization-level one with the boards OR'd
+    /// together, for three reasons. The 500-row cap Azure DevOps puts on a WIQL result applies
+    /// per query, so each board gets its own headroom instead of a busy board crowding a quiet
+    /// one out of the list. A board that cannot be listed fails on its own, leaving the others
+    /// on screen. And each query is the one this app has always sent, addressed to a project,
+    /// so the area clause and the way a failure is classified are unchanged - only repeated.
+    ///
+    /// Which leaves the merged order, and nothing rests on it: the list is sorted by whichever
+    /// column the sidebar or the table is set to before anybody sees it.
+    /// </summary>
+    public async Task<WorkItemFetch> GetWorkItemsAsync(CancellationToken ct = default)
     {
         var ado = settings.Current.Ado;
-        var ids = ado.Scope switch
-        {
-            WorkItemScope.SavedQuery => await RunSavedQueryAsync(ado.SavedQueryId, ct),
-            WorkItemScope.CustomWiql => await RunWiqlAsync(ado.CustomWiql, ct),
-            _ => await RunWiqlAsync(BuildScopeWiql(ado), ct),
-        };
 
-        return ids.Count == 0 ? [] : await GetWorkItemsByIdAsync(ids, ct);
+        // A saved query and custom WIQL belong to whoever wrote them, and both are addressed
+        // to one project, so neither is run per board: they run in the first board's project,
+        // which is what the Settings page says underneath them.
+        if (ado.Scope is WorkItemScope.SavedQuery or WorkItemScope.CustomWiql)
+        {
+            var queried = ado.Scope == WorkItemScope.SavedQuery
+                ? await RunSavedQueryAsync(ado.SavedQueryId, ado.PrimaryProject, ct)
+                : await RunWiqlAsync(ado.CustomWiql, ado.PrimaryProject, ct);
+
+            return new WorkItemFetch(await HydrateAsync(queried, ct), []);
+        }
+
+        // No board at all asks across the organization, as an empty project always has. Every
+        // board hidden is the opposite question and gets the opposite answer: the chips are
+        // what emptied the list, and turning them all off must not quietly widen it instead.
+        if (ado.Scopes.Count == 0)
+            return new WorkItemFetch(
+                await HydrateAsync(await RunWiqlAsync(BuildScopeWiql(ado, null), "", ct), ct), []);
+
+        var boards = ado.EnabledScopes.ToList();
+        if (boards.Count == 0) return new WorkItemFetch([], []);
+
+        var ids = new List<int>();
+        var failures = new List<BoardFailure>();
+        AzureDevOpsException? firstFailure = null;
+
+        foreach (var board in boards)
+        {
+            try
+            {
+                ids.AddRange(await RunWiqlAsync(BuildScopeWiql(ado, board), board.Project, ct));
+            }
+            catch (AzureDevOpsException ex)
+            {
+                firstFailure ??= ex;
+                failures.Add(new BoardFailure(board.Describe(), ex.Message));
+            }
+        }
+
+        // Nothing answering is the load failing, so the first failure is thrown on as it
+        // always was: it carries whether it is worth retrying, which is what the caller's
+        // patient retry at startup reads. Anything less than all of them is a list with a
+        // gap in it, which is worth more than no list.
+        if (firstFailure is not null && failures.Count == boards.Count) throw firstFailure;
+
+        // Distinct because boards may overlap - a project taken whole alongside one of its own
+        // areas - and the same work item under two of them is still one card.
+        return new WorkItemFetch(await HydrateAsync([.. ids.Distinct()], ct), failures);
     }
 
+    private async Task<List<WorkItem>> HydrateAsync(List<int> ids, CancellationToken ct) =>
+        ids.Count == 0 ? [] : await GetWorkItemsByIdAsync(ids, ct);
+
     /// <summary>
-    /// The query Slate builds for itself, from two independent choices: which area the work
-    /// lives in, and whether to narrow it to your own. An area takes everything beneath it,
-    /// so a top-level pick includes its sub-areas; no area at all means the whole project.
+    /// The query Slate builds for itself, from two independent choices: which area of which
+    /// board the work lives in, and whether to narrow it to your own. An area takes everything
+    /// beneath it, so a top-level pick includes its sub-areas; a board with no area means the
+    /// whole project, and no board at all means the whole organization.
     ///
-    /// The saved query and custom WIQL scopes never come through here - those belong to
-    /// whoever wrote them, and Slate does not rewrite them.
+    /// The project itself is not a clause: the query is posted to that project's own address,
+    /// which scopes it there. The saved query and custom WIQL sources never come through here -
+    /// those belong to whoever wrote them, and Slate does not rewrite them.
     /// </summary>
-    public static string BuildScopeWiql(AdoSettings ado)
+    public static string BuildScopeWiql(AdoSettings ado, AdoScope? board)
     {
         var clauses = new List<string>();
 
-        if (!string.IsNullOrWhiteSpace(ado.AreaPath))
-            clauses.Add($"[System.AreaPath] UNDER {Quote(ado.AreaPath)}");
+        if (board is not null && !string.IsNullOrWhiteSpace(board.AreaPath))
+            clauses.Add($"[System.AreaPath] UNDER {Quote(board.AreaPath)}");
 
         if (ado.OnlyMine)
             clauses.Add("[System.AssignedTo] = @Me");
@@ -418,31 +483,33 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     private static string Quote(string value) => "'" + value.Replace("'", "''") + "'";
 
 
-    private async Task<List<int>> RunWiqlAsync(string wiql, CancellationToken ct)
+    private async Task<List<int>> RunWiqlAsync(string wiql, string project, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(wiql))
             throw new AzureDevOpsException("The WIQL query is empty.");
 
-        var url = $"{OrgUrl}{ProjectSegment()}/_apis/wit/wiql?$top=500&api-version={ApiVersion}";
+        var url = $"{OrgUrl}{ProjectSegment(project)}/_apis/wit/wiql?$top=500&api-version={ApiVersion}";
         using var doc = await SendAsync(HttpMethod.Post, url, new { query = wiql }, ct);
         return ExtractIds(doc.RootElement);
     }
 
-    private async Task<List<int>> RunSavedQueryAsync(string queryId, CancellationToken ct)
+    private async Task<List<int>> RunSavedQueryAsync(string queryId, string project, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(queryId))
             throw new AzureDevOpsException("No saved query is selected.");
 
-        var url = $"{OrgUrl}{ProjectSegment()}/_apis/wit/wiql/{Uri.EscapeDataString(queryId)}?$top=500&api-version={ApiVersion}";
+        var url = $"{OrgUrl}{ProjectSegment(project)}/_apis/wit/wiql/{Uri.EscapeDataString(queryId)}?$top=500&api-version={ApiVersion}";
         using var doc = await SendAsync(HttpMethod.Get, url, null, ct);
         return ExtractIds(doc.RootElement);
     }
 
-    private string ProjectSegment()
-    {
-        var project = settings.Current.Ado.Project;
-        return string.IsNullOrWhiteSpace(project) ? "" : "/" + Uri.EscapeDataString(project);
-    }
+    /// <summary>
+    /// The optional /{project} a request is addressed through. With it the query runs in that
+    /// project alone, which is how one board is asked for; without it, across every project the
+    /// credential can see, which is what no board at all asks for.
+    /// </summary>
+    private static string ProjectSegment(string project) =>
+        string.IsNullOrWhiteSpace(project) ? "" : "/" + Uri.EscapeDataString(project);
 
     /// <summary>Handles both flat queries (workItems) and tree/one-hop queries (workItemRelations).</summary>
     private static List<int> ExtractIds(JsonElement root)
@@ -803,7 +870,13 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
         if (string.IsNullOrWhiteSpace(title))
             throw new AzureDevOpsException("Give the new work item a title.");
 
-        var project = string.IsNullOrWhiteSpace(parent.Project) ? settings.Current.Ado.Project : parent.Project;
+        // The parent's own project first, and only then the first board: a Task has to be
+        // raised where its parent lives, which with several boards on screen is rarely the
+        // board that happens to be first in the list.
+        var project = string.IsNullOrWhiteSpace(parent.Project)
+            ? settings.Current.Ado.PrimaryProject
+            : parent.Project;
+
         if (string.IsNullOrWhiteSpace(project))
             throw new AzureDevOpsException("A project is needed to create a work item.");
 
@@ -991,12 +1064,15 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
 
     /// <summary>
     /// The project segment the discussion is read and added to through: the one asked for, or
-    /// the selected project when nothing was. Empty when neither says anything, which both
+    /// the first board's project when nothing was. Empty when neither says anything, which both
     /// callers refuse rather than sending an address with a hole in it. Removing a comment does
     /// not come through here - see <see cref="DeleteCommentAsync"/>.
+    ///
+    /// Both callers do hand the work item's own project over, so the fallback is only reached
+    /// for a record old enough not to have carried one.
     /// </summary>
     private string CommentScope(string project) =>
-        string.IsNullOrWhiteSpace(project) ? ProjectSegment() : "/" + Uri.EscapeDataString(project);
+        ProjectSegment(string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.PrimaryProject : project);
 
     private static WorkItemComment ReadComment(JsonElement element) => new(
         element.TryGetProperty("id", out var id) ? id.GetInt32() : 0,

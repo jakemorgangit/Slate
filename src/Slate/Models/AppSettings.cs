@@ -60,6 +60,9 @@ public sealed class AppSettings
         Ui ??= new UiSettings();
 
         Ado.ExcludedStates ??= [];
+        Ado.Scopes ??= [];
+        MigrateSingleScope();
+        TidyScopes();
 
         if (string.IsNullOrWhiteSpace(Calendar.SubjectTemplate)) Calendar.SubjectTemplate = "#{id} {title}";
         // Bounded like everything else here: it is appended to a subject that has its own
@@ -101,13 +104,169 @@ public sealed class AppSettings
 
         return this;
     }
+
+    /// <summary>
+    /// Folds the one project and area a pre-1.7 settings file carried into the board list, and
+    /// nulls them so they are gone from the next file written. Silent on purpose: the result is
+    /// the same list that file already produced, so there is nothing to tell anybody about.
+    ///
+    /// A file with an area but no project still names a board, because System.AreaPath starts
+    /// with the project - reachable by hand, or by typing an area while the project list was
+    /// unavailable. An empty project with no area names none, and the empty list it leaves is
+    /// what has always meant "across the whole organization".
+    /// </summary>
+    private void MigrateSingleScope()
+    {
+        if (Ado.Project is null && Ado.AreaPath is null) return;
+
+        var area = (Ado.AreaPath ?? "").Trim();
+        var project = (Ado.Project ?? "").Trim();
+        if (project.Length == 0 && area.Length > 0)
+            project = area.Split('\\', 2)[0];
+
+        Ado.Project = null;
+        Ado.AreaPath = null;
+
+        if (project.Length == 0) return;
+
+        var migrated = new AdoScope { Project = project, AreaPath = area };
+
+        // First in the list, since it is the board this setup has always used - which is also
+        // what the project-scoped calls fall back to. Skipped when a list already names it,
+        // which a hand-edited file can manage.
+        if (!Ado.Scopes.Any(s => s.SameBoard(migrated))) Ado.Scopes.Insert(0, migrated);
+    }
+
+    /// <summary>
+    /// Brings the board list back to something the query builder can use: no blank projects,
+    /// no stray whitespace, and no board listed twice - a second copy would fetch the same
+    /// work again and give it a second chip that only half worked.
+    ///
+    /// An area equal to its own project is stored as no area at all. It is what the area
+    /// picker hands back for "the whole project", and holding both spellings would let the
+    /// same board be added twice and read as two different ones.
+    /// </summary>
+    private void TidyScopes()
+    {
+        var tidied = new List<AdoScope>(Ado.Scopes.Count);
+
+        foreach (var scope in Ado.Scopes)
+        {
+            if (scope is null) continue;
+
+            scope.Project = (scope.Project ?? "").Trim();
+            scope.AreaPath = (scope.AreaPath ?? "").Trim();
+            if (scope.Project.Length == 0) continue;
+
+            if (string.Equals(scope.AreaPath, scope.Project, StringComparison.OrdinalIgnoreCase))
+                scope.AreaPath = "";
+
+            if (!tidied.Any(kept => kept.SameBoard(scope))) tidied.Add(scope);
+        }
+
+        Ado.Scopes = tidied;
+    }
+}
+
+/// <summary>
+/// One board's worth of work: a project, and optionally an area inside it. Everything beneath
+/// the area counts, so a top-level area takes in all of its sub-areas; no area at all means
+/// the whole project.
+///
+/// <see cref="Enabled"/> is what the chips above the work item list turn on and off. It lives
+/// here rather than in the UI because it is one setting in both places, the way "only mine"
+/// is: hiding a board is about what you are looking at now, and it must not quietly take the
+/// board out of the settings you spent time choosing.
+/// </summary>
+public sealed class AdoScope
+{
+    public string Project { get; set; } = "";
+
+    /// <summary>The area to list work from. Empty means the whole project.</summary>
+    public string AreaPath { get; set; } = "";
+
+    /// <summary>On by default: a board nobody asked to hide is a board to show.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Two rows describe the same board when they name the same project and area. Used to
+    /// refuse a duplicate in the Settings page, and to find the row a chip belongs to in the
+    /// draft that will be saved - the chip is holding the live settings' copy, not that one.
+    /// </summary>
+    public bool SameBoard(AdoScope other) =>
+        string.Equals(Project, other.Project, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(AreaPath, other.AreaPath, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// What to call this board on a chip: the last part of the area, or the project when the
+    /// board takes the project whole. The leaf alone, because a chip has no room for a full
+    /// path - <see cref="Describe"/> is what the chip's tooltip carries.
+    /// </summary>
+    [JsonIgnore]
+    public string Label
+    {
+        get
+        {
+            if (AreaPath.Length == 0) return Project;
+
+            var slash = AreaPath.LastIndexOf('\\');
+            return slash >= 0 ? AreaPath[(slash + 1)..] : AreaPath;
+        }
+    }
+
+    /// <summary>The board written out in full, for a tooltip or an error message.</summary>
+    public string Describe() => AreaPath.Length == 0 ? Project : AreaPath;
 }
 
 public sealed class AdoSettings
 {
     /// <summary>e.g. https://dev.azure.com/contoso</summary>
     public string OrganizationUrl { get; set; } = "";
-    public string Project { get; set; } = "";
+
+    /// <summary>
+    /// The boards work is listed from, in the order they were added. Several, because work
+    /// often lives on more than one: the list on screen is all of them at once, and each can
+    /// be hidden for a while with its own chip.
+    ///
+    /// An empty list is not a broken one - it is the same "nothing chosen yet" an org URL on
+    /// its own has always been, and asks across every project the credential can see.
+    /// </summary>
+    public List<AdoScope> Scopes { get; set; } = [];
+
+    /// <summary>
+    /// The single project this setting used to be, kept only to be folded into
+    /// <see cref="Scopes"/>: <see cref="AppSettings.Normalize"/> moves it across and nulls it,
+    /// so a file written since carries the board list alone and the two can never disagree.
+    /// Null rather than empty for exactly that reason - a null is left out of the file.
+    /// </summary>
+    public string? Project { get; set; }
+
+    /// <summary>The area that went with <see cref="Project"/>, migrated and nulled with it.</summary>
+    public string? AreaPath { get; set; }
+
+    /// <summary>
+    /// The board the parts of the API that can only be addressed one project at a time use:
+    /// a saved query, custom WIQL, the saved-query list itself, and the team roster behind
+    /// the @-mention picker. The first board in the list, whether or not it is hidden - a
+    /// chip is about what you are looking at, not about where somebody else's query lives.
+    /// Empty when no board is configured, which those callers each answer for themselves.
+    /// </summary>
+    [JsonIgnore]
+    public string PrimaryProject => Scopes.Count > 0 ? Scopes[0].Project : "";
+
+    /// <summary>The boards not currently hidden by their chip.</summary>
+    [JsonIgnore]
+    public IEnumerable<AdoScope> EnabledScopes => Scopes.Where(s => s.Enabled);
+
+    /// <summary>
+    /// The board list as one line, for the stamp that says which connection a cached list
+    /// came from. The hidden flag is in it on purpose: a board turned off must not have its
+    /// items come back from the cache on the next launch looking current.
+    /// </summary>
+    [JsonIgnore]
+    public string ScopeStamp =>
+        string.Join(";", Scopes.Select(s => $"{s.Project}>{s.AreaPath}>{(s.Enabled ? "on" : "off")}"));
+
     /// <summary>
     /// Microsoft sign-in by default: the Connect card leads with it and a new install that
     /// followed that card would otherwise never count as configured, because a token it was
@@ -123,13 +282,7 @@ public sealed class AdoSettings
     public string CustomWiql { get; set; } = "";
 
     /// <summary>
-    /// The area to list work from. Everything beneath it counts, so a top-level area takes in
-    /// all of its sub-areas; empty means the whole project.
-    /// </summary>
-    public string AreaPath { get; set; } = "";
-
-    /// <summary>
-    /// Narrow the list to your own work. On by default - together with an empty area path
+    /// Narrow the list to your own work. On by default - together with an empty board list
     /// that is exactly the "assigned to me" list this used to be, which is why an existing
     /// settings file needs no migrating.
     /// </summary>

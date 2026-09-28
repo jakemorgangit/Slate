@@ -40,7 +40,8 @@ On first launch the app opens on **Settings**, because it needs a couple of thin
 ![The Settings page: organization URL, sign-in method, personal access token and project
 ](docs/screenshots/04-settings.png)
 
-> The Settings screenshot predates the single **Connect** card and the removal of the Save button.
+> The Settings screenshot predates the single **Connect** card, the removal of the Save button, and
+> the board list that replaced the single project and area.
 
 ---
 
@@ -69,7 +70,8 @@ instead*: in Azure DevOps go to *User settings → Personal access tokens → Ne
 **Work Items (Read & Write)** scope — write is what lets you record time. It is stored encrypted
 with Windows DPAPI under your user account, so nobody else on the machine can read it.
 
-Optionally choose a **project**; leaving it blank queries across everything you can see.
+Then add a **board** — a project, and optionally an area inside it — for every board your work lives
+on. Adding none queries across every project you can see.
 
 Then choose which work items appear: **area and assignment** (with finished states filtered out), a
 **saved query** from your Queries hub, or your own **WIQL**.
@@ -301,15 +303,37 @@ The block stays put either way. Turn the offer off in Settings, or from the noti
 
 ## Which work items
 
+### Boards
+
+A **board** is a project, optionally narrowed to an area inside it. Add one per board your work
+lives on — *Contoso*, *Contoso\DevOps*, *Fabrikam\Platform* — and the sidebar shows all of them at
+once, as one list you drag from. Adding none asks across every project you can see, which is where a
+new install starts; removing the last one puts you back there rather than leaving anything broken.
+
+Each board is queried on its own rather than being folded into one organization-wide query. That
+costs a request per board and buys three things: each board gets its own 500-item allowance instead
+of a busy board crowding out a quiet one, a board that cannot be read fails alone and leaves the
+others on screen, and the query sent for each board is the one this app has always sent.
+
+Every board gets a **chip** above the work item list, on the plan's sidebar and on the Work items
+tab. Turning one off hides that board's work and re-runs the query; turning it back on brings it
+straight back. It never takes the board out of Settings — that is what the ✕ beside it is for. The
+chips only appear once there is more than one board, and while the list is drawn from more than one,
+each card and table row says which board its work item came from.
+
+An existing setup upgrades silently: the one project and area you had become the first board.
+
+### Area and assignment
+
 The default source, **Area and assignment**, is two independent choices rather than one list:
 
-- **Area** — where the work lives. Everything beneath the area counts, so a top-level area takes in
-  all of its sub-areas. Leave it empty for the whole project.
+- **The boards** — where the work lives. Everything beneath a board's area counts, so a top-level
+  area takes in all of its sub-areas. Leave the area at the project for the whole project.
 - **Only work items assigned to me** — whose it is. On by default.
 
 Left alone, that is exactly the *assigned to me* list it has always been, which is why upgrading
-changes nothing. Set an area to plan around a team's work; turn the toggle off to see everything in
-that area rather than only your own.
+changes nothing. Set an area to plan around a team's work; turn the toggle off to see everything on
+those boards rather than only your own.
 
 The area is chosen from the project's own tree, one dropdown per level: the project root, then the
 level below it, and so on as deep as the tree goes. Leaving a level unset means *everything beneath
@@ -320,15 +344,18 @@ under it. Only narrow further if you want the narrower list.
 on the Work items tab, and as a chip at the top of the plan's sidebar. It is the same setting in all
 three places, so flipping it anywhere flips it everywhere and re-runs the query.
 
-With no area *and* no assignment filter you are asking for the whole project. Azure DevOps returns
-the first 500 matches, so the list can be cut short without saying so — Settings warns when that
-combination is selected.
+With a whole project on a board *and* no assignment filter you are asking for everything in it.
+Azure DevOps returns the first 500 matches per board, so the list can be cut short without saying
+so — Settings warns when that combination is selected.
 
 **A saved query** and **Custom WIQL** are deliberately left alone by both controls. A saved query is
 run by id, so there is no query text to amend, and narrowing either one afterwards would mean
 filtering an already-capped result set: it would look authoritative while quietly missing anything
 past the cap. To limit a saved query to your own work, edit or clone it in Azure DevOps, where the
 definition belongs.
+
+Both are also addressed to a single project, so both run in the **first board's** project and the
+board chips do not apply to them. Settings says which project that is, underneath each.
 
 ## Your hours
 
@@ -443,7 +470,7 @@ with your own comments accented. Azure DevOps shows it newest-first; a toggle sw
 two. The box underneath posts a comment straight to Azure DevOps, so notes do not mean a trip to
 the browser.
 
-Type `@` and a name to **mention a colleague**. The list comes from the teams in your project, and
+Type `@` and a name to **mention a colleague**. The list comes from the teams in your boards' projects, and
 picking someone from it posts a real Azure DevOps mention that notifies them. Typing a name out in
 full works just as well — any name the app recognises becomes a mention on the way out. People
 it cannot resolve to an identity still read correctly, just without the link, and the picker says
@@ -482,6 +509,88 @@ back to a plain text box and says why.
 Only the project, type and title are needed. An assignee Azure DevOps will not resolve is dropped
 rather than being allowed to fail the whole thing — losing a filled-in form to a stale display
 name is a poor trade for an item that would have been created unassigned anyway.
+
+## Migrating a work item
+
+Areas go legacy and teams get new projects, and the work already raised has to follow. **Migrate…**
+— on the right-click menu of a card in the Plan sidebar, on a row of the Work items table, and along
+the bottom of the work item window — copies a work item into its new home, references the old one,
+and closes the old one off.
+
+**Choosing where it goes.** Project, then the area from that project's own tree, then the work item
+type. The type defaults to the one it already is; where the target project's process has no such
+type, nothing is chosen for you and the wizard says so, because guessing what a Bug becomes is not
+a decision to make on your behalf. The iteration comes across when the same one exists in the new
+project and is left to the project's default when it does not, and it says which.
+
+**Seeing it first.** Nothing at all is written until the button on the second page. That page lists
+every field going over with its value, how many comments there are, every attachment with its size,
+the parent and each child that will be referenced — and a line for everything that is *not* being
+copied, with the reason. A discussion Slate could not read is shown as exactly that, and not as a
+work item without one.
+
+### What comes over
+
+Title, description, and any rich text the item carries — repro steps, acceptance criteria, system
+info, custom HTML fields. Tags, priority, all three estimates (original, remaining, completed),
+assignee, and every other field the target type has. The whole discussion, each comment led by the
+name of whoever wrote it and the date, because Azure DevOps has no way to post as somebody else and
+would otherwise attribute the lot to you, today. Every attachment, downloaded and uploaded again,
+with progress and a Cancel button.
+
+### What does not, and why
+
+| Not copied | Why |
+| --- | --- |
+| Revision history | Azure DevOps builds it from the changes made to a work item; it cannot be written. The original is closed, not deleted, and stays readable to anybody who can see its project. |
+| Hours already recorded | The hours stay booked against the original: Slate's time entries, the Time tab and Undo all still point there. Completed Work *does* come over as a number — the copy should say the work was done — so both work items state those hours and a report adding the two together would count them twice. |
+| Parent and child links | A hierarchy link cannot cross a project. The parent and each child get a *Related* reference to the copy instead, and are not otherwise touched or moved. |
+| State and reason | The copy starts at the first state of its type in the target process; a state named by another process may not exist there. |
+| Created/changed by and dates | The service stamps these itself and cannot back-date them. |
+| Build, pull request and other artefact links | They point at work done on the original and belong to its history. |
+| Its other work item links | Related, Duplicate, Predecessor, Successor and Tested By links say where *this* work item sits among the work around it. They stay on it, named on the review page, and the copy's own *Related* link back puts them one hop away. |
+| Slate's own migration notes | A note saying this work item was migrated belongs to it. Copied over, it would have the new one claiming it had been migrated somewhere itself. |
+| The addresses inside pasted pictures | The markup is copied exactly, so a pasted screenshot still points at the file attached to the original. The files themselves *are* copied; it is the addresses inside the text that still lead back, so somebody who can see only the new project sees a broken picture. Named on the review page when there is one. |
+| A field the target type has not got | Named on the review page rather than sent and refused. |
+
+An assignee the target project cannot resolve is dropped so the copy is still raised, and the wizard
+says which field it had to leave off. A *Related* link is kept on both ends by Azure DevOps, so the
+parent and children will each show one back to the copy — that is the one way in which they change,
+and the wizard says so before you start.
+
+### Order, and what happens when something fails
+
+The copy is raised first. Then the two work items are linked to each other — early, so the trail
+exists before anything slow does. Then the parent and children are referenced, the discussion is
+copied, and the attachments follow. The original is touched last: the note naming the copy, then the
+state — **Removed** on Agile and Scrum, **Cancelled** on CMMI, whatever your own process calls it,
+offered from the states that process actually allows, or left open if you would rather. The calendar
+blocks, which are local, come after all of it.
+
+Every step is listed with what it did, or why it did not. The original is **never** closed unless the
+copy exists *and* something says where the work went — either the two are linked to each other, or
+the original's discussion names the copy — so a work item is never cancelled with nothing on it to
+say where its work went. Nor is it closed when its discussion could not be read at all: that is a
+failure rather than an empty discussion, and it leaves the original open unless you tick to say you
+have compared the two yourself.
+
+The copy's id is on screen either way, so nothing is left stranded without a name, and **Finish the
+rest** picks up exactly where a failed or cancelled run stopped — it will not raise a second copy,
+and it will not repeat a comment or an attachment, including one Azure DevOps accepted without
+saying so. Anything in that position is named on the step rather than sent again, because a
+duplicate comment cannot be told from the original afterwards while a missing one can be pointed at.
+Cancelling stops between one comment, file or link and the next; what is already written stays
+written.
+
+The one thing none of that covers is a create that went out and got no answer back. There may be a
+copy in the target project and there may not — nothing is written on the original at that point, so
+there is nothing to read back. The wizard says so plainly, names the project and the title to go and
+look for, and will not run again until you tick to say you have looked.
+
+Calendar blocks pointing at the original are offered, ticked by default, to be pointed at the copy.
+Hours already recorded stay where they are. Both choices — the closing state and which blocks — are
+remembered as the run started, so finishing a run later does what you asked for then rather than
+what the defaults would be now.
 
 ## Sorting the table
 

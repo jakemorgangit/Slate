@@ -1,0 +1,713 @@
+@using Slate.Services
+@implements IDisposable
+
+@inject WorkItemMigrator Migrator
+
+@* The migration wizard, in four pages: choose where the work item goes, see exactly what will
+   happen, watch it happen, then read what did. Nothing at all is written until the button on
+   the second page. *@
+
+@if (Migrator.IsOpen)
+{
+    @* Handles its own Escape, and data-own-escape keeps the window-level shortcut from acting on
+       the same key press: this is drawn above every other dialog, and a key reaching past it
+       would close the work item window behind it and then throw away a day's typed hours. *@
+    <div class="modal-scrim" data-own-escape tabindex="-1"
+         @onclick="Close" @onkeydown="OnKeyDown">
+        <div class="modal" @onclick:stopPropagation="true">
+
+            <div class="modal-head">
+                <span style="color: var(--accent); font-size: 17px; margin-top: 1px">⇥</span>
+                <div class="grow">
+                    <h2>@Heading</h2>
+                    <div class="sub">
+                        @if (Migrator.Source is { } head)
+                        {
+                            <span class="dot" style="background: @Ui.ColorFor(head.WorkItemType)"></span>
+                            <span class="mono">#@head.Id</span>
+                            <span class="truncate">@head.Title</span>
+                        }
+                        else
+                        {
+                            <span class="mono">#@Migrator.SourceId</span>
+                        }
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-ghost" title="Close" disabled="@Migrator.IsRunning"
+                        @onclick="Close">✕</button>
+            </div>
+
+            <div class="modal-body">
+                @if (Migrator.LoadError is { } loadError)
+                {
+                    <div class="banner error">
+                        <span>✕</span>
+                        <div class="grow">Could not read that work item. @loadError</div>
+                    </div>
+                }
+
+                @* Not inside a page: a migration refused before it started leaves the review
+                   page up, and the reason has to be there rather than only in a toast. *@
+                @if (Migrator.RunError is { } runError)
+                {
+                    <div class="banner error">
+                        <span>✕</span>
+                        <div class="grow">@runError</div>
+                    </div>
+                }
+
+                @if (Migrator.IsLoading)
+                {
+                    <div class="row">
+                        <span class="spinner"></span>
+                        <span class="muted">Reading #@Migrator.SourceId…</span>
+                    </div>
+                }
+                else if (Migrator.Source is { } source)
+                {
+                    @* ------------------------------------------------ page 1: where it goes *@
+                    @if (Migrator.Stage == MigrationStage.Target)
+                    {
+                        @if (Migrator.AlreadyCopiedTo is int copy)
+                        {
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">
+                                    This work item looks as though it has already been migrated, to
+                                    <strong>#@copy</strong> &mdash; a link on it or a note in its discussion says so.
+                                    Migrating it again would raise a second copy, so look at #@copy first.
+                                </div>
+                            </div>
+                        }
+
+                        <div class="banner info">
+                            <span>i</span>
+                            <div class="grow">
+                                A copy of <strong>#@source.Id</strong> is raised where you choose below, the two are
+                                linked to each other, and <strong>#@source.Id</strong> is then closed. Nothing is
+                                written until you have seen the full list on the next page.
+                            </div>
+                        </div>
+
+                        <div class="grid-2">
+                            <div class="field">
+                                <label for="mig-project">Project</label>
+                                <select id="mig-project" class="input" value="@Migrator.TargetProject"
+                                        @onchange="OnProject">
+                                    @foreach (var name in ProjectNames)
+                                    {
+                                        <option value="@name">@name</option>
+                                    }
+                                </select>
+                                <span class="hint">@ProjectHint(source)</span>
+                            </div>
+
+                            <div class="field">
+                                <label for="mig-type">Work item type</label>
+                                @if (Migrator.TargetTypes.Count == 0)
+                                {
+                                    <input id="mig-type" class="input" value="@Migrator.TargetType"
+                                           @onchange="OnType" />
+                                    <span class="hint">Must exist in @Migrator.TargetProject's process.</span>
+                                }
+                                else
+                                {
+                                    <select id="mig-type" class="input" value="@Migrator.TargetType"
+                                            @onchange="OnType">
+                                        <option value="">Choose a type…</option>
+                                        @foreach (var type in Migrator.TargetTypes)
+                                        {
+                                            <option value="@type">@type</option>
+                                        }
+                                    </select>
+                                    <span class="hint">@TypeHint(source)</span>
+                                }
+                            </div>
+                        </div>
+
+                        @if (Migrator.TypeMissingInTarget)
+                        {
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">
+                                    <strong>@Migrator.TargetProject</strong> has no
+                                    <strong>@source.WorkItemType</strong>, so Slate will not choose for you &mdash;
+                                    pick the type the copy should be raised as. Fields that type does not have are
+                                    listed on the next page rather than being sent and refused.
+                                </div>
+                            </div>
+                        }
+
+                        @* Capped: the picker's levels share the row, and a modal this wide would
+                           give each of them far more room than an area name ever needs. *@
+                        <div class="field" style="max-width: 560px">
+                            <label for="mig-area">Area path</label>
+                            <AreaPathPicker Id="mig-area" Value="@Migrator.TargetArea"
+                                            ValueChanged="Migrator.ChooseArea"
+                                            Root="Migrator.AreaTree" Note="@Migrator.TargetNote" />
+                        </div>
+
+                        <div class="field">
+                            <label>Iteration</label>
+                            <span class="hint">@IterationHint(source)</span>
+                        </div>
+
+                        @if (Migrator.TargetIsWhereItAlreadyIs)
+                        {
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">
+                                    That is where <strong>#@source.Id</strong> already is. Migrating it onto itself
+                                    would raise a duplicate and cancel the original &mdash; choose a different
+                                    project or area.
+                                </div>
+                            </div>
+                        }
+                    }
+
+                    @* ------------------------------------------- page 2: what will happen *@
+                    else if (Migrator.Stage == MigrationStage.Review)
+                    {
+                        <div class="banner info">
+                            <span>i</span>
+                            <div class="grow">
+                                A <strong>@Migrator.TargetType</strong> is raised in <strong>@TargetWhere</strong>
+                                first, then the two are linked, the parent and children are referenced, and the
+                                discussion and the attachments go onto the copy. <strong>#@source.Id</strong> is
+                                touched last: the note naming the copy, then its state. If anything fails part way
+                                you are told exactly what was and was not done, and #@source.Id is never closed
+                                unless the copy exists <em>and</em> something says where the work went &mdash;
+                                either the two linked to each other, or the note naming the copy.
+                            </div>
+                        </div>
+
+                        @if (!string.IsNullOrWhiteSpace(Migrator.FieldNote))
+                        {
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">@Migrator.FieldNote</div>
+                            </div>
+                        }
+
+                        <div class="modal-section">
+                            <h3>Going onto the copy &mdash; @Migrator.Carrying.Count fields</h3>
+                            <div class="mig-list">
+                                @foreach (var field in Migrator.Carrying)
+                                {
+                                    <div class="mig-row">
+                                        <span class="k">@field.Label</span>
+                                        <span class="v">@field.Display</span>
+                                    </div>
+                                }
+                            </div>
+                        </div>
+
+                        <div class="modal-section">
+                            <h3>Discussion</h3>
+                            @if (source.DiscussionError is { } discussionError)
+                            {
+                                @* Deliberately not the same as "there is no discussion": nobody may
+                                   assume a question that went unanswered means the answer is none. *@
+                                <div class="banner warn" style="margin: 0 0 8px">
+                                    <span>!</span>
+                                    <div class="grow">
+                                        <strong>#@source.Id's discussion could not be read</strong>, so none of it
+                                        will be copied and Slate cannot say whether there is any.
+                                        @discussionError
+                                        <div style="margin-top: 7px">
+                                            <label class="switch">
+                                                <input type="checkbox" checked="@Migrator.DiscussionAcknowledged"
+                                                       @onchange="OnAcknowledgeDiscussion" />
+                                                <span class="track"></span>
+                                                <span class="label">
+                                                    I have looked at #@source.Id's discussion myself &mdash; close it
+                                                    anyway
+                                                </span>
+                                            </label>
+                                        </div>
+                                        <div class="muted" style="margin-top: 5px; font-size: 11.5px">
+                                            Left unticked, <strong>#@source.Id</strong> is left exactly as it is: a
+                                            work item must not be closed on the strength of a discussion nobody has
+                                            read.
+                                        </div>
+                                    </div>
+                                </div>
+                            }
+                            else
+                            {
+                                <span class="hint">
+                                    @if (source.Comments.Count == 0)
+                                    {
+                                        <text>There is nothing in #@source.Id's discussion to copy.</text>
+                                    }
+                                    else
+                                    {
+                                        <text>
+                                            All <strong>@source.Comments.Count</strong> comments are copied, each led
+                                            by the name of whoever wrote it and the date they wrote it. Azure DevOps
+                                            has no way to post as somebody else, so it will record
+                                            <strong>you</strong> as the author of every copy &mdash; which is exactly
+                                            why the original author and date are written into the text.
+                                        </text>
+                                    }
+                                </span>
+                                @if (source.CommentsNotCarried > 0)
+                                {
+                                    <div class="banner warn" style="margin: 8px 0 0">
+                                        <span>!</span>
+                                        <div class="grow">
+                                            <strong>#@source.Id</strong> has
+                                            <strong>@source.CommentsNotCarried</strong> more comments than Slate reads
+                                            in one pass, and those will <strong>not</strong> be copied. Copy anything
+                                            that matters across by hand before closing it.
+                                        </div>
+                                    </div>
+                                }
+                            }
+                        </div>
+
+                        <div class="modal-section">
+                            <h3>Attachments</h3>
+                            @if (source.Attachments.Count == 0)
+                            {
+                                <span class="hint">#@source.Id has no attachments.</span>
+                            }
+                            else
+                            {
+                                <div class="mig-list">
+                                    @foreach (var file in source.Attachments)
+                                    {
+                                        <div class="mig-row">
+                                            <span class="k">@file.SizeLabel</span>
+                                            <span class="v">@file.Name</span>
+                                        </div>
+                                    }
+                                </div>
+                                <span class="hint" style="margin-top: 7px">
+                                    Each one is downloaded and uploaded again, so a large file takes a while &mdash;
+                                    there is a Cancel button while it runs, and one that will not come over costs
+                                    only itself. The originals stay on #@source.Id either way.
+                                </span>
+                            }
+                        </div>
+
+                        <div class="modal-section">
+                            <h3>Parent and children</h3>
+                            @if (source.ParentId is null && source.ChildIds.Count == 0)
+                            {
+                                <span class="hint">#@source.Id has no parent and no children.</span>
+                            }
+                            else
+                            {
+                                <div class="mig-list">
+                                    @if (source.ParentId is int parent)
+                                    {
+                                        <div class="mig-row">
+                                            <span class="k">Parent</span>
+                                            <span class="v">#@parent &mdash; referenced as Related, not moved</span>
+                                        </div>
+                                    }
+                                    @foreach (var child in source.ChildIds)
+                                    {
+                                        <div class="mig-row">
+                                            <span class="k">Child</span>
+                                            <span class="v">#@child &mdash; referenced as Related, not moved</span>
+                                        </div>
+                                    }
+                                </div>
+                                <span class="hint" style="margin-top: 7px">
+                                    A parent link cannot cross a project, which is why these are references rather
+                                    than a rebuilt tree. Azure DevOps keeps a Related link on both ends, so each of
+                                    them will show a Related link back to the copy. Nothing else about them changes,
+                                    and they stay exactly where they are.
+                                </span>
+                            }
+                        </div>
+
+                        <div class="modal-section">
+                            <h3>Not copied</h3>
+                            <div class="mig-list">
+                                @foreach (var skip in Migrator.LeavingBehind)
+                                {
+                                    <div class="mig-row">
+                                        <span class="k">@skip.Label</span>
+                                        <span class="v muted">@skip.Why</span>
+                                    </div>
+                                }
+                            </div>
+                        </div>
+
+                        <div class="modal-section">
+                            <h3>Closing #@source.Id</h3>
+                            @if (Migrator.ClosingStates.Count == 0)
+                            {
+                                <span class="hint">@NoStatesHint(source)</span>
+                            }
+                            else
+                            {
+                                <select class="input" style="max-width: 340px" value="@Migrator.ClosingState"
+                                        @onchange="OnClosingState">
+                                    <option value="">Leave it as @source.State</option>
+                                    @foreach (var option in Migrator.ClosingStates)
+                                    {
+                                        <option value="@option.Name">@StateLabel(option)</option>
+                                    }
+                                </select>
+                                <span class="hint" style="margin-top: 7px">
+                                    Every state this type allows, as its own process names them. Agile and Scrum call
+                                    the cancelled one <strong>Removed</strong>, CMMI calls it
+                                    <strong>Cancelled</strong>, and a custom process calls it whatever it likes
+                                    &mdash; so the choice is yours. Azure DevOps refuses a move its process does not
+                                    allow, and says so.
+                                </span>
+                            }
+                        </div>
+
+                        <div class="modal-section">
+                            <h3>Calendar blocks</h3>
+                            @if (Migrator.Blocks.Count == 0)
+                            {
+                                <span class="hint">No block in your plan points at #@source.Id.</span>
+                            }
+                            else
+                            {
+                                <div class="mig-blocks">
+                                    @foreach (var block in Migrator.Blocks)
+                                    {
+                                        var id = block.Id;
+                                        <label class="switch">
+                                            <input type="checkbox" checked="@Migrator.Repointing.Contains(id)"
+                                                   @onchange="e => ToggleBlock(id, e)" />
+                                            <span class="track"></span>
+                                            <span class="label">
+                                                @Ui.RelativeDay(block.Start),
+                                                @Ui.TimeRange(block.Start, block.End)
+                                                &mdash; @Ui.Duration(block.DurationMinutes)
+                                            </span>
+                                        </label>
+                                    }
+                                </div>
+                                <span class="hint" style="margin-top: 7px">
+                                    Ticked blocks point at the copy once it exists, so time booked from them lands on
+                                    the new work item. Hours <strong>already</strong> recorded stay booked against
+                                    #@source.Id and are not moved &mdash; see <em>Not copied</em> above for what
+                                    that means for Completed Work.
+                                </span>
+                            }
+                        </div>
+                    }
+
+                    @* ------------------------------------------- pages 3 and 4: the run *@
+                    else
+                    {
+                        @if (Migrator.Stage == MigrationStage.Finished)
+                        {
+                            @if (Migrator.CopyMayExist)
+                            {
+                                @* Never the red "nothing was changed" banner: the request went out
+                                   and no answer came back, so there may well be a copy. *@
+                                <div class="banner warn">
+                                    <span>!</span>
+                                    <div class="grow">
+                                        <strong>There may be a copy in @Migrator.TargetProject.</strong> Azure DevOps
+                                        was asked to raise one and never said whether it did, so Slate has no id to
+                                        name. Nothing on <strong>#@source.Id</strong> was changed &mdash; it is still
+                                        @source.State &mdash; but look in <strong>@Migrator.TargetProject</strong> for
+                                        a <strong>@Migrator.TargetType</strong> called &ldquo;@source.Title&rdquo;
+                                        before migrating it again, because running this a second time could leave two.
+                                    </div>
+                                </div>
+                            }
+                            else if (Migrator.NewItemId is not int created)
+                            {
+                                <div class="banner error">
+                                    <span>✕</span>
+                                    <div class="grow">
+                                        No copy was raised, so nothing at all was changed &mdash;
+                                        <strong>#@source.Id</strong> is exactly as it was, still @source.State.
+                                    </div>
+                                </div>
+                            }
+                            else if (!Migrator.EveryStepSettled)
+                            {
+                                @* Off the steps, not off a cancellation flag: the wizard closed and
+                                   opened again has forgotten the flag but still has the steps. *@
+                                <div class="banner warn">
+                                    <span>!</span>
+                                    <div class="grow">
+                                        Stopped part way. <strong>#@created</strong> was raised in
+                                        <strong>@Migrator.TargetProject</strong> and is still there &mdash; it is not
+                                        removed, and running this again will not raise a second one. Only the steps
+                                        marked below were done; the ones still waiting have not been tried.
+                                        <strong>Finish the rest</strong> carries on from there.
+                                    </div>
+                                </div>
+                            }
+                            else if (Migrator.AnythingFailed)
+                            {
+                                <div class="banner warn">
+                                    <span>!</span>
+                                    <div class="grow">
+                                        <strong>#@created</strong> was raised in
+                                        <strong>@Migrator.TargetProject</strong>, but not everything went over. What
+                                        failed is named below. <strong>Finish the rest</strong> retries only what is
+                                        left &mdash; it will not raise a second copy, and it will not repeat a comment
+                                        or an attachment, including one Azure DevOps never answered for.
+                                    </div>
+                                </div>
+                            }
+                            else
+                            {
+                                <div class="banner ok">
+                                    <span>✓</span>
+                                    <div class="grow">
+                                        <strong>#@source.Id</strong> has been migrated to <strong>#@created</strong>
+                                        in <strong>@Migrator.TargetProject</strong>.
+                                    </div>
+                                </div>
+                            }
+                        }
+
+                        @if (Migrator.Stage == MigrationStage.Finished && Migrator.AwaitingDiscussionAcknowledgement)
+                        {
+                            @* The review page is never shown again once a copy exists, so the one
+                               tickbox that can still let the original be closed has to be here. *@
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">
+                                    <strong>#@source.Id</strong> is still @source.State because its discussion could
+                                    not be read, so Slate cannot say the copy has all of it.
+                                    <div style="margin-top: 7px">
+                                        <label class="switch">
+                                            <input type="checkbox" checked="@Migrator.DiscussionAcknowledged"
+                                                   @onchange="OnAcknowledgeDiscussion" />
+                                            <span class="track"></span>
+                                            <span class="label">
+                                                I have compared the two myself &mdash; <strong>Finish the rest</strong>
+                                                may close it
+                                            </span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+
+                        <div class="mig-steps">
+                            @foreach (var step in Migrator.Steps)
+                            {
+                                <div class="mig-step @StepClass(step)">
+                                    <span class="glyph">
+                                        @if (step.State == MigrationStepState.Running)
+                                        {
+                                            <span class="spinner"></span>
+                                        }
+                                        else
+                                        {
+                                            @StepGlyph(step)
+                                        }
+                                    </span>
+                                    <div class="grow">
+                                        <div class="what">@step.Name</div>
+                                        @if (!string.IsNullOrWhiteSpace(step.Detail))
+                                        {
+                                            <div class="detail">@step.Detail</div>
+                                        }
+                                    </div>
+                                </div>
+                            }
+                        </div>
+                    }
+                }
+            </div>
+
+            <div class="modal-foot">
+                @if (Migrator.Stage == MigrationStage.Target)
+                {
+                    <span class="muted" style="font-size: 11.5px">Nothing is written yet.</span>
+                    <span style="flex: 1"></span>
+                    <button class="btn" @onclick="Close">Cancel</button>
+                    <button class="btn btn-primary" disabled="@(!Migrator.CanReview)" @onclick="Migrator.Review">
+                        @if (Migrator.IsLoadingTarget)
+                        {
+                            <span class="spinner on-accent"></span>
+                            <span>Reading @Migrator.TargetProject…</span>
+                        }
+                        else
+                        {
+                            <span>See what will happen →</span>
+                        }
+                    </button>
+                }
+                else if (Migrator.Stage == MigrationStage.Review)
+                {
+                    <button class="btn btn-sm btn-ghost" @onclick="Migrator.Back">Back</button>
+                    <span style="flex: 1"></span>
+                    <button class="btn" @onclick="Close">Cancel</button>
+                    <button class="btn btn-primary" @onclick="Migrator.RunAsync">Migrate #@Migrator.SourceId</button>
+                }
+                else if (Migrator.Stage == MigrationStage.Running)
+                {
+                    <span class="muted" style="font-size: 11.5px">
+                        Cancelling stops between one comment, file or link and the next; nothing already written is
+                        undone. Raising the copy is the one thing it can leave in doubt, and the wizard says so.
+                    </span>
+                    <span style="flex: 1"></span>
+                    <button class="btn btn-danger" @onclick="Migrator.Cancel">Cancel the migration</button>
+                }
+                else
+                {
+                    @if (Migrator.NewItemId is int newId)
+                    {
+                        <button class="btn" @onclick="OpenNew">Open #@newId in Azure DevOps ↗</button>
+                    }
+                    else if (Migrator.CopyMayExist)
+                    {
+                        @* Not offered on its own: starting again over a copy that was in fact raised
+                           is how a work item ends up migrated twice, and only the user can look. *@
+                        <label class="switch" title="Slate cannot check for you - the create leaves no mark on the original">
+                            <input type="checkbox" checked="@Migrator.RestartAcknowledged"
+                                   @onchange="OnAcknowledgeRestart" />
+                            <span class="track"></span>
+                            <span class="label">I looked in @Migrator.TargetProject; there is no copy</span>
+                        </label>
+                        <button class="btn btn-danger" disabled="@(!Migrator.RestartAcknowledged)"
+                                title="Only once you have checked: a copy that was raised would be joined by a second"
+                                @onclick="Migrator.Restart">Start again anyway</button>
+                    }
+                    else
+                    {
+                        <button class="btn" title="Nothing was raised, so there is nothing to duplicate"
+                                @onclick="Migrator.Restart">Start again</button>
+                    }
+                    <span style="flex: 1"></span>
+                    @if (Migrator.IsResuming && !Migrator.IsFinished)
+                    {
+                        <button class="btn" title="Only what is left; nothing is done twice"
+                                @onclick="Migrator.RunAsync">Finish the rest</button>
+                    }
+                    <button class="btn btn-primary" @onclick="Close">Close</button>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    protected override void OnInitialized() => Migrator.Changed += OnChanged;
+
+    private void OnChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Migrator.Changed -= OnChanged;
+
+    private string Heading => Migrator.Stage switch
+    {
+        MigrationStage.Target => "Migrate work item",
+        MigrationStage.Review => "This is what will happen",
+        MigrationStage.Running => "Migrating…",
+        _ => Migrator.IsFinished ? "Migrated" : "What was and was not done",
+    };
+
+    private string TargetWhere =>
+        string.IsNullOrWhiteSpace(Migrator.TargetArea) ? Migrator.TargetProject : Migrator.TargetArea;
+
+    /// <summary>
+    /// The project list with the current choice always in it: a project Slate could not list -
+    /// or the work item's own, on a token that lists only some - must not be silently swapped
+    /// for whichever name happens to sort first.
+    /// </summary>
+    private IEnumerable<string> ProjectNames
+    {
+        get
+        {
+            var names = Migrator.Projects.Select(p => p.Name).ToList();
+
+            if (Migrator.TargetProject.Length > 0
+                && !names.Contains(Migrator.TargetProject, StringComparer.OrdinalIgnoreCase))
+                names.Insert(0, Migrator.TargetProject);
+
+            return names;
+        }
+    }
+
+    private string ProjectHint(MigrationSource source) =>
+        string.IsNullOrWhiteSpace(Migrator.ProjectsNote)
+            ? $"It is in {source.Project} now."
+            : Migrator.ProjectsNote;
+
+    private string TypeHint(MigrationSource source) =>
+        Migrator.TypeMissingInTarget
+            ? $"{Migrator.TargetProject} has no {source.WorkItemType}."
+            : $"It is a {source.WorkItemType} now.";
+
+    private string IterationHint(MigrationSource source)
+    {
+        if (!string.IsNullOrWhiteSpace(Migrator.TargetIteration))
+            return $"The same iteration exists in {Migrator.TargetProject}, so the copy goes to {Migrator.TargetIteration}.";
+
+        if (!string.IsNullOrWhiteSpace(Migrator.IterationNote)) return Migrator.IterationNote;
+
+        return $"#{source.Id} is not in an iteration, so the copy will not be either.";
+    }
+
+    private string NoStatesHint(MigrationSource source) =>
+        string.IsNullOrWhiteSpace(Migrator.ClosingStatesNote)
+            ? $"Azure DevOps offered no states for a {source.WorkItemType}, so #{source.Id} will be left as it is."
+            : Migrator.ClosingStatesNote + $" #{source.Id} will be left as it is.";
+
+    /// <summary>
+    /// The state, and its category where that adds anything. Agile's "Removed (Removed)" says
+    /// the same word twice; CMMI's "Cancelled (Removed)" is what makes the choice obvious.
+    /// </summary>
+    private static string StateLabel(WorkItemStateOption option) =>
+        string.IsNullOrWhiteSpace(option.Category)
+        || string.Equals(option.Category, option.Name, StringComparison.OrdinalIgnoreCase)
+            ? option.Name
+            : $"{option.Name} ({option.Category})";
+
+    private static string Text(ChangeEventArgs e) => e.Value?.ToString() ?? "";
+
+    private Task OnProject(ChangeEventArgs e) => Migrator.ChooseProjectAsync(Text(e));
+
+    private Task OnType(ChangeEventArgs e) => Migrator.ChooseTypeAsync(Text(e));
+
+    private void OnClosingState(ChangeEventArgs e) => Migrator.ChooseClosingState(Text(e));
+
+    private void ToggleBlock(Guid id, ChangeEventArgs e) =>
+        Migrator.ToggleBlock(id, Ticked(e));
+
+    private void OnAcknowledgeDiscussion(ChangeEventArgs e) => Migrator.AcknowledgeDiscussion(Ticked(e));
+
+    private void OnAcknowledgeRestart(ChangeEventArgs e) => Migrator.AcknowledgeRestart(Ticked(e));
+
+    private static bool Ticked(ChangeEventArgs e) => e.Value is true or "true" or "on";
+
+    private void Close() => Migrator.Close();
+
+    /// <summary>
+    /// Escape closes the wizard, and Close itself refuses mid-run - Cancel is the way out of one
+    /// of those, and it is the button the footer offers.
+    /// </summary>
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Close();
+    }
+
+    private void OpenNew() => SystemShell.OpenUrl(Migrator.NewItemUrl);
+
+    private static string StepClass(MigrationStep step) => step.State switch
+    {
+        MigrationStepState.Done => "done",
+        MigrationStepState.Failed => "failed",
+        MigrationStepState.Skipped => "skipped",
+        MigrationStepState.Running => "running",
+        _ => "waiting",
+    };
+
+    private static string StepGlyph(MigrationStep step) => step.State switch
+    {
+        MigrationStepState.Done => "✓",
+        MigrationStepState.Failed => "✕",
+        MigrationStepState.Skipped => "–",
+        _ => "○",
+    };
+}

@@ -29,10 +29,14 @@ public sealed class AppState(
 
     /// <summary>
     /// Identifies the connection everything cached here was read from. A different
-    /// organization, project or way of signing in makes all of it somebody else's data.
+    /// organization, board list or way of signing in makes all of it somebody else's data.
+    ///
+    /// The whole board list, hidden flags and all: a board added, removed or turned off
+    /// changes which work the list should hold, and a cached one that predates the change
+    /// would otherwise come back on the next launch looking current.
     /// </summary>
     private string ConnectionStamp =>
-        $"{Settings.Ado.OrganizationUrl}|{Settings.Ado.Project}|{Settings.Ado.AuthMode}";
+        $"{Settings.Ado.OrganizationUrl}|{Settings.Ado.ScopeStamp}|{Settings.Ado.AuthMode}";
 
     private string _cachedFor = "";
     private readonly Lock _connectionGate = new();
@@ -71,6 +75,7 @@ public sealed class AppState(
             AreaTree = null;
             AreaTreeError = null;
             Members = [];
+            _boardFailures = [];
             ado.ForgetPeople();
 
             // The error on screen was about the old connection. Left up, it reports the new one
@@ -138,6 +143,63 @@ public sealed class AppState(
         : IsLoadingWorkItems ? $"Showing list from {Ui.Ago(WorkItemsLoadedAt)} · refreshing…"
         : WorkItemError is not null ? $"Showing list from {Ui.Ago(WorkItemsLoadedAt)} · couldn't refresh"
         : null;
+
+    /// <summary>
+    /// The boards that did not answer while the others did. Held rather than raised, because
+    /// the list on screen is real and usable - it is only missing a board, which is a line
+    /// above it rather than the red banner that means there is nothing to show.
+    /// </summary>
+    private IReadOnlyList<BoardFailure> _boardFailures = [];
+
+    /// <summary>
+    /// What to say about the board list itself: a board that could not be read, or every board
+    /// hidden at once. Null when all the configured boards answered, which is the usual case
+    /// and the one that puts nothing at all on screen.
+    /// </summary>
+    public string? BoardNotice
+    {
+        get
+        {
+            // Read off the settings rather than remembered from the load, so the line appears
+            // the moment the last chip goes off and not a fetch later.
+            if (Settings.Ado.Scope == WorkItemScope.AssignedToMe
+                && Settings.Ado.Scopes.Count > 0 && !Settings.Ado.EnabledScopes.Any())
+                return "Every board is hidden. Turn one back on to see its work.";
+
+            if (_boardFailures.Count == 0) return null;
+
+            return $"Couldn't read {string.Join(", ", _boardFailures.Select(f => f.Board))} · "
+                   + _boardFailures[0].Message;
+        }
+    }
+
+    /// <summary>
+    /// How much of a work item's board has to be said on its card. Nothing, when the list is
+    /// one board's work and naming it on every row would be noise; the project, when the list
+    /// spans more than one; the area beneath it, when the boards are several areas of one
+    /// project and the project name would not tell them apart.
+    ///
+    /// Judged on what actually came back as well as on the settings, since a saved query
+    /// returns one project's work whatever the board list says.
+    /// </summary>
+    public BoardNaming Boards
+    {
+        get
+        {
+            string? first = null;
+            foreach (var item in WorkItems)
+            {
+                if (first is null) { first = item.Project; continue; }
+                if (!string.Equals(first, item.Project, StringComparison.OrdinalIgnoreCase))
+                    return BoardNaming.Project;
+            }
+
+            return Settings.Ado.Scope == WorkItemScope.AssignedToMe
+                   && Settings.Ado.EnabledScopes.Skip(1).Any()
+                ? BoardNaming.Area
+                : BoardNaming.None;
+        }
+    }
 
     public string Search { get; set; } = "";
     public HashSet<string> TypeFilter { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -318,7 +380,7 @@ public sealed class AppState(
             }
 
             var retries = atStartup ? PatientRetries : QuickRetries;
-            List<WorkItem> items;
+            WorkItemFetch fetch;
             for (var attempt = 0; ; attempt++)
             {
                 // Re-checked on every attempt, not just once before the loop: a retry can span
@@ -330,7 +392,7 @@ public sealed class AppState(
 
                 try
                 {
-                    items = await ado.GetWorkItemsAsync(cts.Token);
+                    fetch = await ado.GetWorkItemsAsync(cts.Token);
                     break;
                 }
                 catch (AzureDevOpsException ex) when (ex.IsTransient && attempt < retries.Length)
@@ -338,6 +400,8 @@ public sealed class AppState(
                     await Task.Delay(retries[attempt], cts.Token);
                 }
             }
+
+            var items = fetch.Items;
 
             if (cts.IsCancellationRequested) return;
 
@@ -362,6 +426,11 @@ public sealed class AppState(
                     WorkItems = items;
                     WorkItemsLoadedAt = loadedAt;
                     WorkItemsAreCached = false;
+
+                    // Under the same gate as the list itself: a board's failure describes this
+                    // connection's list, and outside it the clearing could take the list away
+                    // and leave the failure sitting over another connection's.
+                    _boardFailures = fetch.Failures;
                 }
             }
 
@@ -389,7 +458,14 @@ public sealed class AppState(
             }
 
             if (showToast)
-                toasts.Success($"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}");
+            {
+                var loaded = $"Loaded {items.Count} work item{(items.Count == 1 ? "" : "s")}";
+
+                // A board missing from a list that otherwise loaded is worth saying out loud
+                // once, since the count on its own reads as everything having arrived.
+                if (BoardNotice is { } notice) toasts.Warning(loaded, notice);
+                else toasts.Success(loaded);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -475,7 +551,8 @@ public sealed class AppState(
             DropStaleCaches();
             var stamp = ConnectionStamp;
 
-            var items = await ado.GetWorkItemsAsync(CancellationToken.None);
+            var fetch = await ado.GetWorkItemsAsync(CancellationToken.None);
+            var items = fetch.Items;
             await EnsureIdentityAsync(CancellationToken.None);
 
             // The connection may have changed while this quiet poll was in flight - and a
@@ -495,6 +572,11 @@ public sealed class AppState(
                     WorkItemsLoadedAt = loadedAt;
                     WorkItemsAreCached = false;
                     WorkItemError = null;
+
+                    // Silent about the failure itself, like the rest of this poll, but the line
+                    // above the list still has to keep up: a board that has come back must stop
+                    // being reported missing, and one that has just gone must start.
+                    _boardFailures = fetch.Failures;
                 }
             }
 
@@ -1078,7 +1160,7 @@ public sealed class AppState(
                 IsBusy(await EventsCovering(placed, end), placed, end))
             {
                 toasts.Warning("Something is already in the calendar then",
-                    "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
+                    "Pick another time, or turn off \"Never plan over existing events\" under Your week in Settings.");
                 return false;
             }
 
@@ -1465,6 +1547,37 @@ public sealed class AppState(
         await LoadWorkItemsAsync();
     }
 
+    /// <summary>
+    /// Hides or shows one board and re-runs the query, for the chips above the work item list.
+    /// The same setting the Settings page holds, so a board hidden here stays hidden until it
+    /// is turned back on - it is not taken out of the list, which is the whole point of a chip.
+    ///
+    /// A refetch rather than a filter over what is loaded, for the reason
+    /// <see cref="SetOnlyMineAsync"/> gives: a hidden board's work was never asked for, and
+    /// asking for every board up front would spend the 500-row cap on work nobody is looking at.
+    ///
+    /// The board is matched by the project and area it names rather than by reference: the chip
+    /// is holding the live settings' copy, and what is saved is a fresh draft.
+    /// </summary>
+    public async Task SetScopeEnabledAsync(AdoScope board, bool enabled)
+    {
+        var draft = settingsStore.CreateDraft();
+        var target = draft.Ado.Scopes.Find(s => s.SameBoard(board));
+        if (target is null || target.Enabled == enabled) return;
+
+        target.Enabled = enabled;
+
+        // Refused while an update takes over; the chip then simply stays as it was.
+        if (!settingsStore.Save(draft))
+        {
+            Changed?.Invoke();
+            return;
+        }
+
+        Changed?.Invoke();
+        await LoadWorkItemsAsync();
+    }
+
     /// <summary>Why the area tree could not be read, for a picker that has to explain itself.</summary>
     public string? AreaTreeError { get; private set; }
 
@@ -1474,7 +1587,16 @@ public sealed class AppState(
     private string _areaTreeProject = "";
 
     /// <summary>
-    /// Loads the project's area tree for the pickers that need it.
+    /// The project whose tree is wanted now. Its own field because picking a board's project
+    /// can happen again while the last one's tree is still in flight, and what is wanted by
+    /// then is what has to end up in hand.
+    /// </summary>
+    private string _areaTreeWanted = "";
+
+    /// <summary>
+    /// Loads a project's area tree for the pickers that need it. The project is passed in
+    /// rather than read from the settings: adding a board means browsing the areas of a
+    /// project that is not yet one of them.
     ///
     /// Reloads when the project changes and retries after a failure, neither of which the
     /// first version did - so a tree that failed to arrive once stayed missing for the rest
@@ -1482,35 +1604,57 @@ public sealed class AppState(
     /// poor substitute: an area has to be project-qualified to match anything, and nothing
     /// on screen says so.
     /// </summary>
-    public async Task EnsureAreaTreeAsync(bool force = false)
+    public async Task EnsureAreaTreeAsync(string project, bool force = false)
     {
-        var project = Settings.Ado.Project;
-        if (string.IsNullOrWhiteSpace(project) || !Settings.IsAdoConfigured)
+        project = (project ?? "").Trim();
+
+        if (project.Length == 0 || !Settings.IsAdoConfigured)
         {
-            AreaTreeError = string.IsNullOrWhiteSpace(project)
+            AreaTreeError = project.Length == 0
                 ? "Pick a project first to browse its areas."
                 : "Connect to Azure DevOps first to browse areas.";
+            Changed?.Invoke();
             return;
         }
 
         if (!force && AreaTree is not null && _areaTreeProject == project) return;
+
+        // Left for the load already running to pick up, rather than dropped: it would
+        // otherwise finish and leave another project's areas in the picker for this one.
+        _areaTreeWanted = project;
         if (IsLoadingAreaTree) return;
 
         IsLoadingAreaTree = true;
-        AreaTreeError = null;
-        Changed?.Invoke();
 
         try
         {
-            AreaTree = await ado.GetAreaTreeAsync(project);
-            _areaTreeProject = project;
-            AreaTreeError = AreaTree is null ? "Azure DevOps returned no areas for this project." : null;
-        }
-        catch (Exception ex)
-        {
-            AreaTree = null;
-            _areaTreeProject = "";
-            AreaTreeError = ex.Message;
+            for (var wanted = _areaTreeWanted; ; wanted = _areaTreeWanted)
+            {
+                // Cleared before the fetch, not after: the tree in hand belongs to another
+                // project, and offering its areas while this one loads would have somebody
+                // choose a path that does not exist where it is about to be used.
+                AreaTree = null;
+                AreaTreeError = null;
+                Changed?.Invoke();
+
+                try
+                {
+                    AreaTree = await ado.GetAreaTreeAsync(wanted);
+                    _areaTreeProject = wanted;
+                    AreaTreeError = AreaTree is null ? "Azure DevOps returned no areas for this project." : null;
+                }
+                catch (Exception ex)
+                {
+                    AreaTree = null;
+                    _areaTreeProject = "";
+                    AreaTreeError = ex.Message;
+                    break;
+                }
+
+                // Another project was picked while that was in flight, so go round again for
+                // it. Terminates because each turn needs the wanted project to have changed.
+                if (_areaTreeWanted == wanted) break;
+            }
         }
         finally
         {
@@ -1527,11 +1671,13 @@ public sealed class AppState(
     {
         if (!CanCreateWorkItems) return;
 
+        // The parent's project first - with several boards on screen, the board a new child
+        // belongs to is the one its parent is on, not whichever is first in the settings.
         var project = parent?.Project is { Length: > 0 } fromParent
             ? fromParent
-            : string.IsNullOrWhiteSpace(Settings.Ado.Project)
+            : string.IsNullOrWhiteSpace(Settings.Ado.PrimaryProject)
                 ? WorkItems.Select(i => i.Project).FirstOrDefault(p => !string.IsNullOrWhiteSpace(p)) ?? ""
-                : Settings.Ado.Project;
+                : Settings.Ado.PrimaryProject;
 
         Creating = new NewWorkItem
         {
@@ -1874,7 +2020,7 @@ public sealed class AppState(
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordDayFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
             || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
-            || UndoingPrompt is not null) return;
+            || UndoingPrompt is not null || MigrationOpen) return;
 
         RecordingFor = allocation;
         Changed?.Invoke();
@@ -1897,7 +2043,7 @@ public sealed class AppState(
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordingFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
             || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
-            || UndoingPrompt is not null) return;
+            || UndoingPrompt is not null || MigrationOpen) return;
 
         RecordDayFor = day.Date;
         Changed?.Invoke();
@@ -3190,7 +3336,7 @@ public sealed class AppState(
         // comment was posted under is what addresses it afterwards, and the selected one can
         // have moved on by the time the entry is undone.
         var project = string.IsNullOrWhiteSpace(allocation.Project)
-            ? Settings.Ado.Project
+            ? Settings.Ado.PrimaryProject
             : allocation.Project;
 
         try
@@ -3996,6 +4142,48 @@ public sealed class AppState(
 
     public Allocation? SelectedAllocation =>
         SelectedAllocationId is Guid id ? planner.Find(id) : null;
+
+    // ---------------------------------------------------------------- the migration wizard
+
+    /// <summary>
+    /// True while the migration wizard is on screen. Set by <see cref="WorkItemMigrator"/> as it
+    /// opens and closes, and kept here rather than read from there because every guard that stops
+    /// one dialog opening underneath another is on this object - and the migrator already depends
+    /// on this one, so a reference the other way would be a cycle.
+    ///
+    /// The wizard is drawn above every other dialog, so anything that opened while it was up would
+    /// sit hidden behind it, taking keystrokes and edits nobody can see.
+    /// </summary>
+    public bool MigrationOpen { get; set; }
+
+    // ---------------------------------------------------------------- items from off-query
+
+    /// <summary>
+    /// Puts a work item into the loaded list, or brings the one already there up to date, and
+    /// refreshes whatever the plan has quoted about it.
+    ///
+    /// For the ones the query behind the list will not produce. A migration's copy lands in
+    /// another project altogether, so without this the block now pointing at it would be the only
+    /// sign it exists - and the sidebar, the type filter and the "can time go here" test would all
+    /// behave as though the block pointed at nothing. Not counted as a write: it changes nothing
+    /// that is saved, and the writes it follows count themselves.
+    /// </summary>
+    public void AdoptWorkItem(WorkItem item)
+    {
+        var at = WorkItems.FindIndex(i => i.Id == item.Id);
+
+        // Links and a parent's title are put on by the list load, not by the answer to a single
+        // write, so one already here keeps its own rather than being flattened to a bare item.
+        var adopted = at >= 0
+            ? item with { Links = WorkItems[at].Links, ParentTitle = WorkItems[at].ParentTitle }
+            : item;
+
+        if (at >= 0) WorkItems[at] = adopted;
+        else WorkItems.Add(adopted);
+
+        planner.RefreshSnapshots([adopted]);
+        Changed?.Invoke();
+    }
 }
 
 internal static class CancellationExtensions
