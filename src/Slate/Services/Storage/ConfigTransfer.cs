@@ -10,7 +10,15 @@ namespace Slate.Services.Storage;
 /// </summary>
 public sealed class ConfigFile
 {
-    public int Version { get; set; } = 1;
+    /// <summary>
+    /// 2 since the single project and area became a list of boards. Bumped rather than left
+    /// alone because an older Slate reading a version 2 file would find no project in it and
+    /// quietly query the whole organization instead; being turned away with a reason is
+    /// better than that. Version 1 files still import here, and migrate on the way in.
+    /// </summary>
+    public int Version { get; set; } = CurrentVersion;
+
+    public const int CurrentVersion = 2;
     public string ExportedBy { get; set; } = "Slate";
     public DateTimeOffset ExportedAt { get; set; } = DateTimeOffset.Now;
 
@@ -83,7 +91,7 @@ public sealed class ConfigTransfer(SettingsStore store)
         if (file is null)
             return new ImportResult(false, "That file did not contain any configuration.", []);
 
-        if (file.Version > 1)
+        if (file.Version > ConfigFile.CurrentVersion)
             return new ImportResult(false,
                 $"That file was written by a newer version of the app (format {file.Version}).", []);
 
