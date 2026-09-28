@@ -1031,6 +1031,23 @@
         // The overlay shown during an update's handover stops clicks, not keys.
         if (State.IsHandingOver) return;
 
+        // The migration wizard's scrim stops clicks, not keys either, and it is drawn above
+        // everything else. Every shortcut stands off while it is up: r would reload the list and
+        // throw away the copy just adopted, Delete would remove the selected block, and Ctrl+R
+        // would open Record day behind the wizard. Escape is the one that still does something,
+        // and it closes the wizard - which refuses mid-run - and nothing underneath it, which is
+        // the whole point of the rule about a key reaching past a dialog.
+        if (Migrator.IsOpen)
+        {
+            if (combo == "escape")
+            {
+                Migrator.Close();
+                await InvokeAsync(StateHasChanged);
+            }
+
+            return;
+        }
+
         switch (combo)
         {
             case "arrowleft": State.GoToWeek(-1); break;

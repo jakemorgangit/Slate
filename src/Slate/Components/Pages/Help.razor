@@ -438,15 +438,17 @@
                 <div class="field">
                     <label>What a migration does, in order</label>
                     <span class="hint">
-                        The copy is raised first. Then the discussion &mdash; each comment led by who wrote it and
-                        when, because Azure DevOps records <em>you</em> as the author of anything posted through an
-                        app. Then every attachment, downloaded and uploaded again, with progress and a Cancel
-                        button, and one that will not come over costs only itself. Then the references: the two
-                        work items are Related to each other, and the original's parent and children are Related
-                        to the copy rather than rebuilt under it, because a parent link cannot cross a project.
-                        The original is touched last and only then: a note naming the copy, and the state you
-                        chose &mdash; <strong>Removed</strong> on Agile and Scrum, <strong>Cancelled</strong> on
-                        CMMI, whatever your own process calls it, or left open if you would rather.
+                        The copy is raised first. Then the two work items are Related to each other, early, so
+                        the trail exists before anything slow does. Then the original's parent and children are
+                        Related to the copy rather than rebuilt under it, because a parent link cannot cross a
+                        project. Then the discussion &mdash; each comment led by who wrote it and when, because
+                        Azure DevOps records <em>you</em> as the author of anything posted through an app. Then
+                        every attachment, downloaded and uploaded again, with progress and a Cancel button, and
+                        one that will not come over costs only itself. The original is touched last and only
+                        then: a note naming the copy, and the state you chose &mdash;
+                        <strong>Removed</strong> on Agile and Scrum, <strong>Cancelled</strong> on CMMI, whatever
+                        your own process calls it, or left open if you would rather. The calendar blocks, which
+                        are local, come after all of it.
                     </span>
                 </div>
 
@@ -460,8 +462,12 @@
                         means a report adding both work items together would count those hours twice. Parents
                         and children are not moved. A field the target type does not have is named on the review
                         page instead of being sent and refused, and an assignee that project cannot resolve is
-                        dropped so the copy is still raised, with the wizard saying so. Calendar blocks pointing
-                        at the original are offered, ticked, to be pointed at the copy.
+                        dropped so the copy is still raised, with the wizard saying so. Its other work item links
+                        &mdash; Related, Duplicate, Predecessor, Successor, Tested By &mdash; stay on it and are
+                        named rather than guessed at on the copy. A picture pasted into the text still points at
+                        the file attached to the original, so somebody who can see only the new project sees a
+                        broken picture; the files themselves are copied, and the wizard says so when there is one.
+                        Calendar blocks pointing at the original are offered, ticked, to be pointed at the copy.
                     </span>
                 </div>
 
@@ -470,11 +476,27 @@
                     <span class="hint">
                         Every step is listed with what it did or why it did not, and the copy's id is always on
                         screen so nothing is left stranded without a name. The original is never closed unless
-                        the copy exists <em>and</em> carries a reference back to it. If something fails part way,
-                        <strong>Finish the rest</strong> picks up exactly where it stopped &mdash; it will not
-                        raise a second copy or repeat a comment. The one case it cannot promise that for is a
-                        create that went out and got no answer: it says so, names the project to go and look in,
-                        and leaves the decision to you.
+                        the copy exists <em>and</em> something says where the work went &mdash; either the two
+                        linked to each other, or the note naming the copy &mdash; and never when its discussion
+                        could not be read at all, unless you tick to say you have compared the two yourself. If
+                        something fails or you cancel part way, <strong>Finish the rest</strong> picks up exactly
+                        where it stopped &mdash; it will not raise a second copy, and it will not repeat a comment
+                        or an attachment, including one Azure DevOps took without saying so, which is named on the
+                        step instead. The closing state and the ticked blocks are remembered as the run started,
+                        so finishing it later does what you asked for then.
+                    </span>
+                </div>
+
+                <div class="field">
+                    <label>A copy that may or may not have been raised</label>
+                    <span class="hint">
+                        The one case none of that covers. Raising the copy is the first step and the only one that
+                        leaves no mark on the original, so when the request goes out and no answer comes back
+                        &mdash; a timeout, a dropped connection, a server error, or you cancelling once it was
+                        already on its way &mdash; there may be a copy in the target project and there may not,
+                        and Slate has no id to name. It says exactly that rather than &ldquo;nothing was
+                        changed&rdquo;, names the project and the title to go and look for, and will not run again
+                        until you tick to say you looked. Running it blind is what would leave two.
                     </span>
                 </div>
 

@@ -8,7 +8,8 @@ namespace Slate.Services.AzureDevOps;
 
 /// <summary>
 /// Moving a work item to another project or area: reading one in full, raising the copy, and
-/// carrying the discussion, the attachments and the links across.
+/// carrying the links, the discussion and the attachments across - which is the order
+/// <see cref="Planning.WorkItemMigrator"/> calls them in, and the order it explains.
 ///
 /// Everything here reads and writes raw field values rather than the display shapes the details
 /// window uses. <see cref="GetWorkItemDetailAsync"/> sanitises markup and rewrites attached
@@ -18,11 +19,19 @@ namespace Slate.Services.AzureDevOps;
 public sealed partial class AzureDevOpsClient
 {
     /// <summary>
-    /// The phrase the note on a migrated work item leads with, and the one thing a later
-    /// migration of the same item has to go on. Reading it back is a warning, not a record -
-    /// see <see cref="MigrationSource.LooksMigratedTo"/>.
+    /// The phrase the note on a migrated work item leads with. Reading it back is a warning, not
+    /// a record - see <see cref="MigrationSource.LooksMigratedTo"/>.
     /// </summary>
     public const string MigratedMarker = "Migrated to #";
+
+    /// <summary>
+    /// What a migration writes on the Related link between the copy and the original. Read back
+    /// alongside <see cref="MigratedMarker"/> because the link goes on at the second step and the
+    /// note only at the sixth: a run stopped in between - or a window closed while a large
+    /// attachment was still going over - leaves this and nothing else, and it is the only thing
+    /// that can warn the next attempt.
+    /// </summary>
+    public const string MigratedFromMarker = "Migrated from #";
 
     /// <summary>
     /// Azure DevOps' own cap on an attachment is 60 MB. Anything larger cannot have come from
@@ -165,7 +174,13 @@ public sealed partial class AzureDevOpsClient
         // details window uses, because it is the order somebody reads a work item in.
         copyable = [.. copyable.OrderBy(MigrationFieldRank).ThenBy(f => f.Label, StringComparer.OrdinalIgnoreCase)];
 
-        var comments = await ReadRawCommentsAsync(id, project, ct);
+        var discussion = await ReadRawCommentsAsync(id, project, ct);
+
+        if (OtherWorkItemLinks(root) is { } otherLinks) skipped.Add(otherLinks);
+        if (discussion.OwnNotes > 0) skipped.Add(OwnNotesSkip(discussion.OwnNotes));
+        if (copyable.Any(f => HasPastedPicture(f.Value)) || discussion.Comments.Any(c => HasPastedPicture(c.RawHtml)))
+            skipped.Add(PastedPicturesSkip(id, project));
+
         var parents = LinkedIds(root, "System.LinkTypes.Hierarchy-Reverse");
 
         return new MigrationSource(
@@ -183,8 +198,115 @@ public sealed partial class AzureDevOpsClient
             parents.Count > 0 ? parents[0] : null,
             LinkedIds(root, "System.LinkTypes.Hierarchy-Forward"),
             ReadAttachments(root),
-            comments,
-            LooksMigratedTo(comments));
+            discussion.Comments,
+            discussion.MigratedTo ?? LinkedCopyId(root),
+            discussion.Error,
+            discussion.NotCarried);
+    }
+
+    /// <summary>
+    /// The work item links that are neither the parent nor a child, as one line for the list of
+    /// what the copy will not have: Related, Duplicate, Predecessor and Successor, Tests and
+    /// Tested By. Named rather than carried over because each of them says something about the
+    /// original's place among the work around it, and which of those the copy is still meant to
+    /// have is not Slate's judgement to make - the originals keep every one of them, and the
+    /// copy's own Related link back to the source is the way to find them again.
+    ///
+    /// Null when there are none, so no line is shown for a work item that has none.
+    /// </summary>
+    private static MigrationSkip? OtherWorkItemLinks(JsonElement root)
+    {
+        if (!root.TryGetProperty("relations", out var array) || array.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var named = new List<string>();
+
+        foreach (var relation in array.EnumerateArray())
+        {
+            var rel = relation.TryGetProperty("rel", out var kind) ? kind.GetString() ?? "" : "";
+            if (!rel.StartsWith(LinkTypePrefix, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var type = rel[LinkTypePrefix.Length..];
+            if (type.StartsWith("Hierarchy", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var url = relation.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+            if (TryReadWorkItemId(url, out var other)) named.Add($"{type} #{other}");
+        }
+
+        return named.Count == 0
+            ? null
+            : new MigrationSkip("Its other work item links — " + string.Join(", ", named),
+                "only the parent and the children are referenced from the copy. What a Related, Duplicate, "
+                + "Predecessor, Successor or Tested By link means is about where this work item sits, so they "
+                + "stay on it rather than being guessed at on the copy — which does carry a Related link back "
+                + "here, so they are one hop away");
+    }
+
+    private const string LinkTypePrefix = "System.LinkTypes.";
+
+    /// <summary>
+    /// A note a previous migration of this work item left. Never copied onto the new one: the
+    /// copy would then carry a note saying it had been migrated, which reads as it having been
+    /// migrated to itself - and the wizard, opened on the copy later, would warn about exactly
+    /// that. Listed so the count on the review page and the discussion actually copied agree.
+    /// </summary>
+    private static MigrationSkip OwnNotesSkip(int count) =>
+        new(count == 1 ? "Slate's own migration note" : $"Slate's own {count} migration notes",
+            "a note saying this work item was migrated belongs to this work item. Copied over, it would have "
+            + "the new one claiming it had been migrated somewhere itself");
+
+    /// <summary>
+    /// Pictures pasted into the description or a comment. The markup goes over exactly as it
+    /// stands, so each one still points at the file attached to the source - which is why this
+    /// is a line in what is not copied rather than a silent success.
+    /// </summary>
+    private static MigrationSkip PastedPicturesSkip(int id, string project) =>
+        new("Pictures pasted into the text",
+            $"the markup is copied exactly, so each picture still points at the file on #{id}. Anybody who can "
+            + $"see {project} sees them on the copy as well; anybody who can only see the new project sees a "
+            + "broken picture and has to be sent the attachment. The files themselves are copied — it is only "
+            + "the addresses inside the text that still lead here");
+
+    /// <summary>
+    /// True when a value carries an image tag, which for a work item means a pasted screenshot
+    /// whose address is an attachment of the work item it was pasted into.
+    /// </summary>
+    private static bool HasPastedPicture(object? value) =>
+        value is string text && text.Contains("<img", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The copy a previous migration raised, from the Related link it puts on rather than from
+    /// the note it leaves afterwards. Evidence from the second step of a run instead of the
+    /// sixth, which is what makes the warning exist for a run that stopped in the middle - and
+    /// the only evidence at all when the discussion could not be read.
+    /// </summary>
+    private static int? LinkedCopyId(JsonElement root)
+    {
+        if (!root.TryGetProperty("relations", out var array) || array.ValueKind != JsonValueKind.Array)
+            return null;
+
+        int? found = null;
+
+        foreach (var relation in array.EnumerateArray())
+        {
+            if (!relation.TryGetProperty("rel", out var kind)
+                || !string.Equals(kind.GetString(), "System.LinkTypes.Related", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!relation.TryGetProperty("attributes", out var attributes)
+                || !attributes.TryGetProperty("comment", out var comment)
+                || comment.GetString() is not { } text
+                || !text.StartsWith(MigratedFromMarker, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var url = relation.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+
+            // The last one wins, as with the note: a work item migrated twice went wherever it
+            // went last, and Azure DevOps keeps relations in the order they were added.
+            if (TryReadWorkItemId(url, out var id)) found = id;
+        }
+
+        return found;
     }
 
     private static int MigrationFieldRank(MigrationFieldValue field) => field.Name switch
@@ -253,52 +375,125 @@ public sealed partial class AzureDevOpsClient
     }
 
     /// <summary>
+    /// What reading a work item's discussion produced: the comments to copy, how many had to be
+    /// left out, how many of them were Slate's own migration notes, the copy the last of those
+    /// notes named, and - the point of having a shape at all - why there are none, when that is
+    /// the answer.
+    /// </summary>
+    private sealed record RawDiscussion(
+        List<MigrationComment> Comments, string? Error, int NotCarried, int OwnNotes, int? MigratedTo);
+
+    /// <summary>How many comments are asked for in one go, which is also Azure DevOps' own cap.</summary>
+    private const int CommentPageSize = 200;
+
+    /// <summary>
+    /// How many pages of discussion are followed. Two hundred comments at a time, so this is
+    /// four thousand: past that the wizard says how many cannot be carried rather than holding
+    /// an unbounded amount of somebody else's discussion in memory to copy one comment at a time.
+    /// </summary>
+    private const int CommentPages = 20;
+
+    /// <summary>
     /// The discussion with its markup exactly as stored - see <see cref="MigrationComment"/> for
     /// why the sanitised, image-inlined form <see cref="GetCommentsAsync"/> returns will not do.
-    /// A discussion that cannot be read is not a reason to give up on the migration, so it comes
-    /// back empty and the wizard says the copy will carry no comments.
+    ///
+    /// A discussion that cannot be read comes back with the reason rather than as an empty one.
+    /// The two are not the same: an empty discussion means the copy loses nothing, while a read
+    /// that failed - throttling, a server error, a dropped connection, or an on-prem server
+    /// without the comments endpoint - means the copy may be missing comments nobody has seen,
+    /// and the original must not be closed on the strength of it.
     /// </summary>
-    private async Task<List<MigrationComment>> ReadRawCommentsAsync(
+    private async Task<RawDiscussion> ReadRawCommentsAsync(
         int id, string project, CancellationToken ct)
     {
         var scope = CommentScope(project);
-        if (string.IsNullOrWhiteSpace(scope)) return [];
+        if (string.IsNullOrWhiteSpace(scope))
+            return Settle([], $"Slate has no project to read the discussion of #{id} through.", 0);
 
-        JsonDocument doc;
-        try
-        {
-            doc = await SendAsync(HttpMethod.Get,
-                $"{OrgUrl}{scope}/_apis/wit/workItems/{id}/comments?$top=200&api-version={CommentsApiVersion}",
-                null, ct);
-        }
-        catch (AzureDevOpsException)
-        {
-            return [];
-        }
+        var all = new List<MigrationComment>();
+        var total = 0;
+        var token = "";
 
-        using (doc)
+        for (var page = 0; page < CommentPages; page++)
         {
-            if (!doc.RootElement.TryGetProperty("comments", out var array) || array.ValueKind != JsonValueKind.Array)
-                return [];
+            var url = $"{OrgUrl}{scope}/_apis/wit/workItems/{id}/comments"
+                      + $"?$top={CommentPageSize}&api-version={CommentsApiVersion}"
+                      + (token.Length == 0 ? "" : "&continuationToken=" + Uri.EscapeDataString(token));
 
-            return
-            [
-                .. array.EnumerateArray()
+            JsonDocument doc;
+            try
+            {
+                doc = await SendAsync(HttpMethod.Get, url, null, ct);
+            }
+            catch (AzureDevOpsException ex)
+            {
+                // Whatever came back before this page stands; the reason goes with it, so the
+                // wizard can say the discussion is only part of one.
+                return Settle(all, ex.Message, 0);
+            }
+
+            using (doc)
+            {
+                if (doc.RootElement.TryGetProperty("totalCount", out var count)
+                    && count.ValueKind == JsonValueKind.Number)
+                    total = count.GetInt32();
+
+                if (!doc.RootElement.TryGetProperty("comments", out var array)
+                    || array.ValueKind != JsonValueKind.Array)
+                    break;
+
+                all.AddRange(array.EnumerateArray()
                     .Select(c => new MigrationComment(
                         c.TryGetProperty("id", out var cid) ? cid.GetInt32() : 0,
                         Identity(c, "createdBy"),
                         ReadDate(c, "createdDate"),
-                        c.TryGetProperty("text", out var t) ? t.GetString() ?? "" : ""))
-                    .Where(c => c.RawHtml.Length > 0)
-                    .OrderBy(c => c.CreatedDate),
-            ];
+                        c.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "")));
+
+                token = doc.RootElement.TryGetProperty("continuationToken", out var next)
+                        && next.GetString() is { Length: > 0 } more
+                    ? more
+                    : "";
+            }
+
+            if (token.Length == 0) break;
         }
+
+        // What the service itself said was there, against what arrived. Normally the two agree
+        // and this is nothing; a discussion longer than every page followed is what it is for,
+        // and the review page then names the number rather than claiming all of them are copied.
+        var missing = total > all.Count ? total - all.Count : 0;
+
+        return Settle(all, null, missing);
     }
 
     /// <summary>
-    /// The work item a previous migration said this one went to, if the discussion carries the
-    /// note one leaves. The last such note wins: a work item migrated twice was migrated to
-    /// wherever it went last.
+    /// Makes the answer out of the comments as they arrived: the empty ones dropped, and Slate's
+    /// own migration notes with them - see <see cref="OwnNotesSkip"/> for why. The notes are read
+    /// before they are dropped, because the copy one of them names is the warning a second
+    /// migration of the same work item is shown.
+    /// </summary>
+    private static RawDiscussion Settle(List<MigrationComment> comments, string? error, int notCarried)
+    {
+        var mine = comments
+            .Where(c => c.RawHtml.Contains(MigratedMarker, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        return new RawDiscussion(
+            [
+                .. comments
+                    .Where(c => c.RawHtml.Length > 0
+                                && !c.RawHtml.Contains(MigratedMarker, StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(c => c.CreatedDate),
+            ],
+            error,
+            notCarried,
+            mine.Count,
+            LooksMigratedTo(mine));
+    }
+
+    /// <summary>
+    /// The work item a previous migration said this one went to, out of the notes one leaves.
+    /// The last such note wins: a work item migrated twice was migrated to wherever it went last.
     /// </summary>
     private static int? LooksMigratedTo(IReadOnlyList<MigrationComment> comments)
     {
@@ -383,10 +578,14 @@ public sealed partial class AzureDevOpsClient
     /// iteration path has to exist in the project it is written to, and a migration that carried
     /// one over blindly would be refused outright. Null when it cannot be read, which leaves the
     /// new work item at the project's default iteration.
+    ///
+    /// Falls back to the first configured board's project when none is named, the same way its
+    /// sibling <see cref="GetAreaTreeAsync"/> does - the wizard always names one, so the fallback
+    /// is only there to keep the two reading alike.
     /// </summary>
     public async Task<AreaNode?> GetIterationTreeAsync(string project, CancellationToken ct = default)
     {
-        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.Project : project;
+        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.PrimaryProject : project;
         if (string.IsNullOrWhiteSpace(scope)) return null;
 
         using var doc = await SendAsync(HttpMethod.Get,
@@ -433,12 +632,25 @@ public sealed partial class AzureDevOpsClient
                 using var doc = await SendAsync(HttpMethod.Post, url, PatchFor(attempts[attempt]), ct,
                     "application/json-patch+json");
 
-                var dropped = fields
-                    .Where(f => attempts[attempt].All(kept => kept.Name != f.Name))
-                    .Select(f => f.Label)
-                    .ToArray();
+                // Past the send: Azure DevOps has said yes, so the copy exists. Anything that
+                // goes wrong from here is Slate failing to read the answer, and saying "nothing
+                // was created" about it would send somebody looking for a work item that is
+                // there - or have them run the migration again and raise a second.
+                try
+                {
+                    var dropped = fields
+                        .Where(f => attempts[attempt].All(kept => kept.Name != f.Name))
+                        .Select(f => f.Label)
+                        .ToArray();
 
-                return new MigrationCreated(Map(doc.RootElement), dropped);
+                    return new MigrationCreated(Map(doc.RootElement), dropped);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    throw new AzureDevOpsException(
+                        "Azure DevOps raised the copy but Slate could not read what it sent back. " + ex.Message, ex)
+                    { Unanswered = true };
+                }
             }
             catch (AzureDevOpsException ex)
                 when (ex.Status == HttpStatusCode.BadRequest && attempt + 1 < attempts.Count)
@@ -472,6 +684,27 @@ public sealed partial class AzureDevOpsClient
         await AddRelationAsync(id, "System.LinkTypes.Related",
             $"{OrgUrl}/_apis/wit/workItems/{otherId}", comment, ct);
     }
+
+    /// <summary>
+    /// The one 400 a caller adding a link may treat as having got what it asked for: the link is
+    /// already there, which is how a second run over the same pair ends. Every other 400 on a
+    /// relations patch means the link was not made - a target that has been deleted or never
+    /// existed, a process rule or a permission refusing it, a malformed relation - and counting
+    /// those as done would report links that are not there and stop them ever being retried.
+    ///
+    /// Only a 400. Anything else is either a refusal that says nothing about the link or an
+    /// answer that never came, and both of those are safe to try again - the link is the same
+    /// link however many times it is asked for.
+    ///
+    /// Azure DevOps names this one in the typeKey. The wording is looked at as well, because the
+    /// same refusal from an on-prem server old enough not to send a typeKey still carries
+    /// TF201036, and being told a link exists twice is cheaper than reporting one that does not.
+    /// </summary>
+    public static bool IsLinkAlreadyThere(AzureDevOpsException ex) =>
+        ex.Status == HttpStatusCode.BadRequest
+        && ((ex.ErrorKey ?? "").Contains("AlreadyExists", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("TF201036", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("already exists", StringComparison.OrdinalIgnoreCase));
 
     private async Task AddRelationAsync(
         int id, string rel, string targetUrl, string comment, CancellationToken ct)
@@ -535,6 +768,19 @@ public sealed partial class AzureDevOpsClient
                         Status = response.StatusCode,
                         IsTransient = BusyStatuses.Contains(response.StatusCode),
                     };
+
+                // The credential being stale is answered with the sign-in page and a success
+                // status, which every other call here is saved from by the 2xx-and-HTML test
+                // inside the shared send. This path reads the body itself, so it has to make
+                // the same test - otherwise that page is uploaded under the original file's
+                // name, recorded as copied, and the original is then cancelled on the strength
+                // of it. The content type is what is judged rather than the bytes: the
+                // attachments endpoint serves every real file as octet-stream, while an
+                // attachment may itself perfectly well be an HTML or SVG file.
+                var served = response.Content.Headers.ContentType?.MediaType ?? "";
+                if (served.Equals("text/html", StringComparison.OrdinalIgnoreCase)
+                    || served.Equals("application/xhtml+xml", StringComparison.OrdinalIgnoreCase))
+                    throw new AzureDevOpsException(SignInPageMessage);
 
                 if (response.Content.Headers.ContentLength is { } declared && declared > MaxAttachmentBytes)
                     throw new AzureDevOpsException(

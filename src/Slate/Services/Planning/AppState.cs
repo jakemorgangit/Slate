@@ -2020,7 +2020,7 @@ public sealed class AppState(
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordDayFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
             || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
-            || UndoingPrompt is not null) return;
+            || UndoingPrompt is not null || MigrationOpen) return;
 
         RecordingFor = allocation;
         Changed?.Invoke();
@@ -2043,7 +2043,7 @@ public sealed class AppState(
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordingFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
             || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
-            || UndoingPrompt is not null) return;
+            || UndoingPrompt is not null || MigrationOpen) return;
 
         RecordDayFor = day.Date;
         Changed?.Invoke();
@@ -4142,6 +4142,19 @@ public sealed class AppState(
 
     public Allocation? SelectedAllocation =>
         SelectedAllocationId is Guid id ? planner.Find(id) : null;
+
+    // ---------------------------------------------------------------- the migration wizard
+
+    /// <summary>
+    /// True while the migration wizard is on screen. Set by <see cref="WorkItemMigrator"/> as it
+    /// opens and closes, and kept here rather than read from there because every guard that stops
+    /// one dialog opening underneath another is on this object - and the migrator already depends
+    /// on this one, so a reference the other way would be a cycle.
+    ///
+    /// The wizard is drawn above every other dialog, so anything that opened while it was up would
+    /// sit hidden behind it, taking keystrokes and edits nobody can see.
+    /// </summary>
+    public bool MigrationOpen { get; set; }
 
     // ---------------------------------------------------------------- items from off-query
 

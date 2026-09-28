@@ -526,7 +526,8 @@ project and is left to the project's default when it does not, and it says which
 **Seeing it first.** Nothing at all is written until the button on the second page. That page lists
 every field going over with its value, how many comments there are, every attachment with its size,
 the parent and each child that will be referenced — and a line for everything that is *not* being
-copied, with the reason.
+copied, with the reason. A discussion Slate could not read is shown as exactly that, and not as a
+work item without one.
 
 ### What comes over
 
@@ -541,12 +542,15 @@ with progress and a Cancel button.
 
 | Not copied | Why |
 | --- | --- |
-| Revision history | Azure DevOps builds it from the changes made to a work item; it cannot be written. The original is closed, not deleted, and stays readable. |
+| Revision history | Azure DevOps builds it from the changes made to a work item; it cannot be written. The original is closed, not deleted, and stays readable to anybody who can see its project. |
 | Hours already recorded | The hours stay booked against the original: Slate's time entries, the Time tab and Undo all still point there. Completed Work *does* come over as a number — the copy should say the work was done — so both work items state those hours and a report adding the two together would count them twice. |
 | Parent and child links | A hierarchy link cannot cross a project. The parent and each child get a *Related* reference to the copy instead, and are not otherwise touched or moved. |
 | State and reason | The copy starts at the first state of its type in the target process; a state named by another process may not exist there. |
 | Created/changed by and dates | The service stamps these itself and cannot back-date them. |
 | Build, pull request and other artefact links | They point at work done on the original and belong to its history. |
+| Its other work item links | Related, Duplicate, Predecessor, Successor and Tested By links say where *this* work item sits among the work around it. They stay on it, named on the review page, and the copy's own *Related* link back puts them one hop away. |
+| Slate's own migration notes | A note saying this work item was migrated belongs to it. Copied over, it would have the new one claiming it had been migrated somewhere itself. |
+| The addresses inside pasted pictures | The markup is copied exactly, so a pasted screenshot still points at the file attached to the original. The files themselves *are* copied; it is the addresses inside the text that still lead back, so somebody who can see only the new project sees a broken picture. Named on the review page when there is one. |
 | A field the target type has not got | Named on the review page rather than sent and refused. |
 
 An assignee the target project cannot resolve is dropped so the copy is still raised, and the wizard
@@ -556,21 +560,37 @@ and the wizard says so before you start.
 
 ### Order, and what happens when something fails
 
-The copy is raised first, then the comments, attachments and references go onto it, and the original
-is touched last: the note naming the copy, then the state — **Removed** on Agile and Scrum,
-**Cancelled** on CMMI, whatever your own process calls it, offered from the states that process
-actually allows, or left open if you would rather.
+The copy is raised first. Then the two work items are linked to each other — early, so the trail
+exists before anything slow does. Then the parent and children are referenced, the discussion is
+copied, and the attachments follow. The original is touched last: the note naming the copy, then the
+state — **Removed** on Agile and Scrum, **Cancelled** on CMMI, whatever your own process calls it,
+offered from the states that process actually allows, or left open if you would rather. The calendar
+blocks, which are local, come after all of it.
 
 Every step is listed with what it did, or why it did not. The original is **never** closed unless the
-copy exists *and* carries a reference back to it, so a work item is never cancelled with nothing on
-it to say where the work went. The copy's id is on screen either way, so nothing is left stranded
-without a name, and **Finish the rest** picks up exactly where a failed or cancelled run stopped —
-it will not raise a second copy or repeat a comment. The one thing it cannot promise that for is a
-create that went out and got no answer back: it says so plainly, names the project to go and look
-in, and leaves the decision to you.
+copy exists *and* something says where the work went — either the two are linked to each other, or
+the original's discussion names the copy — so a work item is never cancelled with nothing on it to
+say where its work went. Nor is it closed when its discussion could not be read at all: that is a
+failure rather than an empty discussion, and it leaves the original open unless you tick to say you
+have compared the two yourself.
+
+The copy's id is on screen either way, so nothing is left stranded without a name, and **Finish the
+rest** picks up exactly where a failed or cancelled run stopped — it will not raise a second copy,
+and it will not repeat a comment or an attachment, including one Azure DevOps accepted without
+saying so. Anything in that position is named on the step rather than sent again, because a
+duplicate comment cannot be told from the original afterwards while a missing one can be pointed at.
+Cancelling stops between one comment, file or link and the next; what is already written stays
+written.
+
+The one thing none of that covers is a create that went out and got no answer back. There may be a
+copy in the target project and there may not — nothing is written on the original at that point, so
+there is nothing to read back. The wizard says so plainly, names the project and the title to go and
+look for, and will not run again until you tick to say you have looked.
 
 Calendar blocks pointing at the original are offered, ticked by default, to be pointed at the copy.
-Hours already recorded stay where they are.
+Hours already recorded stay where they are. Both choices — the closing state and which blocks — are
+remembered as the run started, so finishing a run later does what you asked for then rather than
+what the defaults would be now.
 
 ## Sorting the table
 

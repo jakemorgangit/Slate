@@ -41,8 +41,12 @@ public sealed record MigrationAttachment(string Name, string Url, long Size, str
 /// <summary>
 /// One entry in the source's discussion, with its markup exactly as Azure DevOps stores it.
 /// Deliberately not the sanitised, image-inlined form the work item window renders: what is
-/// copied onto the new item has to be the original markup, and the pictures in it stay valid
-/// because the source work item is closed rather than deleted.
+/// copied onto the new item has to be the original markup, not a rendering of it.
+///
+/// A picture pasted into a comment therefore still points at the file attached to the source,
+/// which stays where it is because the source is closed rather than deleted. That address is
+/// only reachable by somebody who can see the source's project, so the wizard lists it as
+/// something the copy does not really carry - see the pasted-pictures line in <see cref="MigrationSkip"/>.
 /// </summary>
 public sealed record MigrationComment(int Id, string Author, DateTimeOffset? CreatedDate, string RawHtml);
 
@@ -52,8 +56,12 @@ public sealed record MigrationComment(int Id, string Author, DateTimeOffset? Cre
 /// copy rather than a rendering of one.
 ///
 /// <see cref="LooksMigratedTo"/> is the work item a previous migration of this one said it had
-/// gone to, read back out of the discussion. It is only ever a warning: a comment is evidence,
-/// not a record.
+/// gone to, read back out of the Related link a migration puts on and the note it leaves. It is
+/// only ever a warning: a link and a comment are evidence, not a record.
+///
+/// <see cref="DiscussionError"/> is the difference between "there is nothing in the discussion"
+/// and "the discussion could not be read", which are not the same thing and must never be shown
+/// as though they were: the second means the copy may be missing comments nobody has seen.
 /// </summary>
 public sealed record MigrationSource(
     int Id,
@@ -71,7 +79,9 @@ public sealed record MigrationSource(
     IReadOnlyList<int> ChildIds,
     IReadOnlyList<MigrationAttachment> Attachments,
     IReadOnlyList<MigrationComment> Comments,
-    int? LooksMigratedTo);
+    int? LooksMigratedTo,
+    string? DiscussionError = null,
+    int CommentsNotCarried = 0);
 
 /// <summary>How one step of a migration ended.</summary>
 public enum MigrationStepState

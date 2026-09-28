@@ -9,7 +9,11 @@
 
 @if (Migrator.IsOpen)
 {
-    <div class="modal-scrim" @onclick="Close">
+    @* Handles its own Escape, and data-own-escape keeps the window-level shortcut from acting on
+       the same key press: this is drawn above every other dialog, and a key reaching past it
+       would close the work item window behind it and then throw away a day's typed hours. *@
+    <div class="modal-scrim" data-own-escape tabindex="-1"
+         @onclick="Close" @onkeydown="OnKeyDown">
         <div class="modal" @onclick:stopPropagation="true">
 
             <div class="modal-head">
@@ -70,8 +74,8 @@
                                 <span>!</span>
                                 <div class="grow">
                                     This work item looks as though it has already been migrated, to
-                                    <strong>#@copy</strong> &mdash; its discussion says so. Migrating it again would
-                                    raise a second copy, so look at #@copy first.
+                                    <strong>#@copy</strong> &mdash; a link on it or a note in its discussion says so.
+                                    Migrating it again would raise a second copy, so look at #@copy first.
                                 </div>
                             </div>
                         }
@@ -168,10 +172,12 @@
                             <span>i</span>
                             <div class="grow">
                                 A <strong>@Migrator.TargetType</strong> is raised in <strong>@TargetWhere</strong>
-                                first, then the discussion, the attachments and the references go onto it.
-                                <strong>#@source.Id</strong> is touched last: the note naming the copy, then its
-                                state. If anything fails part way you are told exactly what was and was not done,
-                                and #@source.Id is never closed unless the copy exists and carries a reference back.
+                                first, then the two are linked, the parent and children are referenced, and the
+                                discussion and the attachments go onto the copy. <strong>#@source.Id</strong> is
+                                touched last: the note naming the copy, then its state. If anything fails part way
+                                you are told exactly what was and was not done, and #@source.Id is never closed
+                                unless the copy exists <em>and</em> something says where the work went &mdash;
+                                either the two linked to each other, or the note naming the copy.
                             </div>
                         </div>
 
@@ -198,22 +204,66 @@
 
                         <div class="modal-section">
                             <h3>Discussion</h3>
-                            <span class="hint">
-                                @if (source.Comments.Count == 0)
+                            @if (source.DiscussionError is { } discussionError)
+                            {
+                                @* Deliberately not the same as "there is no discussion": nobody may
+                                   assume a question that went unanswered means the answer is none. *@
+                                <div class="banner warn" style="margin: 0 0 8px">
+                                    <span>!</span>
+                                    <div class="grow">
+                                        <strong>#@source.Id's discussion could not be read</strong>, so none of it
+                                        will be copied and Slate cannot say whether there is any.
+                                        @discussionError
+                                        <div style="margin-top: 7px">
+                                            <label class="switch">
+                                                <input type="checkbox" checked="@Migrator.DiscussionAcknowledged"
+                                                       @onchange="OnAcknowledgeDiscussion" />
+                                                <span class="track"></span>
+                                                <span class="label">
+                                                    I have looked at #@source.Id's discussion myself &mdash; close it
+                                                    anyway
+                                                </span>
+                                            </label>
+                                        </div>
+                                        <div class="muted" style="margin-top: 5px; font-size: 11.5px">
+                                            Left unticked, <strong>#@source.Id</strong> is left exactly as it is: a
+                                            work item must not be closed on the strength of a discussion nobody has
+                                            read.
+                                        </div>
+                                    </div>
+                                </div>
+                            }
+                            else
+                            {
+                                <span class="hint">
+                                    @if (source.Comments.Count == 0)
+                                    {
+                                        <text>There is nothing in #@source.Id's discussion to copy.</text>
+                                    }
+                                    else
+                                    {
+                                        <text>
+                                            All <strong>@source.Comments.Count</strong> comments are copied, each led
+                                            by the name of whoever wrote it and the date they wrote it. Azure DevOps
+                                            has no way to post as somebody else, so it will record
+                                            <strong>you</strong> as the author of every copy &mdash; which is exactly
+                                            why the original author and date are written into the text.
+                                        </text>
+                                    }
+                                </span>
+                                @if (source.CommentsNotCarried > 0)
                                 {
-                                    <text>#@source.Id has no discussion, so there is nothing to copy.</text>
+                                    <div class="banner warn" style="margin: 8px 0 0">
+                                        <span>!</span>
+                                        <div class="grow">
+                                            <strong>#@source.Id</strong> has
+                                            <strong>@source.CommentsNotCarried</strong> more comments than Slate reads
+                                            in one pass, and those will <strong>not</strong> be copied. Copy anything
+                                            that matters across by hand before closing it.
+                                        </div>
+                                    </div>
                                 }
-                                else
-                                {
-                                    <text>
-                                        All <strong>@source.Comments.Count</strong> comments are copied, each led by
-                                        the name of whoever wrote it and the date they wrote it. Azure DevOps has no
-                                        way to post as somebody else, so it will record <strong>you</strong> as the
-                                        author of every copy &mdash; which is exactly why the original author and
-                                        date are written into the text.
-                                    </text>
-                                }
-                            </span>
+                            }
                         </div>
 
                         <div class="modal-section">
@@ -352,7 +402,23 @@
                     {
                         @if (Migrator.Stage == MigrationStage.Finished)
                         {
-                            @if (Migrator.NewItemId is not int created)
+                            @if (Migrator.CopyMayExist)
+                            {
+                                @* Never the red "nothing was changed" banner: the request went out
+                                   and no answer came back, so there may well be a copy. *@
+                                <div class="banner warn">
+                                    <span>!</span>
+                                    <div class="grow">
+                                        <strong>There may be a copy in @Migrator.TargetProject.</strong> Azure DevOps
+                                        was asked to raise one and never said whether it did, so Slate has no id to
+                                        name. Nothing on <strong>#@source.Id</strong> was changed &mdash; it is still
+                                        @source.State &mdash; but look in <strong>@Migrator.TargetProject</strong> for
+                                        a <strong>@Migrator.TargetType</strong> called &ldquo;@source.Title&rdquo;
+                                        before migrating it again, because running this a second time could leave two.
+                                    </div>
+                                </div>
+                            }
+                            else if (Migrator.NewItemId is not int created)
                             {
                                 <div class="banner error">
                                     <span>✕</span>
@@ -362,15 +428,18 @@
                                     </div>
                                 </div>
                             }
-                            else if (Migrator.WasCancelled)
+                            else if (!Migrator.EveryStepSettled)
                             {
+                                @* Off the steps, not off a cancellation flag: the wizard closed and
+                                   opened again has forgotten the flag but still has the steps. *@
                                 <div class="banner warn">
                                     <span>!</span>
                                     <div class="grow">
-                                        Stopped part way. <strong>#@created</strong> was already raised in
+                                        Stopped part way. <strong>#@created</strong> was raised in
                                         <strong>@Migrator.TargetProject</strong> and is still there &mdash; it is not
                                         removed, and running this again will not raise a second one. Only the steps
-                                        marked below were done.
+                                        marked below were done; the ones still waiting have not been tried.
+                                        <strong>Finish the rest</strong> carries on from there.
                                     </div>
                                 </div>
                             }
@@ -382,7 +451,8 @@
                                         <strong>#@created</strong> was raised in
                                         <strong>@Migrator.TargetProject</strong>, but not everything went over. What
                                         failed is named below. <strong>Finish the rest</strong> retries only what is
-                                        left &mdash; it will not raise a second copy or repeat a comment.
+                                        left &mdash; it will not raise a second copy, and it will not repeat a comment
+                                        or an attachment, including one Azure DevOps never answered for.
                                     </div>
                                 </div>
                             }
@@ -396,6 +466,30 @@
                                     </div>
                                 </div>
                             }
+                        }
+
+                        @if (Migrator.Stage == MigrationStage.Finished && Migrator.AwaitingDiscussionAcknowledgement)
+                        {
+                            @* The review page is never shown again once a copy exists, so the one
+                               tickbox that can still let the original be closed has to be here. *@
+                            <div class="banner warn">
+                                <span>!</span>
+                                <div class="grow">
+                                    <strong>#@source.Id</strong> is still @source.State because its discussion could
+                                    not be read, so Slate cannot say the copy has all of it.
+                                    <div style="margin-top: 7px">
+                                        <label class="switch">
+                                            <input type="checkbox" checked="@Migrator.DiscussionAcknowledged"
+                                                   @onchange="OnAcknowledgeDiscussion" />
+                                            <span class="track"></span>
+                                            <span class="label">
+                                                I have compared the two myself &mdash; <strong>Finish the rest</strong>
+                                                may close it
+                                            </span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
                         }
 
                         <div class="mig-steps">
@@ -454,7 +548,8 @@
                 else if (Migrator.Stage == MigrationStage.Running)
                 {
                     <span class="muted" style="font-size: 11.5px">
-                        Cancelling stops at the end of the step under way. What is done stays done.
+                        Cancelling stops between one comment, file or link and the next; nothing already written is
+                        undone. Raising the copy is the one thing it can leave in doubt, and the wizard says so.
                     </span>
                     <span style="flex: 1"></span>
                     <button class="btn btn-danger" @onclick="Migrator.Cancel">Cancel the migration</button>
@@ -465,13 +560,27 @@
                     {
                         <button class="btn" @onclick="OpenNew">Open #@newId in Azure DevOps ↗</button>
                     }
+                    else if (Migrator.CopyMayExist)
+                    {
+                        @* Not offered on its own: starting again over a copy that was in fact raised
+                           is how a work item ends up migrated twice, and only the user can look. *@
+                        <label class="switch" title="Slate cannot check for you - the create leaves no mark on the original">
+                            <input type="checkbox" checked="@Migrator.RestartAcknowledged"
+                                   @onchange="OnAcknowledgeRestart" />
+                            <span class="track"></span>
+                            <span class="label">I looked in @Migrator.TargetProject; there is no copy</span>
+                        </label>
+                        <button class="btn btn-danger" disabled="@(!Migrator.RestartAcknowledged)"
+                                title="Only once you have checked: a copy that was raised would be joined by a second"
+                                @onclick="Migrator.Restart">Start again anyway</button>
+                    }
                     else
                     {
                         <button class="btn" title="Nothing was raised, so there is nothing to duplicate"
                                 @onclick="Migrator.Restart">Start again</button>
                     }
                     <span style="flex: 1"></span>
-                    @if (Migrator.IsResuming && (Migrator.AnythingFailed || Migrator.WasCancelled))
+                    @if (Migrator.IsResuming && !Migrator.IsFinished)
                     {
                         <button class="btn" title="Only what is left; nothing is done twice"
                                 @onclick="Migrator.RunAsync">Finish the rest</button>
@@ -495,7 +604,7 @@
         MigrationStage.Target => "Migrate work item",
         MigrationStage.Review => "This is what will happen",
         MigrationStage.Running => "Migrating…",
-        _ => Migrator.AnythingFailed || Migrator.WasCancelled ? "What was and was not done" : "Migrated",
+        _ => Migrator.IsFinished ? "Migrated" : "What was and was not done",
     };
 
     private string TargetWhere =>
@@ -564,9 +673,24 @@
     private void OnClosingState(ChangeEventArgs e) => Migrator.ChooseClosingState(Text(e));
 
     private void ToggleBlock(Guid id, ChangeEventArgs e) =>
-        Migrator.ToggleBlock(id, e.Value is true or "true" or "on");
+        Migrator.ToggleBlock(id, Ticked(e));
+
+    private void OnAcknowledgeDiscussion(ChangeEventArgs e) => Migrator.AcknowledgeDiscussion(Ticked(e));
+
+    private void OnAcknowledgeRestart(ChangeEventArgs e) => Migrator.AcknowledgeRestart(Ticked(e));
+
+    private static bool Ticked(ChangeEventArgs e) => e.Value is true or "true" or "on";
 
     private void Close() => Migrator.Close();
+
+    /// <summary>
+    /// Escape closes the wizard, and Close itself refuses mid-run - Cancel is the way out of one
+    /// of those, and it is the button the footer offers.
+    /// </summary>
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") Close();
+    }
 
     private void OpenNew() => SystemShell.OpenUrl(Migrator.NewItemUrl);
 
