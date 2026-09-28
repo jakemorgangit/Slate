@@ -1904,6 +1904,11 @@ table.data th.sorted { color: var(--text); }
     flex: 1 1 0;
     padding-left: 8px;
     padding-right: 8px;
+
+    /* Every .input is width: 100%, which for the root below - the one level sized by its own
+       content rather than by a flex share - would resolve its auto basis to the full row and
+       crush every level after it to nothing. */
+    width: auto;
 }
 /* The project root is fixed, so it reads as context rather than a choice. */
 .area-picker .input:first-child { flex: 0 1 auto; color: var(--text-2); }
@@ -1976,3 +1981,45 @@ table.data th.sorted { color: var(--text); }
 .about-mark { font-size: 26px; color: var(--accent); line-height: 1; margin-top: 2px; }
 .about-line { color: var(--text-2); margin: 0 0 16px; }
 .about-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* Migration wizard ------------------------------------------------------- */
+
+/* .hint is scoped to .field everywhere else; the wizard's notes sit straight under a section
+   heading, with no field for them to belong to. */
+.modal-section > .hint {
+    display: block;
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--text-3);
+}
+
+/* A label-and-value list for "this is what will happen": fields going over, attachments,
+   references, and what is being left behind. */
+.mig-list { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.mig-row { display: flex; gap: 12px; align-items: baseline; }
+.mig-row > .k { flex: none; width: 172px; color: var(--text-3); font-size: 11.5px; overflow-wrap: anywhere; }
+.mig-row > .v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+
+.mig-blocks { display: flex; flex-direction: column; gap: 7px; }
+
+/* The running account of a migration. Every step keeps its line for the whole run, so what
+   has not been tried yet is as visible as what has. */
+.mig-steps { display: flex; flex-direction: column; }
+.mig-step {
+    display: flex;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12.5px;
+}
+.mig-step:last-child { border-bottom: none; }
+.mig-step > .glyph { flex: none; width: 16px; text-align: center; line-height: 1.5; }
+.mig-step > .grow { flex: 1; min-width: 0; }
+.mig-step .what { font-weight: 560; }
+.mig-step .detail { margin-top: 2px; font-size: 11.5px; color: var(--text-2); overflow-wrap: anywhere; }
+.mig-step.waiting { opacity: 0.45; }
+.mig-step.done > .glyph { color: var(--ok); }
+.mig-step.failed > .glyph { color: var(--danger); }
+.mig-step.failed .detail { color: var(--danger); }
+.mig-step.skipped > .glyph { color: var(--text-3); }
+.mig-step.skipped .what { color: var(--text-2); }

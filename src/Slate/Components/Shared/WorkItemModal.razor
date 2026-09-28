@@ -4,6 +4,7 @@
 @inject AppState State
 @inject SettingsStore Settings
 @inject ToastService Toasts
+@inject WorkItemMigrator Migrator
 @inject IJSRuntime Js
 
 @if (State.DetailWorkItemId is int id)
@@ -447,6 +448,11 @@
                                      WorkItemType="@listed.WorkItemType" Current="@listed.State" />
                     }
                     <span style="flex: 1"></span>
+                    @if (State.CanCreateWorkItems)
+                    {
+                        <button class="btn" title="Copy it into another project or area, reference this one, and close this one off"
+                                @onclick="() => Migrator.BeginAsync(id)">Migrate…</button>
+                    }
                     <button class="btn" @onclick="OpenInAdo">Open in Azure DevOps ↗</button>
                     @if (Fallback is { } item)
                     {

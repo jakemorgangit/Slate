@@ -2020,7 +2020,7 @@ public sealed class AppState(
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordDayFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
             || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
-            || UndoingPrompt is not null) return;
+            || UndoingPrompt is not null || MigrationOpen) return;
 
         RecordingFor = allocation;
         Changed?.Invoke();
@@ -2043,7 +2043,7 @@ public sealed class AppState(
         if (!CanRecordTime || IsHandingOver) return;
         if (RecordingFor is not null || DetailWorkItemId is not null || SchedulingFor is not null
             || PriorityPrompt is not null || Creating is not null || SpawnFor is not null
-            || UndoingPrompt is not null) return;
+            || UndoingPrompt is not null || MigrationOpen) return;
 
         RecordDayFor = day.Date;
         Changed?.Invoke();
@@ -4142,6 +4142,48 @@ public sealed class AppState(
 
     public Allocation? SelectedAllocation =>
         SelectedAllocationId is Guid id ? planner.Find(id) : null;
+
+    // ---------------------------------------------------------------- the migration wizard
+
+    /// <summary>
+    /// True while the migration wizard is on screen. Set by <see cref="WorkItemMigrator"/> as it
+    /// opens and closes, and kept here rather than read from there because every guard that stops
+    /// one dialog opening underneath another is on this object - and the migrator already depends
+    /// on this one, so a reference the other way would be a cycle.
+    ///
+    /// The wizard is drawn above every other dialog, so anything that opened while it was up would
+    /// sit hidden behind it, taking keystrokes and edits nobody can see.
+    /// </summary>
+    public bool MigrationOpen { get; set; }
+
+    // ---------------------------------------------------------------- items from off-query
+
+    /// <summary>
+    /// Puts a work item into the loaded list, or brings the one already there up to date, and
+    /// refreshes whatever the plan has quoted about it.
+    ///
+    /// For the ones the query behind the list will not produce. A migration's copy lands in
+    /// another project altogether, so without this the block now pointing at it would be the only
+    /// sign it exists - and the sidebar, the type filter and the "can time go here" test would all
+    /// behave as though the block pointed at nothing. Not counted as a write: it changes nothing
+    /// that is saved, and the writes it follows count themselves.
+    /// </summary>
+    public void AdoptWorkItem(WorkItem item)
+    {
+        var at = WorkItems.FindIndex(i => i.Id == item.Id);
+
+        // Links and a parent's title are put on by the list load, not by the answer to a single
+        // write, so one already here keeps its own rather than being flattened to a bare item.
+        var adopted = at >= 0
+            ? item with { Links = WorkItems[at].Links, ParentTitle = WorkItems[at].ParentTitle }
+            : item;
+
+        if (at >= 0) WorkItems[at] = adopted;
+        else WorkItems.Add(adopted);
+
+        planner.RefreshSnapshots([adopted]);
+        Changed?.Invoke();
+    }
 }
 
 internal static class CancellationExtensions

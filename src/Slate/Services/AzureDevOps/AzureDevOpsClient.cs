@@ -62,6 +62,15 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
     private const string CommentsApiVersion = "7.1-preview.4";
     private const int BatchSize = 200;
 
+    /// <summary>
+    /// What a rejected credential gets instead of an answer: the sign-in page, served with a
+    /// success status. One message for every path that has to test for it - the shared send
+    /// below, and the attachment download, which reads its own body.
+    /// </summary>
+    private const string SignInPageMessage =
+        "Azure DevOps returned a sign-in page instead of an answer. "
+        + "The token is likely expired or lacks the Work Items scope this needs.";
+
     private static readonly HttpClient Http = new(new SocketsHttpHandler
     {
         AutomaticDecompression = DecompressionMethods.All,
@@ -248,9 +257,7 @@ public sealed partial class AzureDevOpsClient(SettingsStore settings, MsalAuthSe
             // ones read as data: a request whose answer is its status alone - a delete - would
             // otherwise take that very page for the one 2xx nobody looks inside, and report a
             // comment as removed while it is still on the discussion.
-            if (payload.StartsWith('<'))
-                throw new AzureDevOpsException(
-                    "Azure DevOps returned a sign-in page instead of an answer. The token is likely expired or lacks the Work Items scope this needs.");
+            if (payload.StartsWith('<')) throw new AzureDevOpsException(SignInPageMessage);
 
             return payload;
         }

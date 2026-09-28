@@ -7,6 +7,7 @@
 @inject PlannerService Plan
 @inject SettingsStore Settings
 @inject ToastService Toasts
+@inject WorkItemMigrator Migrator
 @inject IJSRuntime Js
 @inject NavigationManager Nav
 
@@ -609,6 +610,13 @@
         }
 
         <div class="sep"></div>
+        @if (State.CanCreateWorkItems)
+        {
+            <button title="Copy it into another project or area, reference this one, and close this one off"
+                    @onclick="() => MigrateFromMenu(item.Item.Id)">
+                <span class="glyph">⇥</span> Migrate…
+            </button>
+        }
         <button @onclick="() => OpenExternal(item.Item.Url)">
             <span class="glyph">↗</span> Open in Azure DevOps
         </button>
@@ -626,6 +634,8 @@
 <PriorityDialog />
 <UndoTimeDialog />
 <NewWorkItemDialog OnSchedule="BookNextFree" />
+@* Last, so a migration started from the work item window lands above it rather than behind. *@
+<MigrateWorkItemDialog />
 
 @code {
     private DotNetObjectReference<Planner>? _self;
@@ -1021,6 +1031,23 @@
         // The overlay shown during an update's handover stops clicks, not keys.
         if (State.IsHandingOver) return;
 
+        // The migration wizard's scrim stops clicks, not keys either, and it is drawn above
+        // everything else. Every shortcut stands off while it is up: r would reload the list and
+        // throw away the copy just adopted, Delete would remove the selected block, and Ctrl+R
+        // would open Record day behind the wizard. Escape is the one that still does something,
+        // and it closes the wizard - which refuses mid-run - and nothing underneath it, which is
+        // the whole point of the rule about a key reaching past a dialog.
+        if (Migrator.IsOpen)
+        {
+            if (combo == "escape")
+            {
+                Migrator.Close();
+                await InvokeAsync(StateHasChanged);
+            }
+
+            return;
+        }
+
         switch (combo)
         {
             case "arrowleft": State.GoToWeek(-1); break;
@@ -1198,6 +1225,13 @@
     {
         CloseMenu();
         SystemShell.OpenUrl(url);
+    }
+
+    /// <summary>Opens the migration wizard on a work item. It reads the item itself.</summary>
+    private async Task MigrateFromMenu(int workItemId)
+    {
+        CloseMenu();
+        await Migrator.BeginAsync(workItemId);
     }
 
     /// <summary>
