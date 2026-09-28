@@ -1078,7 +1078,7 @@ public sealed class AppState(
                 IsBusy(await EventsCovering(placed, end), placed, end))
             {
                 toasts.Warning("Something is already in the calendar then",
-                    "Pick another time, or turn off \"Never plan over existing events\" in Settings.");
+                    "Pick another time, or turn off \"Never plan over existing events\" under Your week in Settings.");
                 return false;
             }
 
