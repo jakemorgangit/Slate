@@ -533,8 +533,10 @@ public sealed class WorkItemMigrator(
                 "Azure DevOps builds a work item's history from the changes made to it, and it cannot be written. "
                 + $"#{source.Id} keeps its own, and stays readable."),
             new("Time already recorded",
-                $"Completed Work booked against #{source.Id} stays on #{source.Id}, so no report counts the same hours twice. "
-                + "Only the estimate comes over."),
+                $"The hours stay booked against #{source.Id}: Slate's own time entries, the Time tab and Undo all "
+                + $"still point there. Completed Work does come over as a number - the copy should say the work was "
+                + $"done - so both work items state those hours, and a report adding the two together would count "
+                + $"them twice."),
             new("Parent and child links",
                 "A parent link cannot cross a project, which is why the parent and each child are referenced as Related "
                 + "instead. The originals keep their own hierarchy."),

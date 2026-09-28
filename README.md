@@ -515,7 +515,7 @@ with progress and a Cancel button.
 | Not copied | Why |
 | --- | --- |
 | Revision history | Azure DevOps builds it from the changes made to a work item; it cannot be written. The original is closed, not deleted, and stays readable. |
-| Hours already recorded | Completed Work booked against the original stays there, so no report counts the same hours twice. Only the estimate comes over. |
+| Hours already recorded | The hours stay booked against the original: Slate's time entries, the Time tab and Undo all still point there. Completed Work *does* come over as a number — the copy should say the work was done — so both work items state those hours and a report adding the two together would count them twice. |
 | Parent and child links | A hierarchy link cannot cross a project. The parent and each child get a *Related* reference to the copy instead, and are not otherwise touched or moved. |
 | State and reason | The copy starts at the first state of its type in the target process; a state named by another process may not exist there. |
 | Created/changed by and dates | The service stamps these itself and cannot back-date them. |
