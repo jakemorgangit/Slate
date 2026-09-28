@@ -77,6 +77,20 @@ public sealed record AdoQuery(string Id, string Name, string Path, bool IsFolder
 
 public sealed record AdoProject(string Id, string Name);
 
+/// <summary>
+/// One pass over the configured boards: everything that came back, and the boards that did
+/// not answer while others did.
+///
+/// Partial rather than all-or-nothing, because one project being unreachable - renamed,
+/// closed, or simply not visible to this credential any more - is no reason to take the other
+/// boards' work off the screen. Every board failing is still a failed load, and comes back as
+/// the exception it always did.
+/// </summary>
+public sealed record WorkItemFetch(List<WorkItem> Items, IReadOnlyList<BoardFailure> Failures);
+
+/// <summary>A board that could not be listed, named so the notice can say which.</summary>
+public sealed record BoardFailure(string Board, string Message);
+
 /// <summary>A rich-text field such as repro steps or acceptance criteria.</summary>
 public sealed record WorkItemRichField(string Name, string DisplayName, string Html);
 

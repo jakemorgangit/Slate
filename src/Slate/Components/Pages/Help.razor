@@ -41,8 +41,9 @@
                                 Azure DevOps and Outlook.</li>
                             <li>No app registration? Open <em>Use a personal access token instead</em> and
                                 paste a token with the <strong>Work Items (Read &amp; Write)</strong> scope.</li>
-                            <li>Pick a project, then choose which items to show: by area and
-                                assignment, a saved query, or your own WIQL.</li>
+                            <li>Add a <strong>board</strong> — a project, and optionally an area inside
+                                it — then add another for every board your work lives on. Choose which
+                                items to show: by area and assignment, a saved query, or your own WIQL.</li>
                         </ol>
                         <p class="hint" style="margin-top: 8px">
                             Write access is only needed so you can record time. Read alone works for planning.
@@ -119,24 +120,40 @@
                         on the Work items tab. Take the first gap that fits inside the hours work can be
                         booked into, or pick a date and time yourself.</dd>
 
+                    <dt>Work on several boards</dt>
+                    <dd>A <strong>board</strong> is a project, optionally narrowed to an area inside it.
+                        Add as many as your work spans and the sidebar lists all of them at once, as one
+                        list you drag from. Each board is asked for on its own, so one that cannot be read
+                        does not take the others off the screen, and each gets its own 500-item allowance
+                        rather than sharing one. With no board at all, the query asks across every project
+                        you can see — which is where a new install starts.</dd>
+
+                    <dt>Showing one board for a while</dt>
+                    <dd>Every board gets a chip above the work item list, on the plan's sidebar and on the
+                        Work items tab. Turning one off hides that board's work without taking the board
+                        out of Settings, and turning it back on brings it straight back. The chips appear
+                        only once there is more than one board. While the list is drawn from more than one,
+                        each card and table row says which board its work item came from.</dd>
+
                     <dt>Beyond your own list</dt>
-                    <dd>The default source is two choices: an <strong>area</strong> (everything beneath
-                        it counts; empty means the whole project) and <strong>only work items assigned
-                        to me</strong>, on by default. Left alone it is the same list as always. Turn
-                        the toggle off to see everything in that area rather than only your own.
-                        A saved query and custom WIQL are left exactly as written.</dd>
+                    <dd>The default source is two choices: the <strong>boards</strong> above, and
+                        <strong>only work items assigned to me</strong>, on by default. Left alone it is
+                        the same list as always. Turn the toggle off to see everything on those boards
+                        rather than only your own. A saved query and custom WIQL are left exactly as
+                        written — both belong to one project, so both run in the first board's, which
+                        Settings says underneath them.</dd>
 
                     <dt>Choosing an area</dt>
                     <dd>One dropdown per level of the project's own tree. Leaving a level unset means
                         everything beneath the level above it, so stopping at <em>DevOps</em> takes in
                         <em>DevOps\DBA</em> and every other team under it — narrow further only if you
-                        want the narrower list. Each work item shows the area it sits in, next to who
-                        it is assigned to.</dd>
+                        want the narrower list. Leave it at the project itself for the whole project.
+                        Each work item shows the area it sits in, next to who it is assigned to.</dd>
 
                     <dt>Only mine, quickly</dt>
                     <dd>The same toggle sits beside <em>Hide fully planned</em> on the Work items tab
                         and as a chip above the plan's sidebar, so you can widen or narrow the list
-                        without opening Settings. All three are one setting.</dd>
+                        without opening Settings. All three are one setting, as the board chips are.</dd>
 
                     <dt>Your existing calendar</dt>
                     <dd>Everything already in Outlook that week is drawn behind the plan in grey. Work is not
