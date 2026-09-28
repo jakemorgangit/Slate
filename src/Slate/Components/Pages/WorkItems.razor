@@ -30,12 +30,32 @@
         </div>
 
         @* The same setting the Settings page holds, put where the list is actually read. *@
-        <label class="switch" title="Off shows everything in the chosen area, not just your own">
+        <label class="switch" title="Off shows everything on the chosen boards, not just your own">
             <input type="checkbox" checked="@State.Settings.Ado.OnlyMine"
                    @onchange="e => State.SetOnlyMineAsync(e.Value is true)" />
             <span class="track"></span>
             <span class="label">Only mine</span>
         </label>
+
+        @* The same board chips as the Plan sidebar, and the same setting behind them. Only
+           once there is more than one board, and not for a saved query or custom WIQL - both
+           of those run in one project whatever the boards say. *@
+        @if (State.Settings.Ado.Scope == WorkItemScope.AssignedToMe
+             && State.Settings.Ado.Scopes.Count > 1)
+        {
+            <div class="row wrap">
+                @foreach (var board in State.Settings.Ado.Scopes)
+                {
+                    var current = board;
+
+                    <button class="chip @(current.Enabled ? "on" : "")"
+                            title="@Ui.BoardChip(current)"
+                            @onclick="() => State.SetScopeEnabledAsync(current, !current.Enabled)">
+                        @current.Label
+                    </button>
+                }
+            </div>
+        }
 
         <label class="switch">
             <input type="checkbox" checked="@State.HideFullyAllocated" @onchange="OnHideToggled" />
@@ -89,6 +109,13 @@
                     </button>
                 }
             </div>
+        }
+
+        @* A board that could not be read, or every board hidden at once. Neither is a failed
+           load - the rest of the table is real - so it says its piece above it. *@
+        @if (State.BoardNotice is { } boards)
+        {
+            <div class="banner warn compact"><span class="grow">@boards</span></div>
         }
 
         @if (_rows.Count == 0)
@@ -153,9 +180,17 @@
                                     </td>
                                     <td class="cell-title">
                                         <div>@item.Title</div>
-                                        @if (!string.IsNullOrWhiteSpace(item.ParentTitle) || item.Tags.Length > 0 || item.HasLinks)
+                                        @{ var board = Ui.Board(item, _boards); }
+                                        @if (board.Length > 0 || !string.IsNullOrWhiteSpace(item.ParentTitle)
+                                             || item.Tags.Length > 0 || item.HasLinks)
                                         {
                                             <div class="row wrap" style="margin-top: 3px">
+                                                @* First in the row, so several boards' work can be
+                                                   scanned down the column. *@
+                                                @if (board.Length > 0)
+                                                {
+                                                    <span class="badge badge-muted" title="@Ui.BoardTooltip(item)">@board</span>
+                                                }
                                                 @if (!string.IsNullOrWhiteSpace(item.ParentTitle))
                                                 {
                                                     <span class="muted" style="font-size: 11.5px">↳ @Ui.Clip(item.ParentTitle, 60)</span>
@@ -288,6 +323,14 @@
 @code {
     private IReadOnlyList<WorkItem> _rows = [];
 
+    /// <summary>
+    /// Whether a row has to say which board it came from. Worked out here rather than per row,
+    /// because deciding reads the whole list. Only alongside a load - the search, sort and
+    /// "hide fully planned" filters below change which rows show, never which boards they
+    /// came from.
+    /// </summary>
+    private BoardNaming _boards;
+
     private int TotalPlannedMinutes => Plan.Allocations.Sum(a => a.DurationMinutes);
 
     protected override void OnInitialized()
@@ -295,11 +338,13 @@
         State.Changed += OnChanged;
         Plan.Changed += OnChanged;
         _rows = State.FilteredWorkItems;
+        _boards = State.Boards;
     }
 
     private void OnChanged() => InvokeAsync(() =>
     {
         _rows = State.FilteredWorkItems;
+        _boards = State.Boards;
         StateHasChanged();
     });
 

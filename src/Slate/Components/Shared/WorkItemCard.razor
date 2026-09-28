@@ -40,6 +40,12 @@
     <div class="wi-title">@Item.Title</div>
 
     <div class="wi-meta">
+        @* Which board this came from, when the list is drawn from more than one. First in the
+           row and clipped, so it is easy to scan down and cannot push the rest off the card. *@
+        @if (Board.Length > 0)
+        {
+            <span class="badge badge-muted wi-board" title="@Ui.BoardTooltip(Item)">@Ui.Clip(Board, 22)</span>
+        }
         <span>@Item.State</span>
         @if (Allocated > 0)
         {
@@ -77,6 +83,14 @@
 
 @code {
     [Parameter, EditorRequired] public WorkItem Item { get; set; } = default!;
+
+    /// <summary>
+    /// The board this item came from, or empty when the list is one board's work and saying
+    /// so on every card would be noise. Passed in rather than worked out here: deciding needs
+    /// the whole list, and the card only has its own item. See <see cref="Ui.Board"/>.
+    /// </summary>
+    [Parameter] public string Board { get; set; } = "";
+
     [Parameter] public int Allocated { get; set; }
     [Parameter] public int Recorded { get; set; }
     /// <summary>Your own triage priority. Zero falls back to the one Azure DevOps holds.</summary>
@@ -99,6 +113,7 @@
         get
         {
             var parts = new List<string> { $"#{Item.Id} · {Item.WorkItemType} · {Item.State}", Item.Title };
+            if (Board.Length > 0) parts.Add(Ui.BoardTooltip(Item));
             if (!string.IsNullOrWhiteSpace(Item.ParentTitle)) parts.Add($"Parent: {Item.ParentTitle}");
             if (!string.IsNullOrWhiteSpace(Item.IterationPath)) parts.Add(Item.IterationPath);
             if (Recorded > 0) parts.Add($"{Ui.Duration(Recorded)} recorded");

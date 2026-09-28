@@ -40,7 +40,8 @@ On first launch the app opens on **Settings**, because it needs a couple of thin
 ![The Settings page: organization URL, sign-in method, personal access token and project
 ](docs/screenshots/04-settings.png)
 
-> The Settings screenshot predates the single **Connect** card and the removal of the Save button.
+> The Settings screenshot predates the single **Connect** card, the removal of the Save button, and
+> the board list that replaced the single project and area.
 
 ---
 
@@ -69,7 +70,8 @@ instead*: in Azure DevOps go to *User settings → Personal access tokens → Ne
 **Work Items (Read & Write)** scope — write is what lets you record time. It is stored encrypted
 with Windows DPAPI under your user account, so nobody else on the machine can read it.
 
-Optionally choose a **project**; leaving it blank queries across everything you can see.
+Then add a **board** — a project, and optionally an area inside it — for every board your work lives
+on. Adding none queries across every project you can see.
 
 Then choose which work items appear: **area and assignment** (with finished states filtered out), a
 **saved query** from your Queries hub, or your own **WIQL**.
@@ -301,15 +303,37 @@ The block stays put either way. Turn the offer off in Settings, or from the noti
 
 ## Which work items
 
+### Boards
+
+A **board** is a project, optionally narrowed to an area inside it. Add one per board your work
+lives on — *Contoso*, *Contoso\DevOps*, *Fabrikam\Platform* — and the sidebar shows all of them at
+once, as one list you drag from. Adding none asks across every project you can see, which is where a
+new install starts; removing the last one puts you back there rather than leaving anything broken.
+
+Each board is queried on its own rather than being folded into one organization-wide query. That
+costs a request per board and buys three things: each board gets its own 500-item allowance instead
+of a busy board crowding out a quiet one, a board that cannot be read fails alone and leaves the
+others on screen, and the query sent for each board is the one this app has always sent.
+
+Every board gets a **chip** above the work item list, on the plan's sidebar and on the Work items
+tab. Turning one off hides that board's work and re-runs the query; turning it back on brings it
+straight back. It never takes the board out of Settings — that is what the ✕ beside it is for. The
+chips only appear once there is more than one board, and while the list is drawn from more than one,
+each card and table row says which board its work item came from.
+
+An existing setup upgrades silently: the one project and area you had become the first board.
+
+### Area and assignment
+
 The default source, **Area and assignment**, is two independent choices rather than one list:
 
-- **Area** — where the work lives. Everything beneath the area counts, so a top-level area takes in
-  all of its sub-areas. Leave it empty for the whole project.
+- **The boards** — where the work lives. Everything beneath a board's area counts, so a top-level
+  area takes in all of its sub-areas. Leave the area at the project for the whole project.
 - **Only work items assigned to me** — whose it is. On by default.
 
 Left alone, that is exactly the *assigned to me* list it has always been, which is why upgrading
-changes nothing. Set an area to plan around a team's work; turn the toggle off to see everything in
-that area rather than only your own.
+changes nothing. Set an area to plan around a team's work; turn the toggle off to see everything on
+those boards rather than only your own.
 
 The area is chosen from the project's own tree, one dropdown per level: the project root, then the
 level below it, and so on as deep as the tree goes. Leaving a level unset means *everything beneath
@@ -320,15 +344,18 @@ under it. Only narrow further if you want the narrower list.
 on the Work items tab, and as a chip at the top of the plan's sidebar. It is the same setting in all
 three places, so flipping it anywhere flips it everywhere and re-runs the query.
 
-With no area *and* no assignment filter you are asking for the whole project. Azure DevOps returns
-the first 500 matches, so the list can be cut short without saying so — Settings warns when that
-combination is selected.
+With a whole project on a board *and* no assignment filter you are asking for everything in it.
+Azure DevOps returns the first 500 matches per board, so the list can be cut short without saying
+so — Settings warns when that combination is selected.
 
 **A saved query** and **Custom WIQL** are deliberately left alone by both controls. A saved query is
 run by id, so there is no query text to amend, and narrowing either one afterwards would mean
 filtering an already-capped result set: it would look authoritative while quietly missing anything
 past the cap. To limit a saved query to your own work, edit or clone it in Azure DevOps, where the
 definition belongs.
+
+Both are also addressed to a single project, so both run in the **first board's** project and the
+board chips do not apply to them. Settings says which project that is, underneath each.
 
 ## Your hours
 
@@ -443,7 +470,7 @@ with your own comments accented. Azure DevOps shows it newest-first; a toggle sw
 two. The box underneath posts a comment straight to Azure DevOps, so notes do not mean a trip to
 the browser.
 
-Type `@` and a name to **mention a colleague**. The list comes from the teams in your project, and
+Type `@` and a name to **mention a colleague**. The list comes from the teams in your boards' projects, and
 picking someone from it posts a real Azure DevOps mention that notifies them. Typing a name out in
 full works just as well — any name the app recognises becomes a mention on the way out. People
 it cannot resolve to an identity still read correctly, just without the link, and the picker says

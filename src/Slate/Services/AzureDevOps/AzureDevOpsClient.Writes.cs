@@ -65,7 +65,7 @@ public sealed partial class AzureDevOpsClient
     public async Task<List<WorkItemStateOption>> GetStatesAsync(
         string project, string workItemType, CancellationToken ct = default)
     {
-        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.Project : project;
+        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.PrimaryProject : project;
         if (string.IsNullOrWhiteSpace(scope) || string.IsNullOrWhiteSpace(workItemType)) return [];
 
         using var doc = await SendAsync(HttpMethod.Get,
@@ -106,7 +106,7 @@ public sealed partial class AzureDevOpsClient
     /// <summary>The work item types a project offers, so the new-item form is not guesswork.</summary>
     public async Task<List<string>> GetWorkItemTypesAsync(string project, CancellationToken ct = default)
     {
-        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.Project : project;
+        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.PrimaryProject : project;
         if (string.IsNullOrWhiteSpace(scope)) return [];
 
         using var doc = await SendAsync(HttpMethod.Get,
@@ -131,7 +131,7 @@ public sealed partial class AzureDevOpsClient
     /// </summary>
     public async Task<AreaNode?> GetAreaTreeAsync(string project, CancellationToken ct = default)
     {
-        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.Project : project;
+        var scope = string.IsNullOrWhiteSpace(project) ? settings.Current.Ado.PrimaryProject : project;
         if (string.IsNullOrWhiteSpace(scope)) return null;
 
         using var doc = await SendAsync(HttpMethod.Get,
@@ -182,7 +182,7 @@ public sealed partial class AzureDevOpsClient
         if (string.IsNullOrWhiteSpace(request.Title))
             throw new AzureDevOpsException("Give the new work item a title.");
 
-        var project = string.IsNullOrWhiteSpace(request.Project) ? settings.Current.Ado.Project : request.Project;
+        var project = string.IsNullOrWhiteSpace(request.Project) ? settings.Current.Ado.PrimaryProject : request.Project;
         if (string.IsNullOrWhiteSpace(project))
             throw new AzureDevOpsException("Choose a project to create the work item in.");
 

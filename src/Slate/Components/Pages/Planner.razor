@@ -54,6 +54,25 @@
                     Only mine
                 </button>
 
+                @* One chip per board, for hiding a board's work for a while without taking it
+                   out of the settings. Only once there is more than one board: naming the only
+                   board you have would be a chip that never does anything useful. A saved query
+                   or custom WIQL runs in one project whatever the boards say, so no chips then. *@
+                @if (State.Settings.Ado.Scope == WorkItemScope.AssignedToMe
+                     && State.Settings.Ado.Scopes.Count > 1)
+                {
+                    @foreach (var board in State.Settings.Ado.Scopes)
+                    {
+                        var current = board;
+
+                        <button class="chip @(current.Enabled ? "on" : "")"
+                                title="@Ui.BoardChip(current)"
+                                @onclick="() => State.SetScopeEnabledAsync(current, !current.Enabled)">
+                            @current.Label
+                        </button>
+                    }
+                }
+
                 @if (State.AvailableTypes.Count > 1)
                 {
                     @foreach (var type in State.AvailableTypes)
@@ -109,6 +128,14 @@
                     </div>
                 }
 
+                @* A board that could not be read, or every board hidden at once. Neither is a
+                   failed load - the rest of the list is real - so it says its piece above the
+                   list rather than taking the list's place. *@
+                @if (State.BoardNotice is { } boards)
+                {
+                    <div class="banner warn compact"><span class="grow">@boards</span></div>
+                }
+
                 if (_visibleItems.Count == 0)
                 {
                     @* Nothing loaded at all is not the same as a query that came back empty -
@@ -126,6 +153,7 @@
                     {
                         <WorkItemCard @key="item.Id"
                                       Item="item"
+                                      Board="@Ui.Board(item, _boards)"
                                       Allocated="@Plan.AllocatedMinutes(item.Id)"
                                       Recorded="@Plan.RecordedMinutes(item.Id)"
                                       Priority="@Plan.LocalPriority(item.Id)"
@@ -628,6 +656,12 @@
     private IReadOnlyList<WorkItem> _visibleItems = [];
     private IReadOnlyList<DateTime> _days = [];
 
+    /// <summary>
+    /// Whether a card has to say which board it came from, worked out once with the list
+    /// rather than per card: it reads the whole list to decide.
+    /// </summary>
+    private BoardNaming _boards;
+
     private PlanningSettings P => Settings.Current.Planning;
     private int SlotMinutes => Math.Clamp(P.SlotMinutes, 5, 120);
     private int SlotPx => Settings.Current.Ui.CompactDensity ? 22 : 30;
@@ -698,6 +732,7 @@
     {
         _visibleItems = State.FilteredWorkItems;
         _days = State.VisibleDays;
+        _boards = State.Boards;
     }
 
     private void OnChanged() => InvokeAsync(() =>

@@ -187,33 +187,6 @@
                 </details>
 
                 <div class="field">
-                    <label for="project">Project</label>
-                    <div class="row">
-                        @if (_projects.Count > 0)
-                        {
-                            <select id="project" class="select" value="@_draft.Ado.Project"
-                                    @onchange="e => Set(() => _draft.Ado.Project = Text(e))">
-                                <option value="">(all projects in the organization)</option>
-                                @foreach (var project in _projects)
-                                {
-                                    <option value="@project.Name">@project.Name</option>
-                                }
-                            </select>
-                        }
-                        else
-                        {
-                            <input id="project" class="input" placeholder="Project name (optional)"
-                                   value="@_draft.Ado.Project" @onchange="e => Set(() => _draft.Ado.Project = Text(e))" />
-                        }
-                        <button class="btn" disabled="@_busyProjects" @onclick="LoadProjectsAsync">
-                            @if (_busyProjects) { <span class="spinner"></span> }
-                            <span>Load projects</span>
-                        </button>
-                    </div>
-                    <span class="hint">Leave empty to query across every project you can see.</span>
-                </div>
-
-                <div class="field">
                     <label for="calendar">Target calendar</label>
                     <div class="row">
                         <select id="calendar" class="select" value="@_draft.Calendar.CalendarId"
@@ -247,11 +220,124 @@
                 </div>
             </div>
             <div class="card-body">
+                @* The boards come first, above the source: they are what the whole card is
+                   about, and a saved query needs one of them to run in. *@
+                <div class="field">
+                    <label>Boards</label>
+                    @if (_draft.Ado.Scopes.Count > 0)
+                    {
+                        <div class="board-list">
+                            @foreach (var board in _draft.Ado.Scopes)
+                            {
+                                var current = board;
+
+                                <div class="board-row">
+                                    <div class="grow">
+                                        <div>@current.Project</div>
+                                        <div class="board-area mono">
+                                            @(current.AreaPath.Length == 0 ? "The whole project" : current.AreaPath)
+                                        </div>
+                                    </div>
+                                    @if (!current.Enabled)
+                                    {
+                                        <span class="badge badge-muted"
+                                              title="Hidden by its chip above the work item list. Still a board - turn the chip back on to see its work.">Hidden</span>
+                                    }
+                                    <button class="btn btn-sm btn-ghost" title="Remove this board"
+                                            @onclick="() => RemoveBoardAsync(current)">✕</button>
+                                </div>
+                            }
+                        </div>
+                        <span class="hint">
+                            The list you drag from is every board at once. Each one gets a chip above
+                            that list, for hiding a board for a while without removing it here.
+                        </span>
+                    }
+                    else
+                    {
+                        <span class="hint">
+                            No board yet, so the query asks across every project this credential can
+                            see. Add one below to narrow it.
+                        </span>
+                    }
+                </div>
+
+                <div class="field">
+                    <label for="board-project">Add a board</label>
+                    <div class="row">
+                        @if (_projects.Count > 0)
+                        {
+                            <select id="board-project" class="select" value="@_newBoard.Project"
+                                    @onchange="OnNewBoardProjectAsync">
+                                <option value="">Choose a project…</option>
+                                @foreach (var project in _projects)
+                                {
+                                    <option value="@project.Name">@project.Name</option>
+                                }
+                            </select>
+                        }
+                        else
+                        {
+                            <input id="board-project" class="input" placeholder="Project name"
+                                   value="@_newBoard.Project" @onchange="OnNewBoardProjectAsync" />
+                        }
+                        <button class="btn" disabled="@_busyProjects" @onclick="LoadProjectsAsync">
+                            @if (_busyProjects) { <span class="spinner"></span> }
+                            <span>Load projects</span>
+                        </button>
+                    </div>
+
+                    @if (_newBoard.Project.Length > 0)
+                    {
+                        <div style="margin-top: 8px">
+                            <label for="board-area">Area in @_newBoard.Project</label>
+                            @if (State.IsLoadingAreaTree)
+                            {
+                                <span class="hint"><span class="spinner"></span> Reading the area tree…</span>
+                            }
+                            else
+                            {
+                                <AreaPathPicker Id="board-area"
+                                                Value="@_newBoard.AreaPath"
+                                                ValueChanged="OnNewBoardAreaChanged"
+                                                Root="State.AreaTree"
+                                                Note="@AreaNote" />
+                            }
+                            @if (State.AreaTree is null && !State.IsLoadingAreaTree)
+                            {
+                                @* A typed path has to be project-qualified to match anything, so
+                                   getting the tree back matters more than accepting free text. *@
+                                <div class="banner warn">
+                                    <span>!</span>
+                                    <div class="grow">
+                                        <div>The area list could not be read, so this is a plain box.</div>
+                                        @if (State.AreaTreeError is { } why)
+                                        {
+                                            <div class="muted" style="font-size: 11.5px">@why</div>
+                                        }
+                                        <button class="btn btn-sm" style="margin-top: 8px"
+                                                @onclick="() => State.EnsureAreaTreeAsync(_newBoard.Project, force: true)">Try again</button>
+                                    </div>
+                                </div>
+                            }
+                        </div>
+                    }
+
+                    <div class="row" style="margin-top: 8px">
+                        <button class="btn btn-primary" disabled="@(_newBoard.Project.Length == 0)"
+                                @onclick="AddBoardAsync">Add</button>
+                    </div>
+                    <span class="hint">
+                        Everything beneath the area counts, so a top-level area takes in all of its
+                        sub-areas. Leave the area at the project to take the whole project.
+                    </span>
+                </div>
+
                 <div class="field">
                     <label>Source</label>
                     <div class="row wrap">
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.AssignedToMe ? "on" : "")"
-                                @onclick="ChooseBuiltScopeAsync">Area and assignment</button>
+                                @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.AssignedToMe)">Area and assignment</button>
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.SavedQuery ? "on" : "")"
                                 @onclick="() => Set(() => _draft.Ado.Scope = WorkItemScope.SavedQuery)">A saved query</button>
                         <button class="chip @(_draft.Ado.Scope == WorkItemScope.CustomWiql ? "on" : "")"
@@ -259,48 +345,11 @@
                     </div>
                 </div>
 
-                @* Two independent choices - where the work lives, and whose it is - rather
-                   than two overlapping sources. Left alone they are the "assigned to me"
+                @* Two independent choices - which boards the work lives on, and whose it is -
+                   rather than two overlapping sources. Left alone they are the "assigned to me"
                    list this has always produced. *@
                 @if (_draft.Ado.Scope == WorkItemScope.AssignedToMe)
                 {
-                    <div class="field">
-                        <label for="scope-area">Area</label>
-                        @if (State.IsLoadingAreaTree)
-                        {
-                            <span class="hint"><span class="spinner"></span> Reading the area tree…</span>
-                        }
-                        else
-                        {
-                            <AreaPathPicker Id="scope-area"
-                                            Value="@_draft.Ado.AreaPath"
-                                            ValueChanged="OnAreaPathChanged"
-                                            Root="State.AreaTree"
-                                            Note="@AreaNote" />
-                        }
-                        @if (State.AreaTree is null && !State.IsLoadingAreaTree)
-                        {
-                            @* A typed path has to be project-qualified to match anything, so
-                               getting the tree back matters more than accepting free text. *@
-                            <div class="banner warn">
-                                <span>!</span>
-                                <div class="grow">
-                                    <div>The area list could not be read, so this is a plain box.</div>
-                                    @if (State.AreaTreeError is { } why)
-                                    {
-                                        <div class="muted" style="font-size: 11.5px">@why</div>
-                                    }
-                                    <button class="btn btn-sm" style="margin-top: 8px"
-                                            @onclick="() => State.EnsureAreaTreeAsync(force: true)">Try again</button>
-                                </div>
-                            </div>
-                        }
-                        <span class="hint">
-                            Everything beneath the area counts, so a top-level area takes in all of
-                            its sub-areas. Leave it empty for the whole project.
-                        </span>
-                    </div>
-
                     <label class="switch">
                         <input type="checkbox" checked="@_draft.Ado.OnlyMine"
                                @onchange="e => Set(() => _draft.Ado.OnlyMine = Bool(e))" />
@@ -308,17 +357,18 @@
                         <span class="label">Only work items assigned to me</span>
                     </label>
                     <span class="hint">
-                        Turn this off to see everything in that area, not just your own.
+                        Turn this off to see everything on those boards, not just your own.
                     </span>
 
-                    @if (!_draft.Ado.OnlyMine && string.IsNullOrWhiteSpace(_draft.Ado.AreaPath))
+                    @if (AsksForEverything)
                     {
                         <div class="banner warn">
                             <span>!</span>
                             <div class="grow">
-                                With no area and no assignment filter this asks for every work item in
-                                the project. Azure DevOps returns the first 500, so the list may be cut
-                                short without saying so - narrow it by area, or hide more states below.
+                                With a whole project on a board and no assignment filter, this asks for
+                                every work item in it. Azure DevOps returns the first 500 per board, so
+                                the list may be cut short without saying so - narrow a board by area, or
+                                hide more states below.
                             </div>
                         </div>
                     }
@@ -355,6 +405,7 @@
                             </button>
                         </div>
                         <span class="hint">Flat, tree and one-hop queries all work; Slate uses the target items.</span>
+                        <span class="hint">@ProjectScopedNote</span>
                     </div>
                 }
                 else
@@ -366,6 +417,12 @@
                                   value="@_draft.Ado.CustomWiql"
                                   @onchange="e => Set(() => _draft.Ado.CustomWiql = Text(e))"></textarea>
                         <span class="hint">Only <code>[System.Id]</code> is read from the result; the rest is fetched in a batch.</span>
+                        @* Only when custom WIQL is the source: this box is on show under "Area and
+                           assignment" too, where the first board's project decides nothing. *@
+                        @if (_draft.Ado.Scope == WorkItemScope.CustomWiql)
+                        {
+                            <span class="hint">@ProjectScopedNote</span>
+                        }
                     </div>
                 }
             </div>
@@ -777,18 +834,19 @@
     }
 
     /// <summary>
-    /// Fetches the area tree once the page is up, so the picker is a picker rather than a
-    /// text box for anyone who arrives already on the scope that uses it - and again whenever
-    /// a change of connection made here has dropped the old one's tree. That leaves no tree and
-    /// no error, which is not the same as a tree that could not be read, and should not be
-    /// reported as one.
+    /// Fetches the area tree again whenever a change of connection made here has dropped the
+    /// one in hand. That leaves no tree and no error, which is not the same as a tree that
+    /// could not be read and should not be reported as one.
+    ///
+    /// Only while a board is being added, which is the only thing on this page that browses
+    /// areas now - so nobody who never opens the Add row pays for a tree they will not see.
     /// </summary>
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (_draft.Ado.Scope != WorkItemScope.AssignedToMe) return;
+        if (_newBoard.Project.Length == 0) return;
 
-        if (firstRender || State.AreaTree is null && State.AreaTreeError is null && !State.IsLoadingAreaTree)
-            await State.EnsureAreaTreeAsync();
+        if (State.AreaTree is null && State.AreaTreeError is null && !State.IsLoadingAreaTree)
+            await State.EnsureAreaTreeAsync(_newBoard.Project);
     }
 
     private void OnChanged() => InvokeAsync(StateHasChanged);
@@ -849,16 +907,86 @@
         int.TryParse(e.Value?.ToString(), out var parsed) ? Math.Clamp(parsed, min, max) : fallback;
 
     /// <summary>
-    /// Switches to the scope Slate builds and fetches the tree behind the area picker. Doing
-    /// it here rather than on page load keeps a request off everyone who never opens this.
+    /// The board being filled in on the Add row. Not part of the draft: it is only a board
+    /// once Add is pressed, and half of one would otherwise be saved on every keystroke.
     /// </summary>
-    private async Task ChooseBuiltScopeAsync()
+    private readonly AdoScope _newBoard = new();
+
+    /// <summary>
+    /// Picking a project starts its area tree loading. The area goes back to the project root,
+    /// since a path under the last project names nothing under this one.
+    /// </summary>
+    private async Task OnNewBoardProjectAsync(ChangeEventArgs e)
     {
-        Set(() => _draft.Ado.Scope = WorkItemScope.AssignedToMe);
-        await State.EnsureAreaTreeAsync();
+        _newBoard.Project = Text(e);
+        _newBoard.AreaPath = "";
+
+        if (_newBoard.Project.Length > 0) await State.EnsureAreaTreeAsync(_newBoard.Project);
     }
 
-    private void OnAreaPathChanged(string path) => Set(() => _draft.Ado.AreaPath = path);
+    private void OnNewBoardAreaChanged(string path) => _newBoard.AreaPath = path;
+
+    /// <summary>
+    /// Adds the board being filled in, and loads the list again so the new board's work turns
+    /// up rather than waiting for the next refresh.
+    ///
+    /// A board already on the list is turned down rather than added twice: a duplicate would
+    /// fetch the same work again and give it a second chip that only half worked. The project
+    /// is left in the Add row afterwards, since a second area of the same project is the next
+    /// thing somebody is likely to want.
+    /// </summary>
+    private async Task AddBoardAsync()
+    {
+        var board = new AdoScope { Project = _newBoard.Project.Trim(), AreaPath = _newBoard.AreaPath.Trim() };
+        if (board.Project.Length == 0) return;
+
+        // "The whole project" comes back from the picker as the project's own path. The two
+        // spellings are one board, and Normalize keeps the shorter, so match on that here too.
+        if (string.Equals(board.AreaPath, board.Project, StringComparison.OrdinalIgnoreCase))
+            board.AreaPath = "";
+
+        if (_draft.Ado.Scopes.Any(existing => existing.SameBoard(board)))
+        {
+            Toasts.Info("That board is already on the list", $"{board.Describe()} is there already.");
+            return;
+        }
+
+        Set(() => _draft.Ado.Scopes.Add(board));
+        _newBoard.AreaPath = "";
+
+        await State.LoadWorkItemsAsync();
+    }
+
+    /// <summary>
+    /// Takes a board off the list. Removing the last one leaves the same "no board chosen"
+    /// this started out in, which asks across the organization rather than breaking.
+    /// </summary>
+    private async Task RemoveBoardAsync(AdoScope board)
+    {
+        Set(() => _draft.Ado.Scopes.RemoveAll(existing => existing.SameBoard(board)));
+        await State.LoadWorkItemsAsync();
+    }
+
+    /// <summary>
+    /// True when the query is about to ask for whole projects with nothing narrowing it by
+    /// assignee either. Worth a word: Azure DevOps answers with the first 500 rows per board
+    /// and says nothing about the rest.
+    /// </summary>
+    private bool AsksForEverything =>
+        !_draft.Ado.OnlyMine
+        && (_draft.Ado.Scopes.Count == 0
+            || _draft.Ado.Scopes.Any(s => s.Enabled && s.AreaPath.Length == 0));
+
+    /// <summary>
+    /// Which project a saved query or custom WIQL runs in. Both are addressed to one project,
+    /// so the first board is the one used - and saying which is the only way anybody with
+    /// several boards would know.
+    /// </summary>
+    private string ProjectScopedNote =>
+        _draft.Ado.PrimaryProject is { Length: > 0 } project
+            ? $"Runs in {project}, the first board above. Both of these are addressed to one "
+              + "project, so the board chips above the work item list do not apply to them."
+            : "Add a board above first: this runs in the first board's project, and there is none yet.";
 
     /// <summary>Told to the picker when the tree could not be read, so it explains itself.</summary>
     private string AreaNote =>

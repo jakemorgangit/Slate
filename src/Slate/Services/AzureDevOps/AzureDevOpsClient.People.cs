@@ -90,10 +90,20 @@ public sealed partial class AzureDevOpsClient
 
         try
         {
-            var configured = settings.Current.Ado.Project;
-            List<string> projects = string.IsNullOrWhiteSpace(configured)
+            // Every configured board's project, not just the first: with work on several
+            // boards the colleagues worth mentioning sit on several teams. Distinct, because
+            // two boards can be two areas of one project, and still bounded by the team and
+            // member caps below.
+            List<string> configured =
+            [
+                .. settings.Current.Ado.Scopes
+                    .Select(s => s.Project)
+                    .Distinct(StringComparer.OrdinalIgnoreCase),
+            ];
+
+            List<string> projects = configured.Count == 0
                 ? [.. (await GetProjectsAsync(ct)).Take(3).Select(p => p.Id)]
-                : [configured];
+                : configured;
 
             var teamsRead = 0;
 
